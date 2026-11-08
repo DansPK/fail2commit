@@ -428,6 +428,8 @@ fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, O
 
 /// Run the approved lifecycle scripts for installed packages. Failure aborts
 /// the whole apply (the caller discards the scratch tree).
+// Stage dir (CR-007) and the per-script recheck (RN3-004) are both required inputs.
+#[allow(clippy::too_many_arguments)]
 pub fn run_scripts(
     deps: &Deps<'_>,
     tc: &Toolchain,
