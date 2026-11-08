@@ -5,8 +5,12 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 deb=${1:?usage: verify-deb.sh path/to/fail2commit.deb}
 deb=$(cd "$(dirname "$deb")" && pwd)/$(basename "$deb")
 test -f "$deb"
+docker_deb=$deb
+if [[ $(uname -s) == MINGW* || $(uname -s) == MSYS* ]]; then
+  docker_deb=$(cygpath -w "$deb")
+fi
 
-docker run --rm -v "$deb:/input/fail2commit.deb:ro" ubuntu:24.04 bash -euc '
+MSYS_NO_PATHCONV=1 docker run --rm -v "$docker_deb:/input/fail2commit.deb:ro" ubuntu:24.04 bash -euc '
   useradd --create-home f2ctest
   install -d -o f2ctest -g f2ctest /home/f2ctest/.config/git/hooks
   printf "%s\n" "[user]" "  name = unrelated" > /home/f2ctest/.config/git/config

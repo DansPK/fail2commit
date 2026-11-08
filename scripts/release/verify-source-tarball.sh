@@ -4,8 +4,12 @@ set -euo pipefail
 archive=${1:?usage: verify-source-tarball.sh path/to/source.tar.gz}
 archive=$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")
 test -f "$archive"
+docker_archive=$archive
+if [[ $(uname -s) == MINGW* || $(uname -s) == MSYS* ]]; then
+  docker_archive=$(cygpath -w "$archive")
+fi
 
-docker run --rm --network none -v "$archive:/input/source.tar.gz:ro" rust:1 bash -euc '
+MSYS_NO_PATHCONV=1 docker run --rm --network none -v "$docker_archive:/input/source.tar.gz:ro" rust:1 bash -euc '
   mkdir /work
   tar -xzf /input/source.tar.gz -C /work
   source_dir=$(find /work -mindepth 1 -maxdepth 1 -type d -print -quit)

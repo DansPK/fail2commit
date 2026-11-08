@@ -23,9 +23,13 @@ fi
 
 mkdir -p "$repo/$out"
 target_volume=${F2C_TARGET_VOLUME:-f2c-t011-deb-target}
+docker_repo=$repo
+if [[ $(uname -s) == MINGW* || $(uname -s) == MSYS* ]]; then
+  docker_repo=$(cygpath -w "$repo")
+fi
 
-docker run --rm \
-  -v "$repo:/src" \
+MSYS_NO_PATHCONV=1 docker run --rm \
+  -v "$docker_repo:/src" \
   -v "$target_volume:/target" \
   -e CARGO_TARGET_DIR=/target \
   -e SOURCE_DATE_EPOCH="$epoch" \
