@@ -1,9 +1,8 @@
-//! Independent wave-1 security review reproductions.
-//!
-//! These tests intentionally fail on the reviewed candidate. They document
-//! approval and secret-scan bypasses that must be fixed before integration.
+//! Regression tests for the independent wave-1 security review
+//! (W1-001..W1-003, FR-001/FR-002). They failed on the reviewed candidate and
+//! now assert the fixed behavior. Everything is offline and unattended.
 
-use fail2commit_core::git::{prepush, scan_outgoing, RefUpdate};
+use fail2commit_core::git::{classify_updates, prepush, scan_outgoing, RefUpdate};
 use fail2commit_core::protocol::{Finding, FindingAction, FindingKind};
 use fail2commit_core::settings::Limits;
 use std::path::{Path, PathBuf};
@@ -48,18 +47,40 @@ fn update(new: String) -> RefUpdate {
     }
 }
 
+fn real_git() -> PathBuf {
+    fail2commit_core::toolpath::find_real("git", None).unwrap()
+}
+
+fn commit_file(root: &Path, config: &Path, name: &str, contents: &[u8]) -> String {
+    std::fs::write(root.join(name), contents).unwrap();
+    git(root, config, &["add", name]);
+    git(root, config, &["commit", "-qm", name]);
+    git(root, config, &["rev-parse", "HEAD"])
+}
+
+fn scan(root: &Path, new: String, limits: &Limits) -> Vec<Finding> {
+    scan_outgoing(&real_git(), root, &[update(new)], Some("origin"), limits).unwrap()
+}
+
+fn has(f: &[Finding], k: FindingKind) -> bool {
+    f.iter().any(|f| f.kind == k)
+}
+
+fn aws() -> String {
+    ["AKIA", "QX7M2K9P4R8T3V6W"].concat()
+}
+
+// ---- W1-001 -------------------------------------------------------------
+
 #[test]
 fn repository_controlled_remote_tracking_ref_must_not_hide_outgoing_secret() {
     let (_tmp, root, config) = repo();
-    let secret = ["AKIA", "QX7M2K9P4R8T3V6W"].concat();
-    std::fs::write(root.join("credentials.txt"), format!("aws_key={secret}\n")).unwrap();
-    git(&root, &config, &["add", "credentials.txt"]);
-    git(&root, &config, &["commit", "-qm", "secret"]);
-    let head = git(&root, &config, &["rev-parse", "HEAD"]);
-
-    // This ref is local, repository-controlled state. It is not evidence that
-    // the remote has the commit, but the candidate passes --remotes=origin to
-    // rev-list and therefore excludes HEAD from the scan.
+    let head = commit_file(
+        &root,
+        &config,
+        "credentials.txt",
+        format!("aws_key={}\n", aws()).as_bytes(),
+    );
     git(
         &root,
         &config,
@@ -70,55 +91,157 @@ fn repository_controlled_remote_tracking_ref_must_not_hide_outgoing_secret() {
         &config,
         &["update-ref", "refs/remotes/origin/attacker", &head],
     );
-
-    let real_git = fail2commit_core::toolpath::find_real("git", None).unwrap();
-    let findings = scan_outgoing(
-        &real_git,
-        &root,
-        &[update(head)],
-        Some("origin"),
-        &Limits::default(),
-    )
-    .unwrap();
+    let findings = scan(&root, head, &Limits::default());
     assert!(
-        findings.iter().any(|f| f.kind == FindingKind::Secret),
+        has(&findings, FindingKind::Secret),
         "a local remote-tracking ref hid the outgoing secret: {findings:?}"
     );
 }
 
 #[test]
-fn large_blob_truncation_must_not_report_a_clean_scan() {
+fn only_the_remote_reported_old_oid_excludes_history() {
     let (_tmp, root, config) = repo();
-    let secret = ["AKIA", "QX7M2K9P4R8T3V6W"].concat();
-    let mut contents = vec![b'a'; 4 * 1024 * 1024];
-    contents.push(b'\n');
-    contents.extend_from_slice(format!("aws_key={secret}\n").as_bytes());
-    std::fs::write(root.join("large.txt"), contents).unwrap();
-    git(&root, &config, &["add", "large.txt"]);
-    git(&root, &config, &["commit", "-qm", "large"]);
-    let head = git(&root, &config, &["rev-parse", "HEAD"]);
+    let old = commit_file(&root, &config, "a.txt", format!("k={}\n", aws()).as_bytes());
+    let new = commit_file(&root, &config, "b.txt", b"clean\n");
+    git(&root, &config, &["remote", "add", "origin", "file:///x"]);
+    // The remote reported `old`: its secret is already published, not outgoing.
+    let u = RefUpdate {
+        refname: "refs/heads/main".into(),
+        old,
+        new: new.clone(),
+    };
+    let f = scan_outgoing(&real_git(), &root, &[u], Some("origin"), &Limits::default()).unwrap();
+    assert!(f.is_empty(), "{f:?}");
+    // A zero old oid (new branch) excludes nothing.
+    assert!(has(
+        &scan(&root, new, &Limits::default()),
+        FindingKind::Secret
+    ));
+}
 
-    let real_git = fail2commit_core::toolpath::find_real("git", None).unwrap();
-    let findings =
-        scan_outgoing(&real_git, &root, &[update(head)], None, &Limits::default()).unwrap();
+#[test]
+fn missing_old_object_scans_everything_and_requires_the_password() {
+    let (_tmp, root, config) = repo();
+    let head = commit_file(&root, &config, "a.txt", format!("k={}\n", aws()).as_bytes());
+    let u = RefUpdate {
+        refname: "refs/heads/main".into(),
+        old: "1".repeat(head.len()),
+        new: head,
+    };
+    let git = real_git();
+    let mut f = classify_updates(&git, &root, std::slice::from_ref(&u)).unwrap();
+    assert!(has(&f, FindingKind::IncompleteScan) && has(&f, FindingKind::RefRewrite));
+    assert!(prepush::needs_password(&f));
+    f.extend(scan_outgoing(&git, &root, &[u], Some("origin"), &Limits::default()).unwrap());
     assert!(
-        findings
-            .iter()
-            .any(|f| { matches!(f.kind, FindingKind::Secret | FindingKind::IncompleteScan) }),
-        "content beyond the 4 MiB prefix was skipped without an incomplete finding: {findings:?}"
+        has(&f, FindingKind::Secret),
+        "unknown old must not hide history"
     );
+}
+
+// ---- W1-002 -------------------------------------------------------------
+
+fn finding(kind: FindingKind) -> Finding {
+    Finding::new(kind, FindingAction::Approve, "git.pre-push", "x")
 }
 
 #[test]
 fn tag_replacement_must_require_the_configured_force_push_password() {
-    let findings = vec![Finding::new(
+    for k in [
         FindingKind::TagReplacement,
-        FindingAction::Approve,
-        "git.pre-push",
-        "existing tag moved",
-    )];
+        FindingKind::RefDeletion,
+        FindingKind::RefRewrite,
+        FindingKind::ForceIntent,
+    ] {
+        assert!(prepush::needs_password(&[finding(k)]), "{k:?}");
+    }
+    for k in [FindingKind::Secret, FindingKind::IncompleteScan] {
+        assert!(!prepush::needs_password(&[finding(k)]), "{k:?}");
+    }
+}
+
+// ---- W1-003 -------------------------------------------------------------
+
+#[test]
+fn blob_past_the_old_4mib_prefix_is_scanned() {
+    let (_tmp, root, config) = repo();
+    let mut contents = vec![b'a'; 4 * 1024 * 1024];
+    contents.push(b'\n');
+    contents.extend_from_slice(format!("aws_key={}\n", aws()).as_bytes());
+    let head = commit_file(&root, &config, "large.txt", &contents);
+    let f = scan(&root, head, &Limits::default());
+    assert!(has(&f, FindingKind::Secret), "{f:?}");
+}
+
+#[test]
+fn blob_over_the_single_file_limit_is_incomplete_not_clean() {
+    let (_tmp, root, config) = repo();
+    let head = commit_file(&root, &config, "huge.txt", &vec![b'a'; 33 * 1024 * 1024]);
+    let f = scan(&root, head, &Limits::default());
+    assert!(has(&f, FindingKind::IncompleteScan), "{f:?}");
+}
+
+#[test]
+fn full_object_size_is_charged_against_the_budget() {
+    let (_tmp, root, config) = repo();
+    let head = commit_file(&root, &config, "a.txt", &vec![b'a'; 100_000]);
+    let limits = Limits {
+        scan_max_bytes: 50_000,
+        ..Limits::default()
+    };
+    assert!(has(
+        &scan(&root, head.clone(), &limits),
+        FindingKind::IncompleteScan
+    ));
+    let ok = Limits {
+        scan_max_bytes: 100_000,
+        ..Limits::default()
+    };
+    assert!(scan(&root, head, &ok).is_empty());
+}
+
+#[test]
+fn missing_blob_is_incomplete_not_clean() {
+    let (_tmp, root, config) = repo();
+    let head = commit_file(&root, &config, "a.txt", b"payload\n");
+    let blob = git(&root, &config, &["rev-parse", "HEAD:a.txt"]);
+    let loose = root.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+    let mut perm = std::fs::metadata(&loose).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perm.set_readonly(false);
+    std::fs::set_permissions(&loose, perm).unwrap();
+    std::fs::remove_file(&loose).unwrap();
+    let f = scan(&root, head, &Limits::default());
+    assert!(has(&f, FindingKind::IncompleteScan), "{f:?}");
+}
+
+#[test]
+fn binary_blob_is_scanned_not_skipped_and_env_names_still_match() {
+    let (_tmp, root, config) = repo();
+    let mut bin = vec![0u8; 64];
+    bin.extend_from_slice(format!(" aws_key={} ", aws()).as_bytes());
+    commit_file(&root, &config, "blob.bin", &bin);
+    commit_file(&root, &config, ".env", &[0u8, 1, 2, 3]);
+    let head = git(&root, &config, &["rev-parse", "HEAD"]);
+    let f = scan(&root, head, &Limits::default());
+    let ev: Vec<&str> = f.iter().map(|f| f.evidence.as_str()).collect();
+    assert!(ev.iter().any(|e| e.contains("aws-access-key")), "{f:?}");
     assert!(
-        prepush::needs_password(&findings),
-        "a tag replacement is an actual rewrite and must require the configured password"
+        ev.iter().any(|e| e.contains("environment file .env")),
+        "{f:?}"
     );
+}
+
+#[test]
+fn secret_inside_an_overlong_line_is_found() {
+    let (_tmp, root, config) = repo();
+    let line = format!(
+        "{}aws_key={}{}\n",
+        "x ".repeat(10_000),
+        aws(),
+        " y".repeat(10_000)
+    );
+    let head = commit_file(&root, &config, "min.js", line.as_bytes());
+    let f = scan(&root, head, &Limits::default());
+    assert!(has(&f, FindingKind::Secret), "{f:?}");
 }

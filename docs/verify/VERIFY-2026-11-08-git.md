@@ -77,3 +77,20 @@ cargo test --workspace --no-fail-fast
 - [ ] **Verified**
 - [x] **Not verified (partial):** all local-hook behaviour passes on both platforms, but real approval
   channels (T-002), the real registry PATH edit and WSL/PowerShell runs are Pending, so FR-001 is not marked Verified.
+
+
+---
+
+## Update 2026-11-09: wave-1 review fixes W1-001..W1-003 (FR-001, FR-002)
+
+Source: `docs/verify/REVIEW-2026-11-09-wave1.md`. Branch `DansPK/f2c-fix-wave1-git`, based on `0a88dca`.
+
+| Finding | Fix | Evidence |
+|---|---|---|
+| W1-001 | `--remotes=<name>` exclusion removed; only the reported old OIDs exclude history | `review_wave1::repository_controlled_remote_tracking_ref_must_not_hide_outgoing_secret`, `only_the_remote_reported_old_oid_excludes_history`, `missing_old_object_scans_everything_and_requires_the_password` |
+| W1-002 | `needs_password` also covers `TagReplacement` and `RefDeletion`; a missing old object or failed ancestry check adds a `RefRewrite` finding | `review_wave1::tag_replacement_must_require_the_configured_force_push_password`; `cmd::hook::tests::destructive_updates_require_password_without_shim_intent` (hook path, no `FAIL2COMMIT_PUSH_INTENT`, password configured) |
+| W1-003 | Blobs are sized first, read whole, full size charged; missing, oversize, over-budget blobs give `IncompleteScan`; binary blobs and overlong lines are scanned | `review_wave1::blob_*`, `full_object_size_is_charged_against_the_budget`, `missing_blob_is_incomplete_not_clean`, `binary_blob_is_scanned_not_skipped_and_env_names_still_match`, `secret_inside_an_overlong_line_is_found`; `git::detect::tests::overlong_lines_are_scanned_not_skipped` |
+| Tests hung on the console | Hook honours `FAIL2COMMIT_HOOK_FAIL_CLOSED`; `git_support` and the argv0 shim test set it and use null stdin | `git_push` 13 passed in 17 s, `git_setup` 6 passed in 10 s (was 304 s) with stdin from an empty file |
+
+The earlier "blobs over 4 MiB are scanned by their first 4 MiB" limit in section 4 no longer applies.
+Real approval channels still need a console or tray run (Pending, see section 2).

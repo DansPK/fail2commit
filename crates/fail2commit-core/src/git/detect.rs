@@ -86,31 +86,72 @@ fn placeholder(v: &str) -> bool {
 pub fn scan_text(text: &str) -> Vec<Hit> {
     let r = rules();
     let mut hits = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        if line.len() > 8192 {
-            continue; // minified blobs: cheap guard against pathological lines
-        }
-        for (name, re) in &r.fixed {
-            if let Some(m) = re.find(line) {
-                hits.push(Hit {
-                    detector: name,
-                    line: i + 1,
-                    evidence: crate::redact::redact(m.as_str()),
-                });
+    for (i, full) in text.lines().enumerate() {
+        // Overlong (minified/binary) lines are scanned in overlapping windows,
+        // never skipped, so no byte goes unexamined.
+        let first = hits.len();
+        for line in windows(full) {
+            for (name, re) in &r.fixed {
+                if let Some(m) = re.find(line) {
+                    hits.push(Hit {
+                        detector: name,
+                        line: i + 1,
+                        evidence: crate::redact::redact(m.as_str()),
+                    });
+                }
+            }
+            if let Some(c) = r.generic.captures(line) {
+                let v = &c[1];
+                if !placeholder(v) && entropy(v) >= 3.0 {
+                    hits.push(Hit {
+                        detector: "generic-assignment",
+                        line: i + 1,
+                        evidence: crate::redact::redact(v),
+                    });
+                }
             }
         }
-        if let Some(c) = r.generic.captures(line) {
-            let v = &c[1];
-            if !placeholder(v) && entropy(v) >= 3.0 {
-                hits.push(Hit {
-                    detector: "generic-assignment",
-                    line: i + 1,
-                    evidence: crate::redact::redact(v),
-                });
+        // at most one hit per (detector, line) across windows
+        let mut seen: Vec<&'static str> = Vec::new();
+        let mut keep = first;
+        for j in first..hits.len() {
+            if !seen.contains(&hits[j].detector) {
+                seen.push(hits[j].detector);
+                hits.swap(keep, j);
+                keep += 1;
             }
         }
+        hits.truncate(keep);
     }
     hits
+}
+
+const WINDOW: usize = 8192;
+const OVERLAP: usize = 512;
+
+/// The line itself, or overlapping char-aligned windows when it is long.
+fn windows(line: &str) -> Vec<&str> {
+    if line.len() <= WINDOW {
+        return vec![line];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < line.len() {
+        let mut end = (start + WINDOW).min(line.len());
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push(&line[start..end]);
+        if end == line.len() {
+            break;
+        }
+        let mut next = end - OVERLAP;
+        while !line.is_char_boundary(next) {
+            next += 1;
+        }
+        start = next;
+    }
+    out
 }
 
 /// `.env` / `.env.*` by basename bytes, except documented templates.
@@ -143,6 +184,22 @@ mod tests {
             ".envrc",
         ] {
             assert!(!is_env_file(p.as_bytes()), "{p}");
+        }
+    }
+
+    #[test]
+    fn overlong_lines_are_scanned_not_skipped() {
+        let aws = ["AKIA", "QX7M2K9P4R8T3V6W"].concat();
+        // secret straddling a window boundary and one deep inside a long line
+        for pad in [WINDOW - 8, 20_000] {
+            let text = format!(
+                "{}{aws} {}\nnext\n",
+                "a ".repeat(pad / 2),
+                "b ".repeat(5000)
+            );
+            let hits = scan_text(&text);
+            assert_eq!(hits.len(), 1, "pad {pad}");
+            assert_eq!((hits[0].detector, hits[0].line), ("aws-access-key", 1));
         }
     }
 

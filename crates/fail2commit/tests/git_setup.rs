@@ -216,7 +216,10 @@ fn installed_shim_routes_push_by_argv0() {
         .env("GIT_CONFIG_GLOBAL", &env.gitcfg)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("FAIL2COMMIT_HOME", &env.f2c_home)
-        .env("FAIL2COMMIT_PATH_TARGET", &env.path_target);
+        .env("FAIL2COMMIT_PATH_TARGET", &env.path_target)
+        // unattended: the hook must fail closed, never open a console prompt
+        .env("FAIL2COMMIT_HOOK_FAIL_CLOSED", "1")
+        .stdin(std::process::Stdio::null());
     let o = c.output().unwrap();
     assert_blocked(&o, "ForceIntent");
 }

@@ -82,6 +82,9 @@ impl Env {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("FAIL2COMMIT_HOME", &self.f2c_home)
             .env("FAIL2COMMIT_PATH_TARGET", &self.path_target)
+            // The hook never opens an approval channel (no CONIN$ or
+            // /dev/tty): every pause fails closed, so tests run unattended.
+            .env("FAIL2COMMIT_HOOK_FAIL_CLOSED", "1")
             .stdin(std::process::Stdio::null());
     }
 

@@ -91,10 +91,17 @@ struct Plan<'a> {
 }
 
 /// Whether a plan needs the force-push password (when one is configured).
+/// Every destructive update counts, whether or not the shim recorded intent.
 pub fn needs_password(findings: &[Finding]) -> bool {
-    findings
-        .iter()
-        .any(|f| matches!(f.kind, FindingKind::ForceIntent | FindingKind::RefRewrite))
+    findings.iter().any(|f| {
+        matches!(
+            f.kind,
+            FindingKind::ForceIntent
+                | FindingKind::RefRewrite
+                | FindingKind::TagReplacement
+                | FindingKind::RefDeletion
+        )
+    })
 }
 
 /// Build the single request, bound to remote, url, every tuple and every
