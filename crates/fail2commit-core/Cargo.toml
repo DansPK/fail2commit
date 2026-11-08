@@ -4,3 +4,30 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+argon2 = "0.6.0"
+base64 = "0.23.1"
+flate2 = "1.1.11"
+getrandom = "0.4.3"
+hex = "0.4.3"
+regex = "1.13.1"
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tar = "0.4.46"
+toml = "1.2.1"
+ureq = "3.5.1"
+zeroize = "1.9.1"
+zip = { version = "9.4.2", default-features = false, features = ["deflate"] }
+tempfile = "3.27.0"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.191"
+
+[target."cfg(windows)".dependencies]
+# SPEC-007: exact pin; source review recorded in docs/verify before claiming controls.
+sandboxrs-windows = "=0.1.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Console"] }
+
