@@ -454,13 +454,27 @@ fn scan_blobs(
             for h in scan_text(&String::from_utf8_lossy(&buf)) {
                 hits.push((path.clone(), h));
             }
-            match utf16_view(&buf) {
-                Utf16::No => {}
-                Utf16::Text(t) => hits.extend(scan_text(&t).into_iter().map(|h| (path.clone(), h))),
+            let clean_utf16 = match utf16_view(&buf) {
+                Utf16::No => false,
+                Utf16::Text(t) => {
+                    hits.extend(scan_text(&t).into_iter().map(|h| (path.clone(), h)));
+                    true
+                }
                 Utf16::Broken(t) => {
                     undecoded += 1;
                     hits.extend(scan_text(&t).into_iter().map(|h| (path.clone(), h)));
+                    false
                 }
+            };
+            // R2-001/R2-002: BOM-less, diluted UTF-16 and UTF-32 (either byte
+            // order) keep ASCII secrets intact once NUL bytes are dropped.
+            if !clean_utf16 && buf.contains(&0) {
+                let stripped: Vec<u8> = buf.iter().copied().filter(|b| *b != 0).collect();
+                hits.extend(
+                    scan_text(&String::from_utf8_lossy(&stripped))
+                        .into_iter()
+                        .map(|h| (path.clone(), h)),
+                );
             }
         }
         Ok(())

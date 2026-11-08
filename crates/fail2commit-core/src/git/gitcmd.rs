@@ -27,6 +27,8 @@ impl GitOut {
 /// - `core.commitGraph=false`: a forged commit-graph file is a repository
 ///   controlled cache that could alter traversal.
 /// - `core.fsmonitor=false`: a repository config value there names a program.
+/// - `log.showSignature=false`: with it on, `git log` runs the repository's
+///   `gpg.program` (R2-003).
 /// - `GIT_NO_LAZY_FETCH`: a partial clone must not start a network fetch.
 /// - no prompts, no optional locks.
 pub(crate) fn command(git: &Path, repo: &Path) -> Command {
@@ -34,11 +36,13 @@ pub(crate) fn command(git: &Path, repo: &Path) -> Command {
     c.current_dir(repo)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "core.commitGraph")
         .env("GIT_CONFIG_VALUE_0", "false")
         .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
         .env("GIT_CONFIG_VALUE_1", "false")
+        .env("GIT_CONFIG_KEY_2", "log.showSignature")
+        .env("GIT_CONFIG_VALUE_2", "false")
         .env_remove("GIT_REPLACE_REF_BASE")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
