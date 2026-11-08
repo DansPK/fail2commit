@@ -18,6 +18,7 @@ mod config;
 mod lockfile;
 mod review;
 mod runner;
+mod scripts;
 mod shim;
 
 use crate::approval::ApprovalCtx;
