@@ -1,0 +1,58 @@
+{
+  "name": "fail2commit",
+  "displayName": "fail2commit",
+  "description": "Guarded Git push, npm and pip installs through the fail2commit CLI.",
+  "version": "0.1.0",
+  "publisher": "fail2commit",
+  "license": "MIT",
+  "private": true,
+  "repository": { "type": "git", "url": "https://github.com/fail2commit/fail2commit" },
+  "engines": { "vscode": "^1.90.0", "node": ">=20" },
+  "categories": ["Other"],
+  "extensionKind": ["workspace"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "fail2commit runs a trusted CLI against the workspace and only works in trusted workspaces."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "fail2commit needs a real folder on disk."
+    }
+  },
+  "main": "./out/src/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "fail2commit",
+      "properties": {
+        "fail2commit.cliPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "markdownDescription": "Absolute path to the trusted `fail2commit` executable. Machine scope only: a workspace `.vscode/settings.json` cannot set it. Paths inside an open workspace folder are rejected."
+        }
+      }
+    },
+    "commands": [
+      { "command": "fail2commit.push", "title": "Guarded Push", "category": "fail2commit" },
+      { "command": "fail2commit.npm", "title": "Guarded npm install/ci", "category": "fail2commit" },
+      { "command": "fail2commit.pip", "title": "Guarded pip install", "category": "fail2commit" },
+      { "command": "fail2commit.status", "title": "Status", "category": "fail2commit" },
+      { "command": "fail2commit.sandboxOn", "title": "Sandbox On", "category": "fail2commit" },
+      { "command": "fail2commit.sandboxOff", "title": "Sandbox Off", "category": "fail2commit" },
+      { "command": "fail2commit.showFindings", "title": "Show Findings", "category": "fail2commit" }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "pretest": "npm run compile",
+    "test": "node --test out/test/*.test.js",
+    "package": "npm run compile && npx @vscode/vsce package --allow-missing-repository --skip-license"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "1.90.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.5.0"
+  }
+}
