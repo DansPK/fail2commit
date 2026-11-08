@@ -21,7 +21,7 @@ use crate::protocol::{ApprovalRequest, Decision, MAX_MESSAGE_BYTES};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -145,13 +145,158 @@ impl Expected {
     }
 }
 
+/// Loopback listener on an ephemeral port. On Windows the socket is bound with
+/// `SO_EXCLUSIVEADDRUSE` and is not inheritable, so no other socket can
+/// co-bind the port with `SO_REUSEADDR` and intercept the hook (RR-001).
+fn bind_loopback() -> std::io::Result<TcpListener> {
+    #[cfg(windows)]
+    return exclusive::bind_loopback();
+    #[cfg(not(windows))]
+    TcpListener::bind(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        0,
+    ))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod exclusive {
+    use std::net::TcpListener;
+    use std::os::windows::io::FromRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        bind, closesocket, listen, setsockopt, WSAGetLastError, WSASocketW, WSAStartup, AF_INET,
+        INVALID_SOCKET, IN_ADDR, IN_ADDR_0, IPPROTO_TCP, SOCKADDR, SOCKADDR_IN, SOCKET,
+        SOCK_STREAM, SOL_SOCKET, SOMAXCONN, SO_EXCLUSIVEADDRUSE, WSADATA,
+        WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+    };
+
+    fn last() -> std::io::Error {
+        // SAFETY: reads the calling thread's WinSock error code.
+        std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    fn close_with(s: SOCKET, e: std::io::Error) -> std::io::Error {
+        // SAFETY: `s` is a socket this module created and still owns.
+        unsafe { closesocket(s) };
+        e
+    }
+
+    pub(super) fn loopback(port: u16) -> SOCKADDR_IN {
+        SOCKADDR_IN {
+            sin_family: AF_INET,
+            sin_port: port.to_be(),
+            sin_addr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                },
+            },
+            sin_zero: [0; 8],
+        }
+    }
+
+    /// New non-inheritable TCP socket with `opt` set to 1 at `SOL_SOCKET`.
+    pub(super) fn socket_with(opt: i32) -> std::io::Result<SOCKET> {
+        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        // SAFETY: WSAStartup is reference counted (std calls it too); `data` is a
+        // valid out parameter.
+        if unsafe { WSAStartup(0x0202, &mut data) } != 0 {
+            return Err(last());
+        }
+        // SAFETY: plain socket creation with no protocol info; result checked.
+        let s = unsafe {
+            WSASocketW(
+                AF_INET as i32,
+                SOCK_STREAM,
+                IPPROTO_TCP,
+                std::ptr::null(),
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+            )
+        };
+        if s == INVALID_SOCKET {
+            return Err(last());
+        }
+        let one: i32 = 1;
+        // SAFETY: `s` is valid; the option value is a live 4-byte i32.
+        let rc = unsafe {
+            setsockopt(
+                s,
+                SOL_SOCKET,
+                opt,
+                &one as *const i32 as *const u8,
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        if rc != 0 {
+            return Err(close_with(s, last()));
+        }
+        Ok(s)
+    }
+
+    /// Bind `s` to 127.0.0.1:`port`.
+    pub(super) fn bind_to(s: SOCKET, port: u16) -> std::io::Result<()> {
+        let addr = loopback(port);
+        // SAFETY: `addr` is a valid SOCKADDR_IN that outlives the call.
+        let rc = unsafe {
+            bind(
+                s,
+                &addr as *const SOCKADDR_IN as *const SOCKADDR,
+                std::mem::size_of::<SOCKADDR_IN>() as i32,
+            )
+        };
+        if rc != 0 {
+            Err(last())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn bind_loopback() -> std::io::Result<TcpListener> {
+        let s = socket_with(SO_EXCLUSIVEADDRUSE)?;
+        if let Err(e) = bind_to(s, 0) {
+            return Err(close_with(s, e));
+        }
+        // SAFETY: `s` is a bound socket owned here.
+        if unsafe { listen(s, SOMAXCONN as i32) } != 0 {
+            return Err(close_with(s, last()));
+        }
+        // SAFETY: ownership of `s` moves into the TcpListener, which closes it.
+        Ok(unsafe { TcpListener::from_raw_socket(s as u64) })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Networking::WinSock::SO_REUSEADDR;
+
+        #[test]
+        fn reuseaddr_socket_cannot_cobind_the_relay_port() {
+            let listener = bind_loopback().unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let attacker = socket_with(SO_REUSEADDR).unwrap();
+            let res = bind_to(attacker, port);
+            // SAFETY: `attacker` is owned by this test.
+            unsafe { closesocket(attacker) };
+            assert!(
+                res.is_err(),
+                "a SO_REUSEADDR socket co-bound the relay port"
+            );
+            // Control: a free port binds fine with the same attacker setup.
+            let control = socket_with(SO_REUSEADDR).unwrap();
+            let ok = bind_to(control, 0);
+            unsafe { closesocket(control) };
+            assert!(ok.is_ok(), "control bind failed: {ok:?}");
+        }
+    }
+}
+
 /// Bind a loopback listener; serve one authenticated request for `expected`
 /// through `decide`.
 pub fn start(
     expected: Expected,
     decide: impl Fn(&ApprovalRequest) -> crate::Result<Decision> + Send + Sync + 'static,
 ) -> crate::Result<Relay> {
-    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    let listener = bind_loopback()?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let token = random_hex32()?;
