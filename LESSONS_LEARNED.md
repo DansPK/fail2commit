@@ -41,6 +41,14 @@
 
 **Why it's invisible:** ASCII-only files round-trip fine; the damage shows only on non-ASCII characters.
 
+## Agent file writes can turn `\uXXXX` escapes into real characters
+
+**Problem:** a TypeScript regex written as `/[ -‮]/` reached disk with literal U+2028 (a line terminator), which split the regex literal and broke compilation. Other non-ASCII escapes silently became invisible raw characters in the source.
+
+**Correct Pattern:** keep security-relevant character tables pure ASCII, as numeric code-point ranges (`[0x2028, 0x202e]`) or Rust `'\u{2028}'` brace escapes, and check with a script that the file has no characters above 0x7E.
+
+**Why it's invisible:** the source looks right in most editors, and the bug only shows when a line-terminator character lands inside a literal.
+
 ## Many parallel Orca worktrees overload a desktop host
 
 **Problem:** about 10 concurrent agent worktrees, each running cargo at full parallelism with Docker builds, made the Windows host lag badly, and agents crashed.
