@@ -3,12 +3,13 @@ import { execFile } from "node:child_process";
 import * as os from "node:os";
 import { ApprovalRequest, Decision, Finding, Response, runApi } from "./client";
 import { resolveCli, trustedSetting } from "./cli";
+import { sanitize } from "./sanitize";
 
 let channel: vscode.OutputChannel;
 let lastFindings: Finding[] = [];
 
 const fmt = (f: Finding) =>
-  `[${f.action}] ${f.kind} (${f.source})${f.target ? ` ${f.target}` : ""}${f.location ? ` @ ${f.location}` : ""}: ${f.evidence}`;
+  sanitize(`[${f.action}] ${f.kind} (${f.source})${f.target ? ` ${f.target}` : ""}${f.location ? ` @ ${f.location}` : ""}: ${f.evidence}`);
 
 function git(cwd: string, args: string[]): Promise<string[]> {
   return new Promise((resolve) =>
@@ -19,9 +20,9 @@ function git(cwd: string, args: string[]): Promise<string[]> {
 async function approve(req: ApprovalRequest) {
   const labels: Record<string, Decision> = { "Approve once": "approve_once", "Run on host once": "run_on_host_once" };
   const buttons = Object.keys(labels).filter((l) => req.allowed.includes(labels[l]));
-  const detail = [...(req.details ?? []), ...(req.findings ?? []).map(fmt)].join("\n");
+  const detail = [...(req.details ?? []).map(sanitize), ...(req.findings ?? []).map(fmt)].join("\n");
   // The modal's built-in Cancel is the default; dismissing returns undefined.
-  const pick = await vscode.window.showWarningMessage(req.summary, { modal: true, detail }, ...buttons);
+  const pick = await vscode.window.showWarningMessage(sanitize(req.summary), { modal: true, detail }, ...buttons);
   if (!pick) return { decision: "cancel" as Decision };
   let password: string | undefined;
   if (req.password_required) {
@@ -43,22 +44,22 @@ async function run(argv: string[], cwd: string): Promise<void> {
     vscode.window.showErrorMessage(cli.error);
     return;
   }
-  channel.appendLine(`> fail2commit ${argv.join(" ")}`);
+  channel.appendLine(sanitize(`> fail2commit ${argv.join(" ")}`));
   try {
     const res: Response = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `fail2commit ${argv[0]}` },
       (p) => runApi({
         cli: cli.path, argv, cwd,
-        ui: { approve, progress: (m) => { p.report({ message: m }); channel.appendLine(m); } },
+        ui: { approve, progress: (m) => { p.report({ message: sanitize(m) }); channel.appendLine(sanitize(m)); } },
       }));
     lastFindings = res.findings;
-    channel.appendLine(`${res.code}: ${res.message}`);
+    channel.appendLine(sanitize(`${res.code}: ${res.message}`));
     res.findings.forEach((f) => channel.appendLine("  " + fmt(f)));
     const show = res.code === "ok" ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
-    show(`fail2commit: ${res.message || res.code}`);
+    show(sanitize(`fail2commit: ${res.message || res.code}`));
   } catch (e) {
-    channel.appendLine(`error: ${(e as Error).message}`);
-    vscode.window.showErrorMessage(`fail2commit: ${(e as Error).message}`);
+    channel.appendLine(sanitize(`error: ${(e as Error).message}`));
+    vscode.window.showErrorMessage(sanitize(`fail2commit: ${(e as Error).message}`));
   }
 }
 

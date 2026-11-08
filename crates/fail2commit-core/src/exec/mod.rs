@@ -89,8 +89,8 @@ fn authorize(
                 ApprovalKind::HostExecution,
                 digest,
                 format!(
-                    "{summary}
-Run on host once: sandbox is off, so package code gains the                      current user's access and does not run in the sandbox."
+                    "{summary}\nRun on host once: sandbox is off, so package code gains the \
+                     current user's access and does not run in the sandbox."
                 ),
                 vec!["Runs with the current user's access, outside the sandbox.".into()],
                 vec![finding],
