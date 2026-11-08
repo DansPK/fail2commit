@@ -27,7 +27,7 @@ fn request(tag: &str, password: bool) -> ApprovalRequest {
     new_request(
         ApprovalKind::Operation,
         &Digest::of("git.push", &serde_json::json!([tag])).unwrap(),
-        format!("push {tag}"),
+        format!("git push to origin (file:///r): {tag}"),
         vec![],
         vec![],
         60,
@@ -37,11 +37,19 @@ fn request(tag: &str, password: bool) -> ApprovalRequest {
     .unwrap()
 }
 
+pub fn expected() -> relay::Expected {
+    relay::Expected {
+        remote: "origin".into(),
+        url: "file:///r".into(),
+        ttl_secs: 300,
+    }
+}
+
 /// A relay whose host decision is `ApproveOnce`, counting how often it ran.
 fn counting_relay() -> (relay::Relay, Arc<AtomicUsize>) {
     let n = Arc::new(AtomicUsize::new(0));
     let n2 = n.clone();
-    let r = relay::start(move |_| {
+    let r = relay::start(expected(), move |_| {
         n2.fetch_add(1, Ordering::SeqCst);
         Ok(Decision::ApproveOnce)
     })
@@ -221,10 +229,10 @@ fn er003_silent_peers_cannot_delay_or_consume_the_request() {
     assert_eq!(ran.load(Ordering::SeqCst), 1);
 }
 
-/// The relay gives up after a small number of attempts and stops listening;
-/// silent peers are dropped after a short pre-auth deadline.
+/// RR-002: silent peers are dropped after a short pre-auth deadline, and many
+/// token-less connections do not end the relay; the real request is answered.
 #[test]
-fn relay_attempts_are_capped_and_pre_auth_reads_time_out() {
+fn tokenless_connections_neither_use_the_slot_nor_stop_the_relay() {
     let (r, ran) = counting_relay();
     let addr = addr_of(&r);
     let mut silent = TcpStream::connect(&addr).unwrap();
@@ -238,16 +246,12 @@ fn relay_attempts_are_capped_and_pre_auth_reads_time_out() {
     let _junk: Vec<TcpStream> = (0..40)
         .filter_map(|_| TcpStream::connect(&addr).ok())
         .collect();
-    let t0 = Instant::now();
-    while TcpStream::connect(&addr).is_ok() {
-        assert!(t0.elapsed() < Duration::from_secs(10), "still listening");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
     assert_eq!(
         relay::forward(&request("late", false), r.env_value()),
-        Decision::Cancel
+        Decision::ApproveOnce
     );
-    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
 }
 
 /// The relay stops when its owner (the push) ends.

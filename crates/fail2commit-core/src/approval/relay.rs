@@ -9,9 +9,12 @@
 //! HMAC-SHA-256 keyed by the relay token. A password never crosses the relay,
 //! and the token is never sent: both directions carry a MAC, not the key.
 //!
-//! The relay serves exactly one authenticated request and then stops
-//! listening. Unauthenticated or malformed connections are dropped without
-//! using that slot, within a short deadline, up to a small attempt cap.
+//! The relay serves exactly one authenticated request that matches the push
+//! the host runs. The listener stays bound until the [`Relay`] drops (RR-001),
+//! so no other process can take the port; after the slot is used every
+//! connection is accepted and closed. Connections without a valid token or with
+//! a request for another push are dropped individually, under a short deadline,
+//! and never use the slot (RR-002, RR-003).
 
 use crate::digest::{ct_eq, random_hex32};
 use crate::protocol::{ApprovalRequest, Decision, MAX_MESSAGE_BYTES};
@@ -19,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,8 +32,8 @@ pub const ENV: &str = "FAIL2COMMIT_APPROVAL_RELAY";
 
 /// Time a new connection gets to send its authenticated request line.
 const PRE_AUTH: Duration = Duration::from_secs(2);
-/// Accepted connections before the relay gives up listening.
-const MAX_ATTEMPTS: u32 = 16;
+/// Connections handled at once; extras are closed unread (fails closed).
+const MAX_INFLIGHT: usize = 256;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The host's complete approval (stdio round trip, validation, password).
@@ -118,8 +121,34 @@ fn read_line(mut conn: &TcpStream, deadline: Instant) -> Option<Vec<u8>> {
     }
 }
 
-/// Bind a loopback listener; serve one authenticated request through `decide`.
+/// The push the host itself runs (from its own argv and config). A relayed
+/// request that names anything else is dropped without using the slot.
+#[derive(Clone)]
+pub struct Expected {
+    pub remote: String,
+    /// The push URL with credentials already redacted.
+    pub url: String,
+    /// `approval.request_ttl_secs`: the upper bound on a request's lifetime.
+    pub ttl_secs: u64,
+}
+
+impl Expected {
+    /// Check the request and clamp `expires_at` to now plus the host's TTL.
+    fn bind(&self, mut req: ApprovalRequest) -> Option<ApprovalRequest> {
+        let prefix = format!("git push to {} ({}): ", self.remote, self.url);
+        let ok = req.kind == crate::protocol::ApprovalKind::Operation
+            && req.summary.starts_with(&prefix)
+            && req.allowed == [Decision::ApproveOnce];
+        let cap = crate::approver::now_secs().saturating_add(self.ttl_secs);
+        req.expires_at = req.expires_at.min(cap);
+        ok.then_some(req)
+    }
+}
+
+/// Bind a loopback listener; serve one authenticated request for `expected`
+/// through `decide`.
 pub fn start(
+    expected: Expected,
     decide: impl Fn(&ApprovalRequest) -> crate::Result<Decision> + Send + Sync + 'static,
 ) -> crate::Result<Relay> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
@@ -127,30 +156,49 @@ pub fn start(
     let port = listener.local_addr()?.port();
     let token = random_hex32()?;
     let stop = Arc::new(AtomicBool::new(false));
-    let used = Arc::new(AtomicBool::new(false));
-    let decide: Arc<Decide> = Arc::new(decide);
-    let (t, s) = (token.clone(), stop.clone());
+    let st = Arc::new(State {
+        token: token.clone(),
+        expected,
+        used: AtomicBool::new(false),
+        inflight: AtomicUsize::new(0),
+        decide: Box::new(decide),
+    });
+    let s = stop.clone();
     std::thread::spawn(move || {
-        let mut attempts = 0;
-        while !s.load(Ordering::SeqCst) && !used.load(Ordering::SeqCst) && attempts < MAX_ATTEMPTS {
+        // RR-001: the listener lives until the Relay drops, used or not.
+        while !s.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((conn, _)) => {
-                    attempts += 1;
-                    let (t, u, d) = (t.clone(), used.clone(), decide.clone());
-                    std::thread::spawn(move || serve(conn, &t, &u, &*d));
+                    let over = st.inflight.fetch_add(1, Ordering::SeqCst) >= MAX_INFLIGHT;
+                    if over || st.used.load(Ordering::SeqCst) {
+                        st.inflight.fetch_sub(1, Ordering::SeqCst);
+                        continue; // dropped: closed at once
+                    }
+                    let st = st.clone();
+                    std::thread::spawn(move || {
+                        serve(conn, &st);
+                        st.inflight.fetch_sub(1, Ordering::SeqCst);
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                Err(_) => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
             }
         }
-        // The listener drops here: nothing accepts after the slot is used.
     });
     Ok(Relay {
         value: format!("127.0.0.1:{port}/{token}"),
         stop,
     })
+}
+
+struct State {
+    token: String,
+    expected: Expected,
+    used: AtomicBool,
+    inflight: AtomicUsize,
+    decide: Box<Decide>,
 }
 
 impl Relay {
@@ -166,7 +214,7 @@ impl Drop for Relay {
     }
 }
 
-fn serve(conn: TcpStream, token: &str, used: &AtomicBool, decide: &Decide) {
+fn serve(conn: TcpStream, st: &State) {
     let _ = conn.set_nonblocking(false);
     let _ = conn.set_write_timeout(Some(WRITE_TIMEOUT));
     let Some(line) = read_line(&conn, Instant::now() + PRE_AUTH) else {
@@ -177,21 +225,26 @@ fn serve(conn: TcpStream, token: &str, used: &AtomicBool, decide: &Decide) {
     };
     if !ct_eq(
         fwd.mac.as_bytes(),
-        request_mac(token, &fwd.request).as_bytes(),
+        request_mac(&st.token, &fwd.request).as_bytes(),
     ) {
         return;
     }
     let Ok(req) = serde_json::from_str::<ApprovalRequest>(&fwd.request) else {
         return;
     };
-    // Authenticated: exactly one such request is served.
-    if used
+    // Authenticated, and it must describe the push this host runs (RR-003).
+    let Some(mut req) = st.expected.bind(req) else {
+        return;
+    };
+    // Only now does the single slot get used.
+    if st
+        .used
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return;
     }
-    let decision = match decide(&req) {
+    let decision = match (st.decide)(&req) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("fail2commit: {e}");
@@ -199,10 +252,16 @@ fn serve(conn: TcpStream, token: &str, used: &AtomicBool, decide: &Decide) {
         }
     };
     let reply = Reply {
-        mac: reply_mac(token, &req.request_id, &req.nonce, &req.digest, decision),
-        request_id: req.request_id,
-        nonce: req.nonce,
-        digest: req.digest,
+        mac: reply_mac(
+            &st.token,
+            &req.request_id,
+            &req.nonce,
+            &req.digest,
+            decision,
+        ),
+        request_id: std::mem::take(&mut req.request_id),
+        nonce: std::mem::take(&mut req.nonce),
+        digest: std::mem::take(&mut req.digest),
         decision,
     };
     if let Ok(text) = serde_json::to_string(&reply) {
