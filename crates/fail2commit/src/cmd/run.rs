@@ -59,7 +59,9 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
     }
     let to = args.to.as_deref().map(std::path::absolute).transpose()?;
     let limits = &ctx.settings.limits;
-    let staging = ctx.paths.cache_dir.join("staging");
+    // CR-007: the Windows backend only accepts stages that are direct children
+    // of this fail2commit-owned root.
+    let staging = ctx.paths.cache_dir.join("sandbox-stage");
     fsutil::ensure_private_dir(&staging)?;
     let stage = Stage::new(&staging)?;
     let work = stage.0.join("work");
@@ -265,12 +267,11 @@ fn system_roots() -> Vec<PathBuf> {
         .collect()
 }
 
+/// No in-place system roots on Windows: the AppContainer backend grants only
+/// inside the job stage (CR-007), so even `cmd.exe` is copied into it.
 #[cfg(windows)]
 fn system_roots() -> Vec<PathBuf> {
-    std::env::var_os("SystemRoot")
-        .and_then(|r| PathBuf::from(r).canonicalize().ok())
-        .into_iter()
-        .collect()
+    Vec::new()
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]

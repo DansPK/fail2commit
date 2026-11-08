@@ -20,6 +20,7 @@ mod review;
 mod runner;
 mod scripts;
 mod shim;
+mod stage;
 
 use crate::approval::ApprovalCtx;
 use crate::approver::new_request;
