@@ -76,6 +76,10 @@ pub struct PkgReview {
     /// `(path relative to the package, sha256)` of the manifest and every
     /// referenced file that was read.
     pub inputs: Vec<(String, String)>,
+    /// Local command paths with no candidate on disk (denied), by path.
+    pub missing: Vec<String>,
+    /// Candidates of local command paths that are absent now and must stay so.
+    pub absent: Vec<String>,
 }
 
 fn join(dir: &str, name: &str) -> String {
@@ -402,6 +406,17 @@ pub fn review_pkg_in(dir: &Path, tree: Option<&Path>, exts: Vec<String>) -> Resu
         for p in scripts::paths(cmd)? {
             cx.expand(&p)?;
         }
+        for p in scripts::local_paths(cmd)? {
+            let before = std::mem::take(&mut cx.wanted);
+            cx.expand(&p)?;
+            let mine = cx.wanted.clone();
+            if !mine.iter().any(|r| dir.join(r).is_file()) {
+                out.missing.push(p);
+            }
+            out.absent
+                .extend(mine.iter().filter(|r| !dir.join(r).exists()).cloned());
+            cx.wanted.extend(before);
+        }
         if let Some(tree) = tree {
             for w in scripts::first_words(cmd) {
                 cx.bin_command(tree, &w);
@@ -502,6 +517,18 @@ pub fn review(
                 .location(name.clone()),
             );
         }
+        for name in &r.missing {
+            reviewed.findings.push(
+                Finding::new(
+                    FindingKind::IncompleteScan,
+                    FindingAction::Deny,
+                    "npm.scripts",
+                    format!("lifecycle command runs `{name}`, which does not exist at review time and could be created by an earlier script"),
+                )
+                .target(id.display())
+                .location(name.clone()),
+            );
+        }
         for name in &r.uninspectable {
             reviewed.findings.push(
                 Finding::new(
@@ -524,6 +551,7 @@ pub fn review(
         }
         rp.scripts = r.scripts;
         rp.inputs = r.inputs;
+        rp.absent = r.absent;
     }
     Ok(found)
 }
@@ -714,6 +742,19 @@ pub fn verify_after_scripts(
 /// Hash `inputs` again just before anything runs: the tree must still be the
 /// one that was reviewed.
 pub fn recheck(tree: &Path, reviewed: &Reviewed) -> Result<()> {
+    for p in &reviewed.pkgs {
+        for rel in &p.absent {
+            if std::fs::symlink_metadata(tree.join(&p.plan.path).join(rel)).is_ok() {
+                return Err(apply::mismatch(
+                    format!(
+                        "`{}/{rel}` appeared after it was reviewed as absent",
+                        p.plan.path
+                    ),
+                    Some(&p.plan.path),
+                ));
+            }
+        }
+    }
     for p in reviewed.pkgs.iter().filter(|p| !p.inputs.is_empty()) {
         for (rel, sha) in &p.inputs {
             let now = std::fs::read(tree.join(&p.plan.path).join(rel)).map(|b| sha_hex(&b));
@@ -1035,6 +1076,7 @@ mod tests {
                 file: None,
                 scripts: r.scripts,
                 inputs: r.inputs,
+                absent: vec![],
             }],
             findings: vec![],
         };

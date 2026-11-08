@@ -20,6 +20,9 @@ pub struct ReviewedPkg {
     pub scripts: Vec<(String, String)>,
     /// `(package-relative path, sha256)` of every reviewed on-disk input.
     pub inputs: Vec<(String, String)>,
+    /// Candidates of local command paths that did not exist at review time;
+    /// none may appear before the scripts run.
+    pub absent: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -163,6 +166,7 @@ pub fn review(deps: &Deps<'_>, plan: &Plan, dir: &Path) -> Result<Reviewed> {
                 file: Some(f.clone()),
                 scripts: vec![],
                 inputs: vec![],
+                absent: vec![],
             });
         }
     }
@@ -176,6 +180,7 @@ pub fn review(deps: &Deps<'_>, plan: &Plan, dir: &Path) -> Result<Reviewed> {
                 file: None,
                 scripts: vec![],
                 inputs: vec![],
+                absent: vec![],
             })
         })
         .collect();

@@ -650,3 +650,74 @@ fn d4_script_violations_fail_the_install() {
         assert!(!committed(&o, "scripty"), "{body}");
     }
 }
+
+// ------------------------------------------- local command paths must exist at review
+
+fn two_scripts(pre: &str, post: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let m = manifest(&format!(r#""preinstall":"{pre}","postinstall":"{post}""#));
+    let mut e: Vec<(&str, &[u8], u32)> = vec![("package/package.json", &m, 0o644)];
+    e.extend(files.iter().map(|(p, b)| (*p, *b, 0o644)));
+    tar_gz(&e)
+}
+
+/// An earlier script creates `./later.js`, a later script runs it: denied at review.
+#[test]
+fn d5_command_path_missing_at_review_is_denied() {
+    let make = b"require('fs').writeFileSync('later.js','console.log(1)')";
+    let bytes = two_scripts(
+        "node make.js",
+        "node ./later.js",
+        &[("package/make.js", make)],
+    );
+    let o = run(bytes, true, false, None);
+    assert!(denied_with(&o, "later.js"), "{:?}", o.result);
+    assert!(!committed(&o, "scripty"));
+    assert!(o.jobs.is_empty(), "no script may run: {:?}", o.jobs.len());
+    // The same through a bare interpreter argument and a `./` command.
+    for post in ["node later.js", "./later.js", "sh ./later.sh"] {
+        let o = run(
+            two_scripts("node make.js", post, &[("package/make.js", make)]),
+            true,
+            false,
+            None,
+        );
+        assert!(
+            denied_with(&o, "does not exist at review time"),
+            "{post}: {:?}",
+            o.result
+        );
+    }
+}
+
+/// A higher-precedence candidate (`./setup` before `setup.js`) that appears
+/// between scripts is stopped before the later script runs.
+#[test]
+fn d5_candidate_appearing_between_scripts_fails_closed() {
+    let make = b"require('fs').writeFileSync('setup','console.log(2)')";
+    let bytes = two_scripts(
+        "node make.js",
+        "node ./setup",
+        &[
+            ("package/make.js", make),
+            ("package/setup.js", b"console.log(1)"),
+        ],
+    );
+    let o = run(bytes, true, false, None);
+    assert!(denied_with(&o, "appeared after"), "{:?}", o.result);
+    assert!(!committed(&o, "scripty"));
+}
+
+/// Bare PATH commands and existing files are unaffected.
+#[test]
+fn d5_existing_and_path_commands_still_work() {
+    let bytes = two_scripts(
+        "node make.js",
+        "node ./other.js",
+        &[
+            ("package/make.js", b"console.log(1)"),
+            ("package/other.js", b"console.log(2)"),
+        ],
+    );
+    let o = run(bytes, true, false, None);
+    assert!(o.result.is_ok(), "{:?}", o.result);
+}

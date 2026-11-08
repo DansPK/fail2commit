@@ -330,7 +330,9 @@ fn control_gitignore_token_names_nothing_npm_extracted() {
         .file(".gitignore", HOSTILE);
     // npm extracted no `.gitignore` (it is `.npmignore` on disk), so the script
     // opens nothing that exists; the extracted tree is what is reviewed (CR-008).
-    assert_eq!(run_pkg(p), Ok(()));
+    // A local command path with no file on disk is an incomplete scan (round 3).
+    let e = run_pkg(p).unwrap_err();
+    assert!(e.contains("does not exist at review time"), "{e}");
 }
 
 // ---------------------------------------------------------------- RN2 repros
