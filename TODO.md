@@ -17,5 +17,5 @@ Integration branch: `DansPK/f2-commit-coordinator`. Contracts frozen at CHORE-00
 | T-008 | Manage sandbox policy | FR-008, SPEC-008 | orca:claude-sonnet | in-progress | T-007 |
 | T-009 | Ship Windows desktop integration | FR-009, SPEC-009 | orca:claude-sonnet | in-progress | T-002, T-008 |
 | T-010 | Integrate VS Code | FR-010, SPEC-010 | orca:claude-sonnet | in-progress | T-002, T-004, T-005, T-008 |
-| T-011 | Ship reproducible releases | FR-011, SPEC-011 | - | ready | T-003–T-010 |
+| T-011 | Ship reproducible releases: prep (Linux .deb, source tarball, notices, hashes, release CI); final artifact run by coordinator after integration | FR-011, SPEC-011 | orca:codex | in-progress | T-003–T-010 |
 | T-012 | Keep resource use bounded | NFR-012, SPEC-012 | - | ready | T-004, T-005, T-007, T-009 |
