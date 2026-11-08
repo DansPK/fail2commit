@@ -11,7 +11,7 @@ import dangerous_cmd  # noqa: E402
 import protected_paths  # noqa: E402
 import requirement_gate  # noqa: E402
 import trace_check  # noqa: E402
-from _guard import ROOT, hook_paths, load_config  # noqa: E402
+from _guard import ROOT, autonomous, hook_paths, load_config  # noqa: E402
 
 GUARDS = Path(__file__).resolve().parent
 PATCH = """*** Begin Patch
@@ -75,20 +75,34 @@ class ProtectedPaths(unittest.TestCase):
         for p in [".env.example", "src/main.py", "docs/specs/SPEC-001-x.md", "README.md"]:
             self.assertFalse(protected_paths.check([p], self.cfg), p)
 
-    def test_warn_asks_in_claude(self):
-        if self.cfg["mode"] != "warn":
-            self.skipTest("config not in warn mode")
-        r = run_hook("protected_paths.py", {"tool_name": "Edit", "tool_input": {"file_path": ".env"}})
-        self.assertEqual(r.returncode, 0)
-        self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
+    def test_agent_block_globs_stop_agents(self):
+        for payload in [{"tool_name": "Edit", "tool_input": {"file_path": ".env"}},
+                        codex("apply_patch", command=PATCH)]:
+            r = run_hook("protected_paths.py", payload)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertEqual(r.stdout, "")  # never emit "ask" JSON for a hard block
+            self.assertIn("protected path: .env", r.stderr)
 
-    def test_warn_is_stderr_only_in_codex(self):
+    def test_warn_path_in_claude(self):
         if self.cfg["mode"] != "warn":
             self.skipTest("config not in warn mode")
-        r = run_hook("protected_paths.py", codex("apply_patch", command=PATCH))
+        r = run_hook("protected_paths.py", {"tool_name": "Edit", "tool_input": {"file_path": "src/secrets.rs"}})
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")  # Codex can't "ask"; never emit that JSON to it
-        self.assertIn("protected path: .env", r.stderr)
+        if autonomous():
+            self.assertEqual(r.stdout, "")  # unattended: report, never prompt
+            self.assertIn("protected path: src/secrets.rs", r.stderr)
+        else:
+            self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_guard_files_stay_editable(self):
+        # AGENTS.md requires agents to keep guard copies in sync, so guards are reported, not blocked.
+        r = run_hook("protected_paths.py", {"tool_name": "Edit", "tool_input": {"file_path": ".codex/hooks/_guard.py"}})
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_git_precommit_only_warns(self):
+        r = subprocess.run([sys.executable, str(GUARDS / "protected_paths.py"), ".env", "Cargo.lock"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0 if self.cfg["mode"] == "warn" else 1, r.stderr)
 
 
 class HookPaths(unittest.TestCase):

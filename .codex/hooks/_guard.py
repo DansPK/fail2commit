@@ -22,6 +22,11 @@ def load_config(name):
     return cfg
 
 
+def autonomous():
+    """True when config.json sets autonomous.enabled: warn guards report instead of prompting."""
+    return bool(json.loads(CONFIG_FILE.read_text(encoding="utf-8")).get("autonomous", {}).get("enabled"))
+
+
 def read_todo():
     """TODO.md text with <!-- comments --> removed, so example rows never count as real tasks."""
     todo = ROOT / load_config("requirement_gate").get("todo_file", "TODO.md")
@@ -71,8 +76,8 @@ def finish(guard, mode, problems, hook=None):
     if not problems or mode == "off":
         sys.exit(0)
     msg = f"[guard:{guard}] " + "\n[guard:{0}] ".format(guard).join(problems)
-    if mode == "warn" and hook is not None and not is_codex(hook):
-        # Claude Code: ask the user instead of silently allowing.
+    if mode == "warn" and hook is not None and not is_codex(hook) and not autonomous():
+        # Claude Code: ask the user instead of silently allowing (unless running unattended).
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "ask",
