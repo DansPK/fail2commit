@@ -7,7 +7,8 @@
 //! Area modules are owned by their task worker, who must keep the public
 //! signatures marked "frozen" in each area `mod.rs`:
 //! `git` (T-001), `approval` (T-002), `server` (T-003), `npm` (T-004),
-//! `pip` (T-005), `scan` (T-006), `sandbox` (T-007), `ipc` (T-009).
+//! `pip` (T-005), `scan` (T-006), `sandbox` (T-007), `exec` (T-008),
+//! `ipc` (T-009).
 
 // Unsafe is denied crate-wide; FFI modules (Windows ACLs, pipes, sandbox
 // backends) opt in locally with `#[allow(unsafe_code)]` and a SAFETY comment.
@@ -27,6 +28,7 @@ pub mod settings;
 pub mod toolpath;
 
 pub mod approval;
+pub mod exec;
 pub mod git;
 pub mod ipc;
 pub mod npm;
