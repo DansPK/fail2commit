@@ -18,7 +18,7 @@ MSYS_NO_PATHCONV=1 docker run --rm --network none -v "$docker_archive:/input/sou
   export CARGO_TARGET_DIR=/tmp/target
   source "$source_dir/scripts/release/release-env.sh" "$source_dir"
   cd "$source_dir"
-  cargo build --release --locked --offline -p fail2commit
+  cargo build --release --locked --offline -p fail2commit -j "${CARGO_BUILD_JOBS:-2}"
   test -x /tmp/target/release/fail2commit
   /tmp/target/release/fail2commit --version
 '

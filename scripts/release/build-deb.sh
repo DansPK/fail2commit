@@ -32,6 +32,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
   -v "$docker_repo:/src" \
   -v "$target_volume:/target" \
   -e CARGO_TARGET_DIR=/target \
+  -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
   -e SOURCE_DATE_EPOCH="$epoch" \
   -e RELEASE_VERSION="$version" \
   -e RELEASE_OUT="/src/$out" \
