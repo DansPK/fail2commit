@@ -37,6 +37,9 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
                 let mut a = ctx.approval();
                 if fail_closed {
                     a.choice = ApproverChoice::None;
+                } else if std::env::var_os(approval::relay::ENV).is_some_and(|v| !v.is_empty()) {
+                    // CR-008: started by `fail2commit git push` under `api`.
+                    a.choice = ApproverChoice::Stdio;
                 }
                 approval::approve(&a, req)
             })

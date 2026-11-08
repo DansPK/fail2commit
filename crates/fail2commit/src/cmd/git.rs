@@ -6,6 +6,8 @@
 //! their own `core.hooksPath`; the hook then asks once for the whole plan.
 
 use super::{CmdResult, Ctx, Outcome};
+use fail2commit_core::approval::relay;
+use fail2commit_core::approver::ApproverChoice;
 use fail2commit_core::git::intent::{
     config_overrides, is_forced_refspec, push_intent, subcommand_index,
 };
@@ -30,7 +32,9 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let mut cmd = Command::new(&real);
-    cmd.env_remove(INTENT_ENV);
+    cmd.env_remove(INTENT_ENV).env_remove(relay::ENV);
+    // CR-008: under `fail2commit api` the pre-push hook asks through this relay.
+    let mut _relay = None;
 
     match subcommand_index(&lossy) {
         Some(i) => {
@@ -57,6 +61,16 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
                         ))
                         .arg("push")
                         .args(&push_args);
+                    if ctx.approver == ApproverChoice::None {
+                        // `--approver none` must reach the hook, which would
+                        // otherwise prompt on a console it finds.
+                        cmd.env(super::hook::FAIL_CLOSED_ENV, "1");
+                    }
+                    if ctx.approver == ApproverChoice::Stdio {
+                        let r = relay::start()?;
+                        cmd.env(relay::ENV, r.env_value());
+                        _relay = Some(r);
+                    }
                     if !reasons.is_empty() {
                         cmd.env(
                             INTENT_ENV,
