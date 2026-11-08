@@ -63,7 +63,9 @@ async function run(argv: string[], cwd: string): Promise<void> {
   }
 }
 
-const pick = (items: string[], placeHolder: string) => vscode.window.showQuickPick(items, { placeHolder });
+// Labels are sanitized for display; the raw value is what gets passed on (R1-006).
+const pick = async (items: string[], placeHolder: string) =>
+  (await vscode.window.showQuickPick(items.map((v) => ({ label: sanitize(v), value: v })), { placeHolder }))?.value;
 
 export function activate(ctx: vscode.ExtensionContext) {
   channel = vscode.window.createOutputChannel("fail2commit");

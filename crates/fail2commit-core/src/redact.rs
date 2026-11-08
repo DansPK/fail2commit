@@ -14,9 +14,29 @@ pub fn redact_in(line: &str, needle: &str) -> String {
 }
 
 /// Strip userinfo from URLs (`https://user:token@host` -> `https://***@host`).
+/// Userinfo runs to the last `@` before the authority ends (R1-004), so a
+/// password containing `@` or non-ASCII spaces is fully redacted.
 pub fn redact_url_credentials(text: &str) -> String {
-    let re = regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@").expect("static regex");
+    let re = regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/ \t\r\n]*@").expect("static regex");
     re.replace_all(text, "${1}***@").into_owned()
+}
+
+/// Characters that are invisible or reorder text: Unicode format (Cf),
+/// line/paragraph separators and tag characters (R1-004, W1-005).
+pub fn is_invisible_or_bidi(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
 }
 
 #[cfg(test)]
@@ -32,5 +52,33 @@ mod tests {
             redact_url_credentials("git push https://u:tok@example.test/r.git"),
             "git push https://***@example.test/r.git"
         );
+        let pw = ["p", "@", "ss\u{a0}x"].concat();
+        let out = redact_url_credentials(&format!("https://user:{pw}@host.test/r and more"));
+        assert_eq!(out, "https://***@host.test/r and more");
+        assert_eq!(
+            redact_url_credentials("see https://host.test/a@b"),
+            "see https://host.test/a@b"
+        );
+    }
+
+    #[test]
+    fn flags_invisible_and_bidi() {
+        for c in [
+            '\u{061c}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{feff}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{00ad}',
+            '\u{e0041}',
+            '\u{202e}',
+            '\u{1b}',
+        ] {
+            assert!(is_invisible_or_bidi(c), "{:x}", c as u32);
+        }
+        for c in ['a', ' ', '/', '\u{e9}'] {
+            assert!(!is_invisible_or_bidi(c));
+        }
     }
 }

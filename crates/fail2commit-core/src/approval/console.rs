@@ -106,9 +106,7 @@ pub fn sanitize(text: &str) -> String {
     let text = crate::redact::redact_url_credentials(text);
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control()
-            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
+        if crate::redact::is_invisible_or_bidi(c) {
             out.push_str(&format!("\\u{{{:x}}}", c as u32));
         } else {
             out.push(c);
