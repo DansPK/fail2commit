@@ -134,30 +134,43 @@ pub struct Scan {
 }
 
 /// Where in the environment an entry would land.
-enum Dest<'a> {
+enum Dest {
     /// `purelib`/`platlib` (root entries and `*.data/purelib|platlib`).
-    Site(Vec<&'a str>),
+    /// Components are already folded with [`fold`].
+    Site(Vec<String>),
     /// `*.data/data`: relative to `sys.prefix`.
-    Data(Vec<&'a str>),
+    Data(Vec<String>),
     /// `*.data/scripts`: the venv's `Scripts`/`bin` directory.
-    Scripts(Vec<&'a str>),
+    Scripts(Vec<String>),
+    /// A component that names nothing once Windows folds it (`...`, `. `).
+    Bad,
     Other,
 }
 
-fn classify(name: &str) -> Dest<'_> {
-    let comps: Vec<&str> = name
+/// How Windows resolves a path component: case-insensitive, with trailing
+/// dots and spaces dropped (`pyvenv.cfg.` is `pyvenv.cfg`, RP2-001).
+fn fold(c: &str) -> String {
+    c.trim_end_matches(['.', ' ']).to_ascii_lowercase()
+}
+
+fn classify(name: &str) -> Dest {
+    let comps: Vec<String> = name
         .split('/')
         .filter(|c| !c.is_empty() && *c != ".")
+        .map(fold)
         .collect();
+    if comps.iter().any(String::is_empty) {
+        return Dest::Bad;
+    }
     let Some(first) = comps.first() else {
         return Dest::Other;
     };
-    if first.to_ascii_lowercase().ends_with(".data") {
+    if first.ends_with(".data") {
         if comps.len() < 3 {
             return Dest::Other;
         }
         let rest = comps[2..].to_vec();
-        return match comps[1].to_ascii_lowercase().as_str() {
+        return match comps[1].as_str() {
             "purelib" | "platlib" => Dest::Site(rest),
             "data" => Dest::Data(rest),
             "scripts" => Dest::Scripts(rest),
@@ -224,11 +237,11 @@ fn is_pip_script(base: &str) -> bool {
 
 /// Why a `scripts` entry may not be installed, if it may not.
 /// `reserved` holds the lower-cased file names of the interpreter executable.
-fn bad_script(rest: &[&str], reserved: &[String]) -> Option<String> {
+fn bad_script(rest: &[String], reserved: &[String]) -> Option<String> {
     if rest.len() > 1 {
         return Some("a nested path under the interpreter's scripts directory".into());
     }
-    let leaf = rest.first()?.to_ascii_lowercase();
+    let leaf = fold(rest.first()?);
     let base = leaf.split('.').next().unwrap_or("");
     let hit = base.starts_with("python")
         || is_pip_script(base)
@@ -256,8 +269,30 @@ pub fn scan(path: &Path, dist: &str, reserved: &[String]) -> Result<Scan, WheelE
         let mut deny: Option<String> = None;
         let mut startup: Option<&'static str> = None;
         match classify(&name) {
+            Dest::Bad => {
+                deny = Some("an entry name component that Windows folds to nothing".into());
+            }
+            Dest::Site(rel)
+                if rel.len() == 2
+                    && rel[0].ends_with(".dist-info")
+                    && rel[1] == "entry_points.txt" =>
+            {
+                // RP2-002: console/GUI scripts land in the scripts directory too.
+                let mut text = Vec::new();
+                let _ = (&mut entry).take(MAX_METADATA + 1).read_to_end(&mut text);
+                if text.len() as u64 > MAX_METADATA {
+                    deny = Some("entry_points.txt too large to inspect".into());
+                } else {
+                    for script in console_script_names(&String::from_utf8_lossy(&text)) {
+                        if let Some(why) = bad_script(&[script], reserved) {
+                            deny = Some(format!("entry point script: {why}"));
+                            break;
+                        }
+                    }
+                }
+            }
             Dest::Site(rel) => {
-                let first = rel[0].to_ascii_lowercase();
+                let first = rel[0].clone();
                 let is_pip_dist = first
                     .strip_prefix("pip-")
                     .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
@@ -284,12 +319,12 @@ pub fn scan(path: &Path, dist: &str, reserved: &[String]) -> Result<Scan, WheelE
                 }
             }
             Dest::Data(rest) => {
-                let first = rest[0].to_ascii_lowercase();
+                let first = rest[0].clone();
                 if DATA_RESERVED.contains(&first.as_str()) || first.starts_with("python") {
                     deny = Some(format!(
                         "the data scheme would write {first} under the interpreter prefix (its layout, site directories or executables)"
                     ));
-                } else if is_startup_name(rest[rest.len() - 1]) {
+                } else if is_startup_name(&rest[rest.len() - 1]) {
                     deny = Some("a startup hook (.pth, sitecustomize, usercustomize) through the data scheme".into());
                 }
             }
@@ -307,6 +342,26 @@ pub fn scan(path: &Path, dist: &str, reserved: &[String]) -> Result<Scan, WheelE
         }
     }
     Ok(out)
+}
+
+/// Script names declared under `[console_scripts]` and `[gui_scripts]` in an
+/// `entry_points.txt` (INI style: `name = module:func`), folded.
+fn console_script_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_scripts = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            let section = l.trim_matches(|c| c == '[' || c == ']').trim();
+            in_scripts = section.eq_ignore_ascii_case("console_scripts")
+                || section.eq_ignore_ascii_case("gui_scripts");
+        } else if in_scripts && !l.is_empty() && !l.starts_with(['#', ';']) {
+            if let Some((name, _)) = l.split_once('=') {
+                out.push(fold(name.trim()));
+            }
+        }
+    }
+    out
 }
 
 fn check_entry_name(name: &str) -> Result<(), String> {
