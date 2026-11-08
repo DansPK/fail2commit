@@ -78,8 +78,9 @@ fn sandboxed_script_keeps_the_npm_lifecycle_context() {
         .cwd
         .ends_with(std::path::Path::new("node_modules").join("scripty")));
     assert!(job.cwd.starts_with(&job.work_dir));
-    assert!(job.work_dir.starts_with(&env.project));
-    assert_ne!(job.work_dir, env.project);
+    // The reviewed staging tree lives in the private cache (CR-008), not in the project.
+    assert!(job.work_dir.starts_with(&env.paths.cache_dir));
+    assert!(!job.work_dir.starts_with(&env.project));
     assert!(job.read_only.iter().all(|p| !p.starts_with(&env.project)));
     assert!(job.exports.is_empty() && job.export_to.is_none());
 
