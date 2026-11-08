@@ -1,5 +1,6 @@
 //! Interpreter binding, scrubbed pip invocation and untrusted-config checks.
 
+use super::guard::Guard;
 use crate::{Error, Finding, FindingAction, FindingKind, ResultCode};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -15,7 +16,13 @@ pub type Cancel = Arc<AtomicBool>;
 /// Facts the plan is bound to. All come from the interpreter itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interpreter {
+    /// The path the user selected (spelling kept when it resolves to the same file).
     pub executable: String,
+    /// Canonical identity of the environment this interpreter installs into:
+    /// implementation, `major.minor` and the real `sys.prefix`, canonicalized
+    /// and case-folded on Windows. Journals and the journal gate are keyed by it,
+    /// so respelling the interpreter path cannot walk around them (RP-006).
+    pub identity: String,
     pub prefix: String,
     pub base_prefix: String,
     pub in_venv: bool,
@@ -28,115 +35,258 @@ pub struct Interpreter {
     pub tags: Vec<String>,
 }
 
-/// Every interpreter fail2commit starts runs as `python -I -S -c <BOOT...>`.
-/// `-S` skips `site`, so no `*.pth` import line, `sitecustomize` or
-/// `usercustomize` from the target environment (W2-001, CR-001) ever runs
-/// inside the guard. The prelude then adds the environment's `purelib`,
-/// `platlib` and `site.getsitepackages()` to `sys.path` by hand. Importing
-/// `site` under `-S` does not process `.pth` files and `getsitepackages`
-/// only computes directory names.
+/// Prelude of every interpreter fail2commit starts: `python -I -S -c <BOOT...>`.
 ///
-/// Without `site`, CPython does not notice a venv (`sys.prefix` stays the base
-/// install), so the prelude does what `site.venv()` does first: find
-/// `pyvenv.cfg` next to or above the executable and point `sys.prefix` at it,
-/// before `sysconfig` and `site` are imported. `include-system-site-packages`
-/// is honored by adding the base install's directories.
+/// `-S` skips `site`, so no `*.pth` import line, `sitecustomize` or
+/// `usercustomize` from the target environment (W2-001, CR-001) ever runs in
+/// the guard. Without `site` CPython does not notice a venv on older versions,
+/// so the prelude does what `site.venv()` does: it reads `<exe dir>/../pyvenv.cfg`
+/// (never `<exe dir>/pyvenv.cfg`: that is the wheel `scripts` directory, RP-004)
+/// and points `sys.prefix` at it. It then *computes* the environment's
+/// `purelib`/`platlib`/`site.getsitepackages()` as `_T`. `_T` is data, not an
+/// import location: nothing in it is put on `sys.path` by this prelude.
 pub(crate) const BOOT: &str = concat!(
     "import os, sys\n",
+    "sys.dont_write_bytecode = True\n",
     "_x = os.path.dirname(sys.executable)\n",
-    "_base, _syssite = sys.prefix, False\n",
-    "for _c in (os.path.join(_x, 'pyvenv.cfg'), os.path.join(os.path.dirname(_x), 'pyvenv.cfg')):\n",
-    "    if os.path.isfile(_c):\n",
-    "        sys.prefix = sys.exec_prefix = os.path.dirname(_c)\n",
-    "        with open(_c, encoding='utf-8') as _f:\n",
-    "            for _l in _f:\n",
-    "                _k, _, _v = _l.partition('=')\n",
-    "                if _k.strip().lower() == 'include-system-site-packages':\n",
-    "                    _syssite = _v.strip().lower() == 'true'\n",
-    "        break\n",
+    "_base, _syssite = sys.base_prefix, False\n",
+    "_c = os.path.join(os.path.dirname(_x), 'pyvenv.cfg')\n",
+    "if os.path.isfile(_c):\n",
+    "    sys.prefix = sys.exec_prefix = os.path.dirname(_c)\n",
+    "    with open(_c, encoding='utf-8') as _f:\n",
+    "        for _l in _f:\n",
+    "            _k, _, _v = _l.partition('=')\n",
+    "            if _k.strip().lower() == 'include-system-site-packages':\n",
+    "                _syssite = _v.strip().lower() == 'true'\n",
     "import sysconfig, site\n",
     "_p = sysconfig.get_paths()\n",
     "_dirs = [_p.get('platlib'), _p.get('purelib')] + list(site.getsitepackages())\n",
     "if _syssite:\n",
     "    _dirs += list(site.getsitepackages([_base]))\n",
+    "_T = []\n",
     "for _d in _dirs:\n",
-    "    if _d and _d not in sys.path and os.path.isdir(_d):\n",
-    "        sys.path.append(_d)\n",
+    "    if _d and _d not in _T and os.path.isdir(_d):\n",
+    "        _T.append(_d)\n",
 );
+
+/// The guard's pip comes from a private snapshot (`guard::Guard`), never from
+/// the target environment (RP-003). Only the snapshot and the stdlib are
+/// importable. The target's site directories are added to `sys.path` solely so
+/// pip can *read installed-distribution metadata*; the finder below refuses to
+/// import any module from them, so a wheel's `keyring.py`, `brotli.py` or
+/// `pip/` can never run inside the guard.
+fn snapshot_tail(snapshot: &Path) -> String {
+    let lit = serde_json::to_string(&snapshot.to_string_lossy()).expect("string serializes");
+    let body = concat!(
+        "sys.path.insert(0, _S)
+",
+        "sys.path.extend([_d for _d in _T if _d not in sys.path])
+",
+        "import importlib.machinery as _im
+",
+        "_N = frozenset(os.path.normcase(os.path.abspath(_d)) for _d in _T)
+",
+        "class _NoTarget(_im.PathFinder):
+",
+        "    @classmethod
+",
+        "    def find_spec(cls, name, path=None, target=None):
+",
+        "        if path is None:
+",
+        "            path = [_d for _d in sys.path if os.path.normcase(os.path.abspath(_d)) not in _N]
+",
+        "        return _im.PathFinder.find_spec(name, path, target)
+",
+        "sys.meta_path[sys.meta_path.index(_im.PathFinder)] = _NoTarget
+",
+        "import pip
+",
+        "if os.path.normcase(os.path.dirname(os.path.dirname(os.path.abspath(pip.__file__)))) != os.path.normcase(os.path.abspath(_S)):
+",
+        "    raise SystemExit('pip was not loaded from the fail2commit snapshot')
+",
+    );
+    format!(
+        "_S = {lit}
+{body}"
+    )
+}
 
 /// Runs pip's `__main__`; pip's arguments follow `-c` as `sys.argv`.
 const PIP_MAIN: &str = "import runpy\n\
 runpy.run_module('pip', run_name='__main__', alter_sys=True)\n";
 
-/// A command running `body` after the site-free prelude.
-pub(crate) fn python_c(python: impl AsRef<std::ffi::OsStr>, body: &str) -> Command {
+/// A command running `body` after the site-free prelude. With `snapshot`,
+/// pip is importable from that directory (and only from there).
+pub(crate) fn python_c(
+    python: impl AsRef<std::ffi::OsStr>,
+    snapshot: Option<&Path>,
+    body: &str,
+) -> Command {
+    let tail = snapshot.map(snapshot_tail).unwrap_or_default();
     let mut cmd = Command::new(python);
-    cmd.args(["-I", "-S", "-c"]).arg(format!("{BOOT}{body}"));
+    cmd.args(["-I", "-S", "-c"])
+        .arg(format!("{BOOT}{tail}{body}"));
     cmd
 }
 
-/// `python -I -S` running pip with the given leading flags.
-pub(crate) fn pip_command(python: impl AsRef<std::ffi::OsStr>, flags: &[&str]) -> Command {
-    let mut cmd = python_c(python, PIP_MAIN);
+/// `python -I -S` running the snapshot's pip with the given leading flags.
+pub(crate) fn pip_command(
+    python: impl AsRef<std::ffi::OsStr>,
+    snapshot: &Path,
+    flags: &[&str],
+) -> Command {
+    let mut cmd = python_c(python, Some(snapshot), PIP_MAIN);
     cmd.args(flags);
     cmd
 }
 
-const PROBE: &str = "import json, platform\n\
+/// Stage 1: who is this interpreter? Needs nothing from the environment.
+const PROBE_BASE: &str = "import json, platform\n\
+print(json.dumps({'executable': sys.executable, 'real_prefix': os.path.realpath(sys.prefix), \
+'prefix': sys.prefix, 'base_prefix': sys.base_prefix, 'in_venv': sys.prefix != sys.base_prefix, \
+'implementation': sys.implementation.name, 'python_version': platform.python_version(), \
+'platform': sys.platform, 'machine': platform.machine(), 'version': list(sys.version_info[:2]), \
+'site_dirs': _T}))";
+
+/// Stage 2, from the snapshot's pip.
+const PROBE_PIP: &str = "import json\n\
 from pip import __version__ as pv\n\
 from pip._vendor.packaging import tags\n\
-print(json.dumps({'executable': sys.executable, 'prefix': sys.prefix, 'base_prefix': sys.base_prefix, \
-'in_venv': sys.prefix != sys.base_prefix, 'implementation': sys.implementation.name, \
-'python_version': platform.python_version(), 'platform': sys.platform, 'machine': platform.machine(), \
-'pip_version': pv, 'tags': [str(t) for t in tags.sys_tags()]}))";
+print(json.dumps({'pip_version': pv, 'tags': [str(t) for t in tags.sys_tags()]}))";
 
-/// Prints `[[name, version], ...]` for every installed distribution.
+/// Prints `[[name, version], ...]` for every distribution whose `dist-info`
+/// is on disk in the environment's site directories. Reads metadata files only.
 const LIST_INSTALLED: &str = "import json\n\
 from importlib import metadata\n\
-print(json.dumps([[d.metadata['Name'] or '', d.version or ''] for d in metadata.distributions()]))";
+print(json.dumps([[d.metadata['Name'] or '', d.version or ''] for d in metadata.distributions(path=list(_T))]))";
+
+#[derive(Deserialize)]
+struct Base {
+    executable: String,
+    real_prefix: String,
+    prefix: String,
+    base_prefix: String,
+    in_venv: bool,
+    implementation: String,
+    python_version: String,
+    platform: String,
+    machine: String,
+    version: [u32; 2],
+    site_dirs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PipFacts {
+    pip_version: String,
+    tags: Vec<String>,
+}
+
+/// Canonical identity of an environment (RP-006).
+fn identity_of(b: &Base) -> String {
+    let real = Path::new(&b.real_prefix)
+        .canonicalize()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| b.real_prefix.clone());
+    let real = real.strip_prefix(r"\\?\").unwrap_or(&real).to_string();
+    let real = if cfg!(windows) {
+        real.replace('\\', "/").to_lowercase()
+    } else {
+        real
+    };
+    format!(
+        "{}-{}.{}:{}",
+        b.implementation, b.version[0], b.version[1], real
+    )
+}
 
 impl Interpreter {
-    /// Ask `python` who it is. `-I` keeps the workspace and `PYTHON*` out.
-    pub fn probe(python: &Path, limits: &RunLimits, cancel: &Cancel) -> crate::Result<Interpreter> {
-        let mut cmd = python_c(python, PROBE);
+    /// Ask `python` who it is, take (or verify) the guard's private pip
+    /// snapshot, then ask that pip for the tags. `-I` keeps the workspace and
+    /// `PYTHON*` out; nothing from the target environment is imported.
+    pub fn probe(
+        paths: &crate::paths::TrustedPaths,
+        python: &Path,
+        limits: &RunLimits,
+        cancel: &Cancel,
+    ) -> crate::Result<(Interpreter, Guard)> {
+        let not_a_target = |why: &str| {
+            Error::invalid(format!(
+                "cannot use {} as a pip target (pip must be importable): {why}",
+                python.display()
+            ))
+        };
+        let mut cmd = python_c(python, None, PROBE_BASE);
         let out = run(&mut cmd, limits, cancel)?;
         if out.status != Some(0) {
-            return Err(Error::invalid(format!(
-                "cannot use {} as a pip target (pip must be importable): {}",
-                python.display(),
-                tail(&out.stderr)
-            )));
+            return Err(not_a_target(&tail(&out.stderr)));
         }
-        let mut i: Interpreter = serde_json::from_slice(&out.stdout)
+        let b: Base = serde_json::from_slice(&out.stdout)
             .map_err(|e| Error::invalid(format!("interpreter probe output invalid: {e}")))?;
-        if Path::new(&i.executable) != python {
+        let identity = identity_of(&b);
+        let mut executable = b.executable.clone();
+        if Path::new(&executable) != python {
             // Keep the path the user selected when it resolves to the same file.
-            if let (Ok(a), Ok(b)) = (
-                Path::new(&i.executable).canonicalize(),
-                python.canonicalize(),
-            ) {
-                if a == b {
-                    i.executable = python.to_string_lossy().into_owned();
+            if let (Ok(a), Ok(c)) = (Path::new(&executable).canonicalize(), python.canonicalize()) {
+                if a == c {
+                    executable = python.to_string_lossy().into_owned();
                 }
             }
         }
-        if i.tags.is_empty() {
+        let guard = Guard::ensure(
+            paths,
+            Path::new(&executable),
+            &identity,
+            &b.site_dirs,
+            limits,
+            cancel,
+        )
+        .map_err(|e| {
+            if e.code == ResultCode::InvalidInput {
+                not_a_target(&e.message)
+            } else {
+                e
+            }
+        })?;
+        let mut cmd = guard.python_c(PROBE_PIP)?;
+        let out = run(&mut cmd, limits, cancel)?;
+        if out.status != Some(0) {
+            return Err(not_a_target(&tail(&out.stderr)));
+        }
+        let f: PipFacts = serde_json::from_slice(&out.stdout)
+            .map_err(|e| Error::invalid(format!("interpreter probe output invalid: {e}")))?;
+        if f.tags.is_empty() {
             return Err(Error::invalid("interpreter reported no compatible tags"));
         }
-        Ok(i)
+        let interp = Interpreter {
+            executable,
+            identity,
+            prefix: b.prefix,
+            base_prefix: b.base_prefix,
+            in_venv: b.in_venv,
+            implementation: b.implementation,
+            python_version: b.python_version,
+            platform: b.platform,
+            machine: b.machine,
+            pip_version: f.pip_version,
+            tags: f.tags,
+        };
+        Ok((interp, guard))
     }
 
     pub fn python(&self) -> PathBuf {
         PathBuf::from(&self.executable)
     }
 
-    /// Installed `(normalized name, version)` pairs.
+    /// Installed `(normalized name, version)` pairs, read from the `dist-info`
+    /// directories on disk. No package of the environment is imported.
     pub fn installed(
         &self,
         limits: &RunLimits,
         cancel: &Cancel,
     ) -> crate::Result<Vec<(String, String)>> {
-        let mut cmd = python_c(&self.executable, LIST_INSTALLED);
+        let mut cmd = python_c(&self.executable, None, LIST_INSTALLED);
         let out = run(&mut cmd, limits, cancel)?;
         if out.status != Some(0) {
             return Err(Error::internal(format!(
@@ -147,15 +297,6 @@ impl Interpreter {
         let raw: Vec<(String, String)> = serde_json::from_slice(&out.stdout)
             .map_err(|e| Error::internal(format!("installed list invalid: {e}")))?;
         Ok(raw.into_iter().map(|(n, v)| (normalize(&n), v)).collect())
-    }
-
-    /// A pip command bound to this interpreter: isolated, no config, no env,
-    /// no `site`.
-    pub fn pip(&self) -> Command {
-        pip_command(
-            &self.executable,
-            &["--isolated", "--disable-pip-version-check", "--no-input"],
-        )
     }
 }
 
@@ -258,6 +399,10 @@ pub(crate) fn scrub_env(cmd: &mut Command) {
         "WINDIR",
         "SYSTEMDRIVE",
         "PROGRAMDATA",
+        // platform.machine() on Windows reads these; without them it can fall back
+        // to a slow WMI query that sometimes yields "", changing the plan digest.
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_ARCHITEW6432",
         "ALLUSERSPROFILE",
         "TEMP",
         "TMP",

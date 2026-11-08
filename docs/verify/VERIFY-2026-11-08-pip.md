@@ -92,3 +92,21 @@ Commands and results (tested tree = this commit's parent plus the fix commit; se
 | `cargo test -j 2 --workspace --no-fail-fast` (Windows, empty stdin) | 101 | all pip targets pass: `pip_cli` 6, `pip_install` 15, `pip_recover` 7, `pip_reject` 4, `review_wave2_pth` 3, core lib incl. `pip::` 17. Failures are only the other areas' intentional wave-2 reproductions and one npm test: `review_wave2_scan` (2), the git review reproductions (3) and `npm_flow::the_real_stub_scanner_pauses_in_production_wiring` (1); none touch pip files |
 | Linux: `docker run --rm -v "${PWD}:/src" -v f2c-fixpip-target:/target -e CARGO_TARGET_DIR=/target -w /src rust:1 bash -c "apt-get update -qq && apt-get install -y -qq python3-venv python3-pip && cargo test -j 2 -p fail2commit --test review_wave2_pth --test pip_install --test pip_recover --test pip_cli --test pip_reject --no-fail-fast"` | 0 | 3 + 15 + 7 + 6 + 4 tests pass |
 
+
+## 7. 2026-11-09 fix: pip re-review RP-001..RP-008 (FR-005, FR-008)
+
+Branch `DansPK/f2c-fix-pip-r2` from `ee86252` (re-review `REREVIEW-2026-11-09-pip.md`). Design in `docs/pip.md` (flow step 0, startup files, layout violations, journal).
+
+| Finding | Change | Evidence |
+|---|---|---|
+| RP-003 | Guard-owned pip snapshot under `cache_dir/pip/guard/<id>` with SHA-256 manifest re-verified before every launch (`IntegrityFailure`); target site dirs are metadata-only (import-blocking finder); `verify_installed` reads dist-info | `rereview_pip_boot::{rp_guard_runs_pip_from_its_snapshot_not_from_the_environment, rp_tampered_snapshot_is_an_integrity_failure_and_nothing_runs, guard_pip_still_sees_installed_distributions, rp_wheel_overlaying_pip_is_denied_and_runs_nothing}`, `guard::tests` |
+| RP-004 | Hard `Deny` `pip.layout` for interpreter-layout data entries, scripts named `python*`/`pip*`/interpreter exe/nested, `pip/` and `pip-*.dist-info/` entries (pip itself included, stated), startup files via data scheme; BOOT ignores `<exe dir>/pyvenv.cfg` | `rp_scripts_dir_pyvenv_cfg_and_interpreter_names_are_denied`, `upgrading_pip_through_the_guard_is_denied_and_says_so`, `wheel::tests::layout_entries_are_denied` |
+| RP-001 | `.pth` detection like `site.addpackage` (BOM, bare CR and other separators, non-UTF-8 and oversized flagged) | `rp_pth_with_cr_line_separator_is_named`, `rp_pth_with_utf8_bom_is_named`, `wheel::tests::pth_lines_are_detected_like_site_addpackage`, `oversized_pth_is_flagged_not_skipped` |
+| RP-002 | `.pth`/`sitecustomize`/`usercustomize` through the data scheme are denied; ordinary data files still install | `rp_pth_through_data_scheme_is_denied`, `rp_sitecustomize_through_data_scheme_is_denied`, `control_ordinary_data_scheme_file_still_installs` |
+| RP-006 | Journal and gate keyed by canonical identity (real `sys.prefix`, implementation, major.minor; case-folded on Windows) | `respelled_*`, `recased_*` (Windows), `symlinked_*` (Linux) |
+| RP-007, RP-008 | Journal carries plan inputs, digest recomputed, identity, confined `reviewed`/wheel names; remaining wheels re-hashed and re-inspected; forged journal refused with `--discard` offered, `--discard` removes only the journal file | `forged_or_mismatched_journals_are_refused_and_discard_is_offered`, `discard_drops_a_forged_journal_without_touching_what_it_names`, `recover_rehashes_the_remaining_wheels_before_approval`, `recover_rejects_a_journal_*`, `discard_acts_on_the_journal_*` |
+| RP-005 | Ownership by setup record plus marker in `state_dir/pip/shim-<name>.json`; refresh on setup, removal on uninstall after an upgrade | `rereview_pip_shim::*` (6) |
+
+Notes: pip itself rejects a wheel carrying a second `.dist-info` before our scan on newer pip, so `pip-*.dist-info` is covered by the unit test only. Interpretation: "matching an existing venv executable" is implemented as the interpreter's own executable name (spelled and resolved) plus `python*`/`pip*`/`activate*`, because denying every existing script name would block upgrading console-script packages. Debian-style unbundled pip is refused. Debug-build test time rose (manifest hashing, one-time precompile).
+
+Commands and results are in the worker report for the commit that carries this section (SHA there).

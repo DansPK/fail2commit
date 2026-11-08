@@ -45,7 +45,8 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
     }
     if sub != "install" {
         let all: Vec<OsString> = std::iter::once(sub).chain(rest).collect();
-        let (code, out) = pip::passthrough(&python, &all, ctx.json)?;
+        let actx = ctx.approval();
+        let (code, out) = pip::passthrough(&actx, &python, &all, ctx.json)?;
         return Ok(Outcome {
             tool_exit: Some(code),
             data: serde_json::json!({ "stdout": String::from_utf8_lossy(&out) }),

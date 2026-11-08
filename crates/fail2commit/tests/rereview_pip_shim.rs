@@ -121,3 +121,75 @@ fn install_twice_then_uninstall_restores_an_empty_bin_dir() {
         assert!(std::fs::symlink_metadata(c.paths.bin_dir.join(n)).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fix regressions (FR-005, RP-005): ownership by owned-change record + marker.
+// ---------------------------------------------------------------------------
+
+fn markers(c: &SetupCtx) -> usize {
+    std::fs::read_dir(c.paths.state_dir.join("pip"))
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("shim-"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Setup after an upgrade refreshes our own previous shim; a later uninstall
+/// removes it and its marker, leaving an empty bin dir (any platform).
+#[test]
+fn setup_after_upgrade_refreshes_our_shim_and_uninstall_removes_it() {
+    let d = tempfile::tempdir().unwrap();
+    let (v1, v2) = (d.path().join("f2c-v1.bin"), d.path().join("f2c-v2.bin"));
+    std::fs::write(&v1, b"fail2commit v1").unwrap();
+    std::fs::write(&v2, b"fail2commit v2").unwrap();
+    let shim = pip::integration().unwrap();
+    let c1 = ctx(d.path(), &v1);
+    let c2 = ctx(d.path(), &v2);
+    shim.install(&c1).unwrap();
+    assert_eq!(markers(&c1), 2);
+    let owned = shim.install(&c2).unwrap();
+    for n in names() {
+        let p = c2.paths.bin_dir.join(n);
+        if cfg!(windows) {
+            assert_eq!(std::fs::read(&p).unwrap(), b"fail2commit v2", "refreshed");
+        } else {
+            assert_eq!(std::fs::read_link(&p).unwrap(), v2);
+        }
+    }
+    // the earlier record (v1) and the new one both identify our shims
+    shim.uninstall(&c2, &owned).unwrap();
+    for n in names() {
+        assert!(std::fs::symlink_metadata(c2.paths.bin_dir.join(n)).is_err());
+    }
+    assert_eq!(markers(&c2), 0, "markers are removed with the shims");
+}
+
+/// A shim that the user replaced after setup is not ours to remove, upgrade or not.
+#[test]
+fn replaced_shim_is_kept_even_with_our_record() {
+    let d = tempfile::tempdir().unwrap();
+    let exe = d.path().join("f2c.bin");
+    std::fs::write(&exe, b"fail2commit v1").unwrap();
+    let c = ctx(d.path(), &exe);
+    let shim = pip::integration().unwrap();
+    let owned = shim.install(&c).unwrap();
+    for n in names() {
+        let p = c.paths.bin_dir.join(n);
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, b"user's own wrapper").unwrap();
+    }
+    std::fs::write(&exe, b"fail2commit v2").unwrap();
+    shim.uninstall(&c, &owned).unwrap();
+    for n in names() {
+        assert_eq!(
+            std::fs::read(c.paths.bin_dir.join(n)).unwrap(),
+            b"user's own wrapper"
+        );
+    }
+    assert!(
+        shim.install(&c).is_err(),
+        "setup still refuses a foreign file"
+    );
+}

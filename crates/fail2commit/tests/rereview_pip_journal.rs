@@ -74,6 +74,7 @@ impl Fx {
                     .unwrap()
                     .to_string_lossy()
                     .starts_with("journal-")
+                    && p.extension().is_some_and(|x| x == "json")
             })
             .expect("journal")
     }
@@ -208,4 +209,228 @@ fn cancel_stops_at_a_wheel_boundary_with_consistent_progress() {
     assert_eq!(j["done"], 1);
     assert_eq!(j["wheels"].as_array().unwrap().len(), 2);
     assert!(has(&f.python, "alpha", "1.0") && !has_name(&f.python, "beta"));
+}
+
+// ---------------------------------------------------------------------------
+// Fix regressions (FR-005): RP-006 identity gate, RP-007/RP-008 journal trust.
+// ---------------------------------------------------------------------------
+
+/// RP-006: casing of the same Windows path is the same environment.
+#[test]
+fn recased_interpreter_path_is_still_blocked_by_the_journal() {
+    if !cfg!(windows) {
+        eprintln!("case-insensitive paths are a Windows property; not exercised here");
+        return;
+    }
+    let f = fx();
+    f.cancelled_journal();
+    let recased = PathBuf::from(f.python.to_string_lossy().to_uppercase());
+    assert!(recased.is_file());
+    let before = snapshot(&f.venv);
+    let r = f.install_at(&recased, &["gamma"], &seams(&f.index));
+    assert!(
+        matches!(&r, Err(e) if e.code == ResultCode::InvalidInput && e.message.contains("recover")),
+        "RP-006: {:?}",
+        r.map(|r| r.packages.len()).map_err(|e| e.to_string())
+    );
+    assert_eq!(snapshot(&f.venv), before);
+}
+
+/// RP-006: a symlink to the same interpreter hits the same gate.
+#[cfg(unix)]
+#[test]
+fn symlinked_interpreter_path_is_still_blocked_by_the_journal() {
+    let f = fx();
+    f.cancelled_journal();
+    let d = tempfile::tempdir().unwrap();
+    let link = d.path().join("py");
+    std::os::unix::fs::symlink(&f.python, &link).unwrap();
+    let prefix = |p: &std::path::Path| {
+        std::process::Command::new(p)
+            .args(["-c", "import sys; print(sys.prefix)"])
+            .output()
+            .unwrap()
+            .stdout
+    };
+    if prefix(&link) != prefix(&f.python) {
+        eprintln!("this symlink targets a different environment; not the same gate");
+        return;
+    }
+    let r = f.install_at(&link, &["gamma"], &seams(&f.index));
+    assert!(
+        matches!(&r, Err(e) if e.message.contains("recover")),
+        "RP-006: {:?}",
+        r.map(|r| r.packages.len()).map_err(|e| e.to_string())
+    );
+    assert!(!has_name(&f.python, "gamma"));
+}
+
+impl Fx {
+    fn journal_json(&self) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(self.journal_file()).unwrap()).unwrap()
+    }
+    fn write_journal_json(&self, j: &serde_json::Value) {
+        std::fs::write(self.journal_file(), serde_json::to_vec(j).unwrap()).unwrap();
+    }
+}
+
+/// RP-007/RP-008: every way of making the journal disagree with what was
+/// approved, with the interpreter asked about, or with the trusted directories
+/// is refused with a message that offers `--discard`, installs nothing and
+/// still blocks guarded installs.
+#[test]
+fn forged_or_mismatched_journals_are_refused_and_discard_is_offered() {
+    type Mutation = Box<dyn Fn(&mut serde_json::Value)>;
+    let f = fx();
+    f.cancelled_journal();
+    let good = f.journal_json();
+    let outside = tempfile::tempdir().unwrap();
+    let reviewed_outside = outside.path().to_string_lossy().into_owned();
+    let reviewed_root = f.env.paths.cache_dir.join("pip").join("reviewed");
+    let escaping = reviewed_root
+        .join("..")
+        .join("reviewed")
+        .join("0123456789abcdef")
+        .to_string_lossy()
+        .into_owned();
+    let nested = reviewed_root
+        .join("0123456789abcdef")
+        .join("deeper")
+        .to_string_lossy()
+        .into_owned();
+    let mutations: Vec<(&str, Mutation)> = vec![
+        (
+            "digest changed",
+            Box::new(|j| j["digest"] = "ab".repeat(32).into()),
+        ),
+        (
+            "wheel hash changed",
+            Box::new(|j| j["wheels"][1]["sha256"] = "cd".repeat(32).into()),
+        ),
+        (
+            "wheel list shortened",
+            Box::new(|j| {
+                j["wheels"].as_array_mut().unwrap().pop();
+            }),
+        ),
+        (
+            "index changed",
+            Box::new(|j| j["index"] = "http://evil.test/simple".into()),
+        ),
+        (
+            "requested changed",
+            Box::new(|j| j["requested"] = serde_json::json!(["forged"])),
+        ),
+        (
+            "reviewed outside the cache",
+            Box::new(move |j| j["reviewed"] = reviewed_outside.clone().into()),
+        ),
+        (
+            "reviewed with a parent component",
+            Box::new(move |j| j["reviewed"] = escaping.clone().into()),
+        ),
+        (
+            "reviewed nested below the reviewed root",
+            Box::new(move |j| j["reviewed"] = nested.clone().into()),
+        ),
+        (
+            "wheel name traverses",
+            Box::new(|j| j["wheels"][1]["filename"] = "../../x-1.0-py3-none-any.whl".into()),
+        ),
+        (
+            "identity of another env",
+            Box::new(|j| {
+                j["identity"] = "cpython-3.12:/elsewhere".into();
+                j["interpreter"]["identity"] = "cpython-3.12:/elsewhere".into();
+            }),
+        ),
+        ("progress past the end", Box::new(|j| j["done"] = 9.into())),
+        ("old version", Box::new(|j| j["version"] = 1.into())),
+    ];
+    for (why, mutate) in &mutations {
+        let mut j = good.clone();
+        mutate(&mut j);
+        f.write_journal_json(&j);
+        let (s, asked) = f.approving();
+        let r = pip::recover(&f.env.ctx(), &f.python, false, &s);
+        let e = r.expect_err(&format!("{why}: recover accepted a forged journal"));
+        assert!(
+            e.message.contains("--discard") && e.message.contains("not trusted"),
+            "{why}: {}",
+            e.message
+        );
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "{why}: asked for approval"
+        );
+        // the gate keeps blocking installs, with the same way out
+        let g = f
+            .install_at(&f.python, &["gamma"], &seams(&f.index))
+            .expect_err(why);
+        assert!(g.message.contains("--discard"), "{why}: {}", g.message);
+        assert!(
+            !has_name(&f.python, "gamma") && !has_name(&f.python, "beta"),
+            "{why}"
+        );
+    }
+    // garbage that is not even JSON
+    std::fs::write(f.journal_file(), b"{ not json").unwrap();
+    let e = pip::recover(&f.env.ctx(), &f.python, false, &seams(&f.index)).unwrap_err();
+    assert!(e.message.contains("--discard"), "{}", e.message);
+}
+
+/// `--discard` works on a journal nobody trusts, and removes only that file.
+#[test]
+fn discard_drops_a_forged_journal_without_touching_what_it_names() {
+    let f = fx();
+    f.cancelled_journal();
+    let victim = tempfile::tempdir().unwrap();
+    std::fs::write(victim.path().join("keep.txt"), b"keep").unwrap();
+    let mut j = f.journal_json();
+    j["reviewed"] = victim.path().to_string_lossy().into_owned().into();
+    f.write_journal_json(&j);
+    let r = pip::recover(&f.env.ctx(), &f.python, true, &seams(&f.index)).unwrap();
+    assert!(r.discarded && !r.approved);
+    assert!(!f.env.journal_exists());
+    assert_eq!(
+        std::fs::read(victim.path().join("keep.txt")).unwrap(),
+        b"keep"
+    );
+    // installs work again
+    f.install_at(&f.python, &["gamma"], &seams(&f.index))
+        .unwrap();
+    assert!(has(&f.python, "gamma", "1.0"));
+}
+
+/// `recover` re-hashes every remaining wheel against the journal's SHA-256
+/// before it asks for anything.
+#[test]
+fn recover_rehashes_the_remaining_wheels_before_approval() {
+    let f = fx();
+    f.cancelled_journal();
+    let j = f.journal_json();
+    let dir = PathBuf::from(j["reviewed"].as_str().unwrap());
+    let beta = dir.join(j["wheels"][1]["filename"].as_str().unwrap());
+    let mut bytes = std::fs::read(&beta).unwrap();
+    bytes.push(0);
+    std::fs::write(&beta, bytes).unwrap();
+    let before = snapshot(&f.venv);
+    let (s, asked) = f.approving();
+    let e = pip::recover(&f.env.ctx(), &f.python, false, &s).unwrap_err();
+    assert_eq!(e.code, ResultCode::IntegrityFailure, "{e}");
+    assert!(asked.lock().unwrap().is_empty());
+    assert_eq!(snapshot(&f.venv), before);
+    assert!(f.env.journal_exists(), "evidence kept");
+}
+
+/// The honest journal, written by the fixed code, still recovers (control).
+#[test]
+fn control_an_untouched_journal_still_recovers() {
+    let f = fx();
+    f.cancelled_journal();
+    let (s, asked) = f.approving();
+    let r = pip::recover(&f.env.ctx(), &f.python, false, &s).unwrap();
+    assert!(r.approved && asked.lock().unwrap().len() == 1);
+    assert!(has(&f.python, "beta", "1.0"));
+    assert!(!f.env.journal_exists());
 }

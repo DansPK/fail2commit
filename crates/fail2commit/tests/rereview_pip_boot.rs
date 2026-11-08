@@ -5,11 +5,17 @@
 //! when the attempt works; the failure message carries the RP-### id used in
 //! `docs/verify/REREVIEW-2026-11-09-pip.md`. All state is disposable and the
 //! only network is the loopback fixture index.
+//!
+//! Fixed (FR-005): these are now regression tests that assert the secure
+//! outcome. RP-001 wheels are approved with the file named; RP-002/003/004
+//! wheels are refused with a hard `pip.layout` deny; the guard runs pip from a
+//! hash-verified snapshot and never imports anything from the environment.
 
 mod pip_support;
 
 use fail2commit_core::pip;
 use fail2commit_core::protocol::{ApprovalRequest, Decision};
+use fail2commit_core::{FindingAction, FindingKind, ResultCode};
 use pip_support::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -222,33 +228,91 @@ fn rp_pth_with_utf8_bom_is_named() {
     );
 }
 
-#[test]
-fn rp_pth_through_data_scheme_is_named() {
-    startup_variant(
-        |l| {
-            format!(
-                "evil-1.0.data/data/{}/evil_data.pth",
-                purelib_rel(&l.python, &l.root)
-            )
-        },
-        |m| format!("{}\n", writes(m)).into_bytes(),
-        ".pth installed through the wheel's .data/data scheme",
-        "RP-002",
+/// The install must be refused with a hard `pip.layout` deny that nobody is
+/// asked to approve, and the venv must be byte-identical afterwards.
+fn assert_layout_denied(l: &Lab, specs: &[&str], id: &str, what: &str) -> fail2commit_core::Error {
+    let before = snapshot(&l.root);
+    let (r, asked) = l.install(specs);
+    let e = r.expect_err(&format!("{id}: {what} was installed"));
+    assert_eq!(e.code, ResultCode::InvalidInput, "{id}: {e}");
+    assert!(
+        e.findings.iter().any(|f| f.source == "pip.layout"
+            && f.kind == FindingKind::UnsupportedInput
+            && f.action == FindingAction::Deny),
+        "{id}: {what}: no pip.layout deny finding: {e} / {:?}",
+        e.findings
     );
+    assert!(asked.is_empty(), "{id}: a hard deny must not be approvable");
+    assert_eq!(snapshot(&l.root), before, "{id}: the venv changed");
+    assert!(!l.env.journal_exists(), "{id}: a journal was written");
+    e
 }
 
 #[test]
-fn rp_sitecustomize_through_data_scheme_is_named() {
-    startup_variant(
-        |l| {
-            format!(
-                "evil-1.0.data/data/{}/sitecustomize.py",
-                purelib_rel(&l.python, &l.root)
-            )
-        },
-        |m| format!("{}\n", writes(m)).into_bytes(),
-        "sitecustomize.py installed through the wheel's .data/data scheme",
-        "RP-002",
+fn rp_pth_through_data_scheme_is_denied() {
+    let _g = serial();
+    let Some(l) = lab() else { return };
+    let marker = l.marker("startup-ran");
+    let entry = format!(
+        "evil-1.0.data/data/{}/evil_data.pth",
+        purelib_rel(&l.python, &l.root)
+    );
+    l.publish(
+        "evil",
+        &[(
+            entry.as_str(),
+            format!("{}\n", writes(&marker)).into_bytes(),
+        )],
+    );
+    assert_layout_denied(&l, &["evil"], "RP-002", ".pth through .data/data");
+    l.plain_python();
+    assert!(!marker.exists());
+}
+
+#[test]
+fn rp_sitecustomize_through_data_scheme_is_denied() {
+    let _g = serial();
+    let Some(l) = lab() else { return };
+    let marker = l.marker("startup-ran");
+    let rel = purelib_rel(&l.python, &l.root);
+    // both into the site directory and into an otherwise allowed data folder
+    for (i, entry) in [
+        format!("evil-1.0.data/data/{rel}/sitecustomize.py"),
+        "evil-1.0.data/data/share/usercustomize.py".to_string(),
+        "evil-1.0.data/data/share/x.pth".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("evil{i}");
+        l.publish(
+            &name,
+            &[(
+                entry.as_str(),
+                format!("{}\n", writes(&marker)).into_bytes(),
+            )],
+        );
+        assert_layout_denied(&l, &[name.as_str()], "RP-002", &entry);
+    }
+    l.plain_python();
+    assert!(!marker.exists());
+}
+
+/// Control: data-scheme files outside the interpreter layout still install.
+#[test]
+fn control_ordinary_data_scheme_file_still_installs() {
+    let _g = serial();
+    let Some(l) = lab() else { return };
+    l.publish(
+        "evil",
+        &[("evil-1.0.data/data/share/f2c/readme.txt", b"hello".to_vec())],
+    );
+    let (r, asked) = l.install(&["evil"]);
+    r.expect("an ordinary data file is allowed");
+    assert!(asked.is_empty());
+    assert_eq!(
+        std::fs::read(l.root.join("share/f2c/readme.txt")).unwrap(),
+        b"hello"
     );
 }
 
@@ -286,11 +350,31 @@ fn guard_run_executes(l: &Lab, marker: &Path) -> bool {
 }
 
 #[test]
-fn rp_wheel_overlaying_pip_runs_code_in_the_next_guarded_start() {
+fn rp_wheel_overlaying_pip_is_denied_and_runs_nothing() {
     let _g = serial();
     let Some(l) = lab() else { return };
     let marker = l.marker("pip-overlay-ran");
     let site = purelib_rel(&l.python, &l.root);
+    // every way a wheel can put a file into pip's tree or its metadata
+    for (i, entry) in [
+        "pip/__init__.py".to_string(),
+        "pip/_internal/cli/main.py".to_string(),
+        "evil-1.0.data/purelib/pip/__init__.py".to_string(),
+        "evil-1.0.data/platlib/pip/__main__.py".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("evil{i}");
+        l.publish(
+            &name,
+            &[(
+                entry.as_str(),
+                format!("{}\n", writes(&marker)).into_bytes(),
+            )],
+        );
+        assert_layout_denied(&l, &[name.as_str()], "RP-003", &entry);
+    }
     let _ = site;
     l.publish(
         "evil",
@@ -299,23 +383,129 @@ fn rp_wheel_overlaying_pip_runs_code_in_the_next_guarded_start() {
             format!("{}\n", writes(&marker)).into_bytes(),
         )],
     );
+    // the next guarded commands still run, and nothing of the wheel ran
     assert!(
         !guard_run_executes(&l, &marker),
-        "RP-003: a wheel that installs pip/__init__.py had its code executed by the guard's own interpreter, unsandboxed, with no approval naming it"
+        "RP-003: a wheel that installs pip/__init__.py had its code executed by the guard's own interpreter"
     );
 }
 
 #[test]
-fn rp_scripts_dir_pyvenv_cfg_redirects_the_bootstrap_prefix() {
+fn upgrading_pip_through_the_guard_is_denied_and_says_so() {
+    let _g = serial();
+    let Some(l) = lab() else { return };
+    l.publish(
+        "pip",
+        &[("pip/__init__.py", b"__version__ = '1.0'\n".to_vec())],
+    );
+    let e = assert_layout_denied(&l, &["pip==1.0"], "RP-003", "a wheel for pip itself");
+    assert!(
+        e.findings.iter().any(|f| f
+            .evidence
+            .contains("upgrading pip through fail2commit is not supported")),
+        "{:?}",
+        e.findings
+    );
+}
+
+/// The core of RP-003: the guard's pip is its private snapshot. Planting code in
+/// the environment's own pip, or in modules pip might optionally import
+/// (`keyring`, `brotli`, ...), changes nothing the guard runs.
+#[test]
+fn rp_guard_runs_pip_from_its_snapshot_not_from_the_environment() {
+    let _g = serial();
+    let Some(l) = lab() else { return };
+    let marker = l.marker("env-code-ran");
+    l.index.add_wheel("first", "1.0", &[]);
+    l.index.add_wheel("second", "1.0", &[]);
+    l.install(&["first"]).0.expect("first install");
+    // out of band, after the snapshot exists: overwrite the environment's pip
+    // and plant optional-import modules
+    let site = l.root.join(purelib_rel(&l.python, &l.root));
+    let code = format!("{}\n", writes(&marker));
+    for rel in [
+        "pip/__init__.py",
+        "pip/__main__.py",
+        "pip/_internal/cli/main.py",
+    ] {
+        let p = site.join(rel);
+        let old = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, format!("{code}{old}")).unwrap();
+    }
+    for module in ["keyring.py", "brotli.py", "truststore.py", "socks.py"] {
+        std::fs::write(site.join(module), &code).unwrap();
+    }
+    let (r, _) = l.install(&["second"]);
+    r.expect("the guard still installs, from its own pip");
+    assert!(has(&l.python, "second", "1.0"));
+    assert!(
+        !marker.exists(),
+        "RP-003: code planted in the environment ran inside the guard"
+    );
+}
+
+/// The snapshot is private and checked before every launch.
+#[test]
+fn rp_tampered_snapshot_is_an_integrity_failure_and_nothing_runs() {
+    let _g = serial();
+    let Some(l) = lab() else { return };
+    let marker = l.marker("snapshot-code-ran");
+    l.index.add_wheel("first", "1.0", &[]);
+    l.index.add_wheel("second", "1.0", &[]);
+    l.install(&["first"]).0.expect("first install");
+    let guard_root = l.env.paths.cache_dir.join("pip").join("guard");
+    let snap = std::fs::read_dir(&guard_root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.join("manifest.json").is_file())
+        .expect("a snapshot under cache_dir/pip/guard");
+    assert!(snap.join("site").join("pip").join("__init__.py").is_file());
+    let init = snap.join("site").join("pip").join("__init__.py");
+    let old = std::fs::read_to_string(&init).unwrap();
+    std::fs::write(&init, format!("{}\n{old}", writes(&marker))).unwrap();
+    let before = snapshot(&l.root);
+    let (r, asked) = l.install(&["second"]);
+    let e = r.expect_err("a changed snapshot must stop the command");
+    assert_eq!(e.code, ResultCode::IntegrityFailure, "{e}");
+    assert!(asked.is_empty());
+    assert!(!marker.exists(), "the tampered snapshot was executed");
+    assert_eq!(snapshot(&l.root), before);
+    // an added or removed file is caught as well
+    std::fs::write(&init, old).unwrap();
+    std::fs::write(snap.join("site").join("pip").join("extra.py"), "x = 1\n").unwrap();
+    let e = l.install(&["second"]).0.expect_err("added file");
+    assert_eq!(e.code, ResultCode::IntegrityFailure, "{e}");
+    std::fs::remove_file(snap.join("site").join("pip").join("extra.py")).unwrap();
+    l.install(&["second"]).0.expect("intact again");
+}
+
+/// pip must still see what is installed, even though it cannot import from the
+/// environment: already-satisfied requirements are a no-op and an upgrade
+/// replaces the old version instead of leaving it behind.
+#[test]
+fn guard_pip_still_sees_installed_distributions() {
+    let _g = serial();
+    let Some(l) = lab() else { return };
+    l.index.add_wheel("alpha", "1.0", &[]);
+    l.install(&["alpha"]).0.expect("install");
+    let (again, _) = l.install(&["alpha"]);
+    assert!(again.unwrap().packages.is_empty(), "already satisfied");
+    l.index.add_wheel("alpha", "1.1", &[]);
+    l.install(&["alpha", "--upgrade"]).0.expect("upgrade");
+    assert!(has(&l.python, "alpha", "1.1"));
+    assert!(!has(&l.python, "alpha", "1.0"), "old version left behind");
+}
+
+#[test]
+fn rp_scripts_dir_pyvenv_cfg_and_interpreter_names_are_denied() {
     let _g = serial();
     let Some(l) = lab() else { return };
     let marker = l.marker("pyvenv-redirect-ran");
     let rel = purelib_rel(&l.python, &l.root);
-    // BOOT trusts `<dir of sys.executable>/pyvenv.cfg` before the real one and
-    // `.data/scripts` installs into exactly that directory.
-    let pip_init = format!("evil-1.0.data/scripts/{rel}/pip/__init__.py");
-    // a copy of the venv's own config, so the interpreter still starts
     let real_cfg = std::fs::read(l.root.join("pyvenv.cfg")).unwrap();
+    // the exact RP-004 reproduction, now refused
+    let pip_init = format!("evil-1.0.data/scripts/{rel}/pip/__init__.py");
     l.publish(
         "evil",
         &[
@@ -326,22 +516,38 @@ fn rp_scripts_dir_pyvenv_cfg_redirects_the_bootstrap_prefix() {
             ),
         ],
     );
-    let ran = guard_run_executes(&l, &marker);
+    assert_layout_denied(&l, &["evil"], "RP-004", "scripts/pyvenv.cfg");
     let scripts = l.python.parent().unwrap();
-    eprintln!(
-        "diag: {}/pyvenv.cfg exists = {}, planted pip = {}",
-        scripts.display(),
-        scripts.join("pyvenv.cfg").exists(),
-        scripts.join(&rel).join("pip/__init__.py").exists()
+    assert_eq!(
+        std::fs::read(l.root.join("pyvenv.cfg")).unwrap(),
+        real_cfg,
+        "venv config untouched"
     );
-    assert!(
-        scripts.join("pyvenv.cfg").exists(),
-        "fixture is vacuous: the wheel's scripts-dir pyvenv.cfg was not installed (or was refused)"
-    );
-    assert!(
-        !ran,
-        "RP-004: a wheel's .data/scripts/pyvenv.cfg moved sys.prefix for the guard's bootstrap and the guard imported the wheel's pip"
-    );
+    assert!(!scripts.join("pyvenv.cfg").exists());
+    assert!(!guard_run_executes(&l, &marker));
+    // each way to replace the interpreter or its pip launcher, and each data root
+    let exe = l.python.file_name().unwrap().to_string_lossy().into_owned();
+    for (i, entry) in [
+        format!("evil-1.0.data/scripts/{exe}"),
+        "evil-1.0.data/scripts/python3".to_string(),
+        "evil-1.0.data/scripts/pip".to_string(),
+        "evil-1.0.data/scripts/pip3.exe".to_string(),
+        "evil-1.0.data/scripts/nested/tool".to_string(),
+        "evil-1.0.data/data/pyvenv.cfg".to_string(),
+        "evil-1.0.data/data/Lib/site-packages/x.py".to_string(),
+        "evil-1.0.data/data/lib/python3.12/site-packages/x.py".to_string(),
+        "evil-1.0.data/data/lib64/x".to_string(),
+        "evil-1.0.data/data/include/x.h".to_string(),
+        "evil-1.0.data/data/bin/python".to_string(),
+        "evil-1.0.data/data/Scripts/python.exe".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("tool{i}");
+        l.publish(&name, &[(entry.as_str(), b"x".to_vec())]);
+        assert_layout_denied(&l, &[name.as_str()], "RP-004", &entry);
+    }
 }
 
 #[test]

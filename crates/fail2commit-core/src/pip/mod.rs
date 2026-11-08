@@ -11,12 +11,18 @@
 //!
 //! Every interpreter is started `-I -S` (see `interp::BOOT`): wheel-supplied
 //! `*.pth`, `sitecustomize` and `usercustomize` never run inside the guard.
-//! Wheels that install such files need an explicit approval naming them,
-//! because they run whenever the user next starts Python (FR-005, CR-001).
-//! An unfinished journal blocks guarded installs for its interpreter until
-//! [`recover`] completes it after a fresh approval or discards it (CR-002).
+//! pip itself runs from a private, hash-verified snapshot (`guard`), never
+//! from the target environment, and no module of the environment is ever
+//! imported (RP-003). Wheels that would change the interpreter's layout or
+//! pip's files are denied (`pip.layout`, RP-004). Wheels that install
+//! startup files need an explicit approval naming them, because they run
+//! whenever the user next starts Python (FR-005, CR-001).
+//! An unfinished journal blocks guarded installs for its interpreter (keyed
+//! by canonical identity) until [`recover`] completes it after a fresh
+//! approval or discards it (CR-002).
 
 mod apply;
+mod guard;
 mod index;
 mod interp;
 mod plan;
@@ -153,7 +159,7 @@ pub fn install(
     }
 
     // 2. bind to the selected interpreter
-    let interp = Interpreter::probe(python, &limits, &seams.cancel)?;
+    let (interp, guard) = Interpreter::probe(ctx.paths, python, &limits, &seams.cancel)?;
     if seams.check_ambient_config {
         interp::check_config_files(&interp::config_file_candidates(&interp.prefix), &policy.url)?;
     }
@@ -161,12 +167,13 @@ pub fn install(
     let cx = apply::ApplyCtx {
         paths: ctx.paths,
         interp: &interp,
+        guard: &guard,
         limits: &limits,
         cancel: &seams.cancel,
         hooks: &seams.hooks,
     };
     // An unfinished plan is never rolled forward from here.
-    if let Some(j) = apply::read_journal(ctx.paths, &interp.executable)? {
+    if let Some(j) = apply::read_journal(ctx.paths, &interp)? {
         return Err(apply::pending_error(&j));
     }
 
@@ -190,7 +197,7 @@ pub fn install(
     )?;
     let report_path = run_dir.join("report.json");
     std::fs::write(run_dir.join("requirements.txt"), req.requirements_txt())?;
-    let mut cmd = interp.pip();
+    let mut cmd = guard.pip(&["--isolated", "--disable-pip-version-check", "--no-input"])?;
     cmd.args([
         "install",
         "--dry-run",
@@ -242,14 +249,11 @@ pub fn install(
 
     // 4. review: advisories, approval bound to the exact wheel set
     let reviewed = apply::materialize(ctx.paths, &staged)?;
+    let requested = req.canonical();
     let result = review_and_apply(
-        ctx, &cx, seams, &digest, &wheels, &reviewed, &interp, &policy,
+        ctx, &cx, seams, &digest, &wheels, &reviewed, &requested, &interp, &policy,
     );
-    let journal_pending = apply::read_journal(ctx.paths, &interp.executable)
-        .ok()
-        .flatten()
-        .is_some();
-    if !journal_pending {
+    if !apply::journal_exists(ctx.paths, &interp) {
         let _ = std::fs::remove_dir_all(&reviewed);
     }
     let (findings, approved) = result?;
@@ -263,15 +267,45 @@ pub fn install(
     })
 }
 
-/// One `pip.startup` approval finding per interpreter-startup file the
-/// wheels would install, read from the reviewed copies.
-fn startup_findings(dir: &Path, wheels: &[PlanWheel]) -> crate::Result<Vec<Finding>> {
-    let mut out = Vec::new();
+/// File names the wheel `scripts` scheme must not replace: the target
+/// interpreter's own executable, as spelled and as resolved.
+fn reserved_names(interp: &Interpreter) -> Vec<String> {
+    let exe = interp.python();
+    let mut v: Vec<String> = Vec::new();
+    for p in [Some(exe.clone()), exe.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(n) = p.file_name() {
+            v.push(n.to_string_lossy().to_ascii_lowercase());
+        }
+    }
+    v
+}
+
+/// What inspecting the reviewed copies found: approvable startup files, and a
+/// hard deny for anything that changes the interpreter layout or pip.
+struct WheelFindings {
+    startup: Vec<Finding>,
+}
+
+/// One `pip.startup` approval finding per interpreter-startup file the wheels
+/// would install (CR-001, RP-001, RP-002), read from the reviewed copies. Any
+/// layout violation (RP-003, RP-004) is a `pip.layout` `Deny`: it cannot be
+/// approved away and nothing is installed.
+fn scan_wheels(
+    dir: &Path,
+    wheels: &[PlanWheel],
+    interp: &Interpreter,
+) -> crate::Result<WheelFindings> {
+    let reserved = reserved_names(interp);
+    let mut startup = Vec::new();
+    let mut denied = Vec::new();
     for w in wheels {
-        let files = wheel::startup_files(&dir.join(&w.filename))
+        let scan = wheel::scan(&dir.join(&w.filename), &w.name, &reserved)
             .map_err(|e| Error::integrity(format!("{}: {e:?}", w.filename)))?;
-        for f in files {
-            out.push(
+        for f in scan.startup {
+            startup.push(
                 Finding::new(
                     FindingKind::HostExecution,
                     FindingAction::Approve,
@@ -285,8 +319,30 @@ fn startup_findings(dir: &Path, wheels: &[PlanWheel]) -> crate::Result<Vec<Findi
                 .location(&f.entry),
             );
         }
+        for v in scan.denied {
+            denied.push(
+                Finding::new(
+                    FindingKind::UnsupportedInput,
+                    FindingAction::Deny,
+                    "pip.layout",
+                    format!("{} installs {}: {}", w.filename, v.entry, v.why),
+                )
+                .target(w.package().display())
+                .location(&v.entry),
+            );
+        }
     }
-    Ok(out)
+    if let Some(first) = denied.first() {
+        return Err(Error::new(
+            ResultCode::InvalidInput,
+            format!(
+                "unsupported wheel layout, nothing was installed: {}",
+                first.evidence
+            ),
+        )
+        .with_findings(denied));
+    }
+    Ok(WheelFindings { startup })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -297,9 +353,12 @@ fn review_and_apply(
     digest: &crate::digest::Digest,
     wheels: &[PlanWheel],
     reviewed: &Path,
+    requested: &[String],
     interp: &Interpreter,
     policy: &IndexPolicy,
 ) -> crate::Result<(Vec<Finding>, bool)> {
+    // Layout denies and startup files come from the reviewed copies (RP-003/4).
+    let startup = scan_wheels(reviewed, wheels, interp)?.startup;
     let pkgs: Vec<PackageId> = wheels.iter().map(PlanWheel::package).collect();
     let adv = (seams.advisories)(&pkgs);
     if adv.findings.iter().any(|f| f.action == FindingAction::Deny) {
@@ -308,8 +367,6 @@ fn review_and_apply(
                 .with_findings(adv.findings),
         );
     }
-    // Startup files in the reviewed copies need approval, not denial (CR-001).
-    let startup = startup_findings(reviewed, wheels)?;
     let mut findings = adv.findings.clone();
     findings.extend(startup.iter().cloned());
     let needs_approval =
@@ -357,10 +414,11 @@ fn review_and_apply(
     // The plan must still be exactly what was reviewed.
     apply::verify_reviewed(reviewed, wheels)?;
     // `has_scripts` is about code the guard itself would run. Installing a
-    // wheel runs none: pip only unpacks it, and every interpreter we start
-    // skips `site`, so `*.pth`/`sitecustomize` files the wheel ships do not run
-    // here. Those files are reported above as `pip.startup` approvals because
-    // they run later, when the user starts Python outside this command.
+    // wheel runs none: pip only unpacks it, every interpreter we start skips
+    // `site`, pip runs from the guard snapshot, and nothing in the target
+    // environment is imported. `*.pth`/`sitecustomize` files the wheel ships
+    // are reported above as `pip.startup` approvals because they run later,
+    // when the user starts Python outside this command.
     crate::exec::authorize_scripts(
         ctx,
         &*crate::sandbox::platform_backend(),
@@ -375,7 +433,16 @@ fn review_and_apply(
     if seams.cancel.load(Ordering::SeqCst) {
         return Err(Error::rejected("canceled; nothing was installed"));
     }
-    apply::apply(cx, digest.as_hex(), reviewed, wheels)?;
+    apply::apply(
+        cx,
+        &apply::PlanInputs {
+            digest: digest.as_hex(),
+            index: &policy.url,
+            requested,
+        },
+        reviewed,
+        wheels,
+    )?;
     Ok((findings, approved))
 }
 
@@ -392,15 +459,16 @@ pub fn recover(
     seams: &Seams<'_>,
 ) -> crate::Result<RecoverReport> {
     let limits = interp::RunLimits::from_settings(&ctx.settings.limits);
-    let interp = Interpreter::probe(python, &limits, &seams.cancel)?;
+    let (interp, guard) = Interpreter::probe(ctx.paths, python, &limits, &seams.cancel)?;
     let cx = apply::ApplyCtx {
         paths: ctx.paths,
         interp: &interp,
+        guard: &guard,
         limits: &limits,
         cancel: &seams.cancel,
         hooks: &seams.hooks,
     };
-    let jp = apply::journal_path(ctx.paths, &interp.executable);
+    let jp = apply::journal_path(ctx.paths, &interp.identity);
     crate::fsutil::with_lock(&jp, || recover_locked(ctx, &cx, &interp, discard, seams))
 }
 
@@ -411,11 +479,29 @@ fn recover_locked(
     discard: bool,
     seams: &Seams<'_>,
 ) -> crate::Result<RecoverReport> {
-    let Some(j) = apply::read_journal(ctx.paths, &interp.executable)? else {
-        return Err(Error::invalid(format!(
-            "no unfinished pip install is recorded for {}",
-            interp.executable
-        )));
+    let j = match apply::read_journal(ctx.paths, interp) {
+        Ok(Some(j)) => j,
+        Ok(None) => {
+            return Err(Error::invalid(format!(
+                "no unfinished pip install is recorded for {}",
+                interp.executable
+            )))
+        }
+        // A forged or mismatched journal is refused; `--discard` still drops it
+        // (and only its own file: nothing it names is trusted).
+        Err(_) if discard => {
+            apply::discard(ctx.paths, &interp.identity, None);
+            return Ok(RecoverReport {
+                interpreter: interp.executable.clone(),
+                digest: String::new(),
+                approved: false,
+                discarded: true,
+                already_installed: vec![],
+                pending: vec![],
+                findings: vec![],
+            });
+        }
+        Err(e) => return Err(e),
     };
     let (done, left) = j.wheels.split_at(j.done);
     let (done, left) = (done.to_vec(), left.to_vec());
@@ -429,7 +515,7 @@ fn recover_locked(
         findings: vec![],
     };
     if discard {
-        apply::discard(ctx.paths, &j);
+        apply::discard(ctx.paths, &interp.identity, Some(&j));
         return Ok(report);
     }
     apply::verify_pending(cx, &j)?;
@@ -446,7 +532,16 @@ fn recover_locked(
                 .with_findings(adv.findings),
         );
     }
-    let startup = startup_findings(&j.reviewed, &left)?;
+    // The remaining wheels go through the same inspection as at plan time.
+    for w in &left {
+        wheel::inspect(
+            &j.reviewed.join(&w.filename),
+            &w.filename,
+            ctx.settings.limits.artifact_max_bytes,
+        )
+        .map_err(|e| Error::integrity(format!("{}: {e:?}", w.filename)))?;
+    }
+    let startup = scan_wheels(&j.reviewed, &left, interp)?.startup;
     let mut findings = adv.findings.clone();
     findings.extend(startup.iter().cloned());
     let digest = plan::recover_digest(interp, &left)?;
@@ -561,6 +656,7 @@ fn resolution_failure(proxy: &proxy::Proxy, out: &interp::RunOutput) -> Error {
 /// shim never hands arguments to an unguarded manager path.
 /// With `capture` the output is returned instead of inherited (JSON mode).
 pub fn passthrough(
+    ctx: &ApprovalCtx<'_>,
     python: &Path,
     args: &[OsString],
     capture: bool,
@@ -605,7 +701,12 @@ pub fn passthrough(
             )));
         }
     }
-    let mut cmd = interp::pip_command(python, &["--isolated", "--disable-pip-version-check"]);
+    // Even read-only commands run the guard's snapshot of pip, never the
+    // environment's own copy (RP-003).
+    let limits = interp::RunLimits::from_settings(&ctx.settings.limits);
+    let cancel: Cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_, guard) = Interpreter::probe(ctx.paths, python, &limits, &cancel)?;
+    let mut cmd = guard.pip(&["--isolated", "--disable-pip-version-check"])?;
     cmd.args(args);
     interp::scrub_env(&mut cmd);
     let start_err =

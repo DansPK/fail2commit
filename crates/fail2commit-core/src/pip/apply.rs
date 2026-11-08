@@ -6,7 +6,15 @@
 //! is never rolled forward implicitly (W2-002, CR-002): while one exists for an
 //! interpreter, guarded installs stop, and `fail2commit pip recover` either
 //! completes it after a fresh approval or discards it.
+//!
+//! The journal is keyed by the interpreter's canonical identity (RP-006) and
+//! lives only under `paths.state_dir`. It is validated whenever it is read
+//! (RP-007, RP-008): identity, plan digest recomputed from the journal's own
+//! plan inputs, wheel names and hashes, and `reviewed` confined to the
+//! fail2commit-owned reviewed-wheel directory. A journal that fails is refused
+//! with a message offering `recover --discard`; it still blocks installs.
 
+use super::guard::Guard;
 use super::interp::{Cancel, Interpreter, RunLimits};
 use super::plan::PlanWheel;
 use crate::paths::TrustedPaths;
@@ -16,10 +24,19 @@ use sha2::{Digest as _, Sha256};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+pub const JOURNAL_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Journal {
     pub version: u32,
+    /// How the user spelled the interpreter when the plan was made. Display only;
+    /// the journal is found and checked by `identity`.
     pub python: String,
+    pub identity: String,
+    /// The interpreter facts the plan digest was computed over.
+    pub interpreter: Interpreter,
+    pub index: String,
+    pub requested: Vec<String>,
     pub digest: String,
     pub reviewed: PathBuf,
     pub wheels: Vec<PlanWheel>,
@@ -39,31 +56,90 @@ pub struct ApplyHooks {
     pub before_wheel: Option<BeforeWheel>,
 }
 
-pub fn journal_path(paths: &TrustedPaths, python: &str) -> PathBuf {
-    let id = hex::encode(&Sha256::digest(python.as_bytes())[..8]);
+/// `state_dir/pip/journal-<hash of the canonical identity>.json`.
+pub fn journal_path(paths: &TrustedPaths, identity: &str) -> PathBuf {
+    let id = hex::encode(&Sha256::digest(identity.as_bytes())[..8]);
     paths
         .state_dir
         .join("pip")
         .join(format!("journal-{id}.json"))
 }
 
-pub fn read_journal(paths: &TrustedPaths, python: &str) -> crate::Result<Option<Journal>> {
-    let p = journal_path(paths, python);
+fn reviewed_root(paths: &TrustedPaths) -> PathBuf {
+    paths.cache_dir.join("pip").join("reviewed")
+}
+
+fn refused(paths: &TrustedPaths, interp: &Interpreter, why: &str) -> Error {
+    Error::integrity(format!(
+        "the pip journal {} is not trusted ({why}); nothing was installed. Run `fail2commit pip --python \"{}\" recover --discard` to drop it",
+        journal_path(paths, &interp.identity).display(),
+        interp.executable
+    ))
+}
+
+/// Everything a journal claims must be consistent with itself, with the
+/// interpreter asked about, and with the directories fail2commit owns.
+fn validate(paths: &TrustedPaths, interp: &Interpreter, j: &Journal) -> Result<(), String> {
+    if j.version != JOURNAL_VERSION {
+        return Err("unknown journal version".into());
+    }
+    if j.identity != interp.identity || j.interpreter.identity != interp.identity {
+        return Err("it was written for a different interpreter".into());
+    }
+    if j.done > j.wheels.len() {
+        return Err("inconsistent progress".into());
+    }
+    let hex_ok = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hex_ok(&j.digest, 64) {
+        return Err("malformed plan digest".into());
+    }
+    let root = reviewed_root(paths);
+    let name_ok = j.reviewed.file_name().is_some_and(|n| {
+        let n = n.to_string_lossy();
+        hex_ok(&n, 16)
+    });
+    if j.reviewed.parent() != Some(root.as_path()) || !name_ok {
+        return Err("its wheel directory is outside the fail2commit cache".into());
+    }
+    for w in &j.wheels {
+        let plain = Path::new(&w.filename)
+            .file_name()
+            .is_some_and(|n| n == w.filename.as_str())
+            && !w.filename.contains(['/', '\\', ':']);
+        let named = super::wheel::parse_filename(&w.filename).is_some_and(|(n, _)| n == w.name);
+        if !plain || !named || !hex_ok(&w.sha256, 64) {
+            return Err(format!("wheel entry {} is malformed", w.filename));
+        }
+    }
+    let expected = super::plan::plan_digest(&j.interpreter, &j.index, &j.requested, &j.wheels)
+        .map_err(|e| e.message)?;
+    if !expected.matches(&j.digest) {
+        return Err("it does not match the plan digest that was approved".into());
+    }
+    Ok(())
+}
+
+/// Is there a journal file (trusted or not) for this interpreter's environment?
+pub fn journal_exists(paths: &TrustedPaths, interp: &Interpreter) -> bool {
+    journal_path(paths, &interp.identity).exists()
+}
+
+pub fn read_journal(paths: &TrustedPaths, interp: &Interpreter) -> crate::Result<Option<Journal>> {
+    let p = journal_path(paths, &interp.identity);
     if !p.exists() {
         return Ok(None);
     }
-    let bytes = crate::fsutil::read_bounded(&p, 4 * 1024 * 1024)?;
-    let bad = |e: String| Error::integrity(format!("pip journal {} is invalid: {e}", p.display()));
-    let j: Journal = serde_json::from_slice(&bytes).map_err(|e| bad(e.to_string()))?;
-    if j.done > j.wheels.len() || !j.digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(bad("inconsistent progress or digest".into()));
-    }
+    let bytes = crate::fsutil::read_bounded(&p, 4 * 1024 * 1024)
+        .map_err(|e| refused(paths, interp, &e.message))?;
+    let j: Journal = serde_json::from_slice(&bytes)
+        .map_err(|e| refused(paths, interp, &format!("unreadable: {e}")))?;
+    validate(paths, interp, &j).map_err(|why| refused(paths, interp, &why))?;
     Ok(Some(j))
 }
 
 /// Delete a reviewed-wheel directory, but only one under our own cache.
 fn remove_reviewed(paths: &TrustedPaths, dir: &Path) {
-    let root = paths.cache_dir.join("pip").join("reviewed");
+    let root = reviewed_root(paths);
     let plain = dir
         .components()
         .all(|c| !matches!(c, std::path::Component::ParentDir));
@@ -72,15 +148,18 @@ fn remove_reviewed(paths: &TrustedPaths, dir: &Path) {
     }
 }
 
-/// Drop a pending journal and its reviewed wheels. Installed wheels stay.
-pub fn discard(paths: &TrustedPaths, j: &Journal) {
-    let _ = std::fs::remove_file(journal_path(paths, &j.python));
-    remove_reviewed(paths, &j.reviewed);
+/// Drop a pending journal (valid or not) and, when it was trusted, its
+/// reviewed wheels. Installed wheels stay.
+pub fn discard(paths: &TrustedPaths, identity: &str, trusted: Option<&Journal>) {
+    let _ = std::fs::remove_file(journal_path(paths, identity));
+    if let Some(j) = trusted {
+        remove_reviewed(paths, &j.reviewed);
+    }
 }
 
 fn write_journal(paths: &TrustedPaths, j: &Journal) -> crate::Result<()> {
     let bytes = serde_json::to_vec(j).map_err(|e| Error::internal(e.to_string()))?;
-    crate::fsutil::atomic_write(&journal_path(paths, &j.python), &bytes)
+    crate::fsutil::atomic_write(&journal_path(paths, &j.identity), &bytes)
 }
 
 fn sha256_file(p: &Path) -> crate::Result<String> {
@@ -102,7 +181,7 @@ pub fn materialize(
     paths: &TrustedPaths,
     wheels: &[(PlanWheel, PathBuf)],
 ) -> crate::Result<PathBuf> {
-    let root = paths.cache_dir.join("pip").join("reviewed");
+    let root = reviewed_root(paths);
     crate::fsutil::ensure_private_dir(&root)?;
     let dir = root.join(&crate::digest::random_hex32()?[..16]);
     crate::fsutil::ensure_private_dir(&dir)?;
@@ -173,31 +252,44 @@ pub fn apply_args(reviewed: &Path, hashes_file: &Path) -> Vec<OsString> {
 pub struct ApplyCtx<'a> {
     pub paths: &'a TrustedPaths,
     pub interp: &'a Interpreter,
+    pub guard: &'a Guard,
     pub limits: &'a RunLimits,
     pub cancel: &'a Cancel,
     pub hooks: &'a ApplyHooks,
+}
+
+/// What the plan digest was computed over besides the wheels; stored in the
+/// journal so a later `recover` can recompute it.
+pub struct PlanInputs<'a> {
+    pub digest: &'a str,
+    pub index: &'a str,
+    pub requested: &'a [String],
 }
 
 /// Journal, install every wheel in order, verify, then clear the journal.
 /// Refuses to start while another journal exists for the interpreter.
 pub fn apply(
     cx: &ApplyCtx<'_>,
-    digest: &str,
+    plan: &PlanInputs<'_>,
     reviewed: &Path,
     wheels: &[PlanWheel],
 ) -> crate::Result<()> {
     let journal = Journal {
-        version: 1,
+        version: JOURNAL_VERSION,
         python: cx.interp.executable.clone(),
-        digest: digest.to_string(),
+        identity: cx.interp.identity.clone(),
+        interpreter: cx.interp.clone(),
+        index: plan.index.to_string(),
+        requested: plan.requested.to_vec(),
+        digest: plan.digest.to_string(),
         reviewed: reviewed.to_path_buf(),
         wheels: wheels.to_vec(),
         done: 0,
         cancelled: false,
     };
-    let jp = journal_path(cx.paths, &journal.python);
+    let jp = journal_path(cx.paths, &journal.identity);
     crate::fsutil::with_lock(&jp, || {
-        if let Some(other) = read_journal(cx.paths, &journal.python)? {
+        if let Some(other) = read_journal(cx.paths, cx.interp)? {
             return Err(pending_error(&other));
         }
         write_journal(cx.paths, &journal)?;
@@ -229,7 +321,7 @@ pub fn verify_pending(cx: &ApplyCtx<'_>, j: &Journal) -> crate::Result<()> {
         Error::integrity(format!(
             "{} (journal: {})",
             e.message,
-            journal_path(cx.paths, &j.python).display()
+            journal_path(cx.paths, &j.identity).display()
         ))
     })
 }
@@ -251,7 +343,7 @@ fn run_journal(cx: &ApplyCtx<'_>, mut j: Journal, fresh: bool) -> crate::Result<
     for i in j.done..j.wheels.len() {
         if cx.cancel.load(std::sync::atomic::Ordering::SeqCst) {
             if fresh && j.done == 0 {
-                discard(cx.paths, &j);
+                discard(cx.paths, &j.identity, Some(&j));
                 return Err(Error::rejected("canceled; nothing was installed"));
             }
             j.cancelled = true;
@@ -268,7 +360,10 @@ fn run_journal(cx: &ApplyCtx<'_>, mut j: Journal, fresh: bool) -> crate::Result<
         }
         let hf = hashes_dir.join(format!("hashes-{:.16}.txt", j.digest));
         std::fs::write(&hf, w.hash_line())?;
-        let mut cmd = cx.interp.pip();
+        // The snapshot is re-verified by `Guard::pip` before this launch.
+        let mut cmd = cx
+            .guard
+            .pip(&["--isolated", "--disable-pip-version-check", "--no-input"])?;
         cmd.args(apply_args(&j.reviewed, &hf));
         let out = super::interp::run(&mut cmd, cx.limits, &never);
         let _ = std::fs::remove_file(&hf);
@@ -284,12 +379,13 @@ fn run_journal(cx: &ApplyCtx<'_>, mut j: Journal, fresh: bool) -> crate::Result<
         write_journal(cx.paths, &j)?;
     }
     verify_installed(&inner, &j.wheels)?;
-    let _ = std::fs::remove_file(journal_path(cx.paths, &j.python));
+    let _ = std::fs::remove_file(journal_path(cx.paths, &j.identity));
     remove_reviewed(cx.paths, &j.reviewed);
     Ok(())
 }
 
-/// The environment must now contain exactly the planned versions.
+/// The environment must now contain exactly the planned versions, as recorded
+/// by the `dist-info` directories on disk. Nothing from it is imported.
 pub fn verify_installed(cx: &ApplyCtx<'_>, wheels: &[PlanWheel]) -> crate::Result<()> {
     let installed = cx.interp.installed(cx.limits, cx.cancel)?;
     for w in wheels {

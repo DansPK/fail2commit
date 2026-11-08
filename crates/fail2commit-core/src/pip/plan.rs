@@ -200,6 +200,7 @@ mod tests {
     fn digest_binds_every_part() {
         let i = Interpreter {
             executable: "/v/bin/python".into(),
+            identity: "cpython-3.12:/v".into(),
             prefix: "/v".into(),
             base_prefix: "/usr".into(),
             in_venv: true,
