@@ -7,7 +7,6 @@ use crate::protocol::{Finding, FindingAction as A, FindingKind as K};
 use crate::settings::Limits;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 const MAX_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_UPDATES: usize = 4096;
@@ -113,10 +112,10 @@ pub fn repo_id(git_dir: &Path) -> crate::Result<String> {
 
 /// `Ok(true)` fast-forward, `Ok(false)` rewrite, `Err` unknown (missing
 /// objects, not a commit): the caller denies.
-fn is_ancestor(git: &Path, old: &str, new: &str) -> Result<bool, String> {
-    let out = Command::new(git)
+fn is_ancestor(git: &Path, repo: &Path, old: &str, new: &str) -> Result<bool, String> {
+    // Hardened env (no replace refs etc.), shared with the scanner.
+    let out = crate::git::gitcmd::command(git, repo)
         .args(["merge-base", "--is-ancestor", old, new])
-        .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("git failed to start: {e}"))?;
     match out.status.code() {
@@ -176,7 +175,7 @@ pub fn pre_receive(
                 ));
             }
         } else {
-            match is_ancestor(git, &u.old, &u.new) {
+            match is_ancestor(git, &input.git_dir, &u.old, &u.new) {
                 Ok(true) => {}
                 Ok(false) => needs_approval.push(finding(
                     K::RefRewrite,

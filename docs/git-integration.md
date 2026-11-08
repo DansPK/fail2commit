@@ -56,6 +56,21 @@ Binary blobs are scanned (lossily) rather than skipped, `.env` names are matched
 and lines over 8 KiB are scanned in overlapping 8 KiB windows (512-byte overlap) rather than
 skipped.
 
+**Tips are peeled.** Every new value is peeled through annotated tags (recursively) to the
+real object. A commit is walked; a blob is scanned as a blob; a tree is walked (`ls-tree -r`)
+and its blobs scanned within the same entry bound. A tip whose type cannot be established
+gives `IncompleteScan` (deny on the server).
+
+**Encodings.** Blobs with a UTF-16 BOM, or NULs concentrated in one byte parity, are also
+scanned as a decoded copy. A UTF-32 BOM, an odd length or invalid surrogates give
+`IncompleteScan` (the blob is only partly scanned). Other encodings are not decoded.
+
+**Hardened Git environment.** Every Git subprocess the guard runs (scanner, classifier,
+pre-push, server ancestry check) is built by `gitcmd::command`: `GIT_NO_REPLACE_OBJECTS=1`
+(replace refs cannot swap a blob; Git also skips `info/grafts` under it),
+`core.commitGraph=false` and `core.fsmonitor=false` via `GIT_CONFIG_COUNT`,
+`GIT_NO_LAZY_FETCH=1`, no prompts and no optional locks.
+
 Force-push password: `ForceIntent`, `RefRewrite`, `TagReplacement` and `RefDeletion`
 findings all require the configured password on the direct hook path, with or without the
 shim's `FAIL2COMMIT_PUSH_INTENT`.
@@ -70,8 +85,11 @@ Detectors: `.env` / `.env.*` (not `.example`, `.sample`, `.template`), private k
 AWS access keys, GitHub / GitLab / Slack tokens, and `password=` / `secret=` style
 assignments with an entropy check. Values are always redacted.
 
-`fail2commit secret-scan [REMOTE]` runs the same scan for the current branch without pushing
-(exit 10 on findings, 12 if only incomplete).
+`fail2commit secret-scan [REMOTE] [--remote]` runs the same scan for the current branch
+without pushing (exit 10 on findings, 12 if only incomplete). By default it is **local-only**:
+it scans everything reachable from `HEAD` (old = zero), never `refs/remotes/**`, and the
+output says so. `--remote` asks the remote itself (`git ls-remote`, network) for the branch's
+current value and scans only what is newer; it fails if the remote cannot be queried.
 
 ## What bypasses local integration
 
