@@ -110,6 +110,205 @@ pub fn inspect(
     Ok(info)
 }
 
+/// A file the wheel installs into `purelib`/`platlib` that CPython's `site`
+/// module executes at every interpreter start of that environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupFile {
+    /// Entry name inside the wheel.
+    pub entry: String,
+    pub why: &'static str,
+}
+
+/// A wheel entry that would change the interpreter's own layout or the
+/// guard's tools (RP-003, RP-004). Never approvable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutViolation {
+    pub entry: String,
+    pub why: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Scan {
+    pub startup: Vec<StartupFile>,
+    pub denied: Vec<LayoutViolation>,
+}
+
+/// Where in the environment an entry would land.
+enum Dest<'a> {
+    /// `purelib`/`platlib` (root entries and `*.data/purelib|platlib`).
+    Site(Vec<&'a str>),
+    /// `*.data/data`: relative to `sys.prefix`.
+    Data(Vec<&'a str>),
+    /// `*.data/scripts`: the venv's `Scripts`/`bin` directory.
+    Scripts(Vec<&'a str>),
+    Other,
+}
+
+fn classify(name: &str) -> Dest<'_> {
+    let comps: Vec<&str> = name
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let Some(first) = comps.first() else {
+        return Dest::Other;
+    };
+    if first.to_ascii_lowercase().ends_with(".data") {
+        if comps.len() < 3 {
+            return Dest::Other;
+        }
+        let rest = comps[2..].to_vec();
+        return match comps[1].to_ascii_lowercase().as_str() {
+            "purelib" | "platlib" => Dest::Site(rest),
+            "data" => Dest::Data(rest),
+            "scripts" => Dest::Scripts(rest),
+            _ => Dest::Other,
+        };
+    }
+    Dest::Site(comps)
+}
+
+/// Does CPython's `site.addpackage` execute a line of this `.pth` file?
+/// It decodes UTF-8 (BOM allowed), splits like `str.splitlines` (bare CR and
+/// the other separators included) and executes lines starting `import ` or
+/// `import\t`. Content that is not UTF-8 is decoded with the locale, which we
+/// cannot know, so it is flagged.
+pub(crate) fn pth_executes(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return true;
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.split(|c| {
+        matches!(
+            c,
+            '\n' | '\r'
+                | '\x0b'
+                | '\x0c'
+                | '\x1c'
+                | '\x1d'
+                | '\x1e'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    })
+    .any(|l| l.starts_with("import ") || l.starts_with("import\t"))
+}
+
+fn is_startup_name(leaf: &str) -> bool {
+    let lower = leaf.to_ascii_lowercase();
+    let stem = lower.split('.').next().unwrap_or("");
+    lower.ends_with(".pth") || stem == "sitecustomize" || stem == "usercustomize"
+}
+
+/// First `data` component that is part of the interpreter's own layout.
+const DATA_RESERVED: [&str; 9] = [
+    "pyvenv.cfg",
+    "lib",
+    "lib64",
+    "include",
+    "bin",
+    "scripts",
+    "dlls",
+    "libs",
+    "tools",
+];
+
+/// `pip`, `pip3`, `pip3.12`, `pip-script.py`: the guard's own tool names.
+fn is_pip_script(base: &str) -> bool {
+    base == "pip"
+        || base.starts_with("pip-script")
+        || base
+            .strip_prefix("pip")
+            .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Why a `scripts` entry may not be installed, if it may not.
+/// `reserved` holds the lower-cased file names of the interpreter executable.
+fn bad_script(rest: &[&str], reserved: &[String]) -> Option<String> {
+    if rest.len() > 1 {
+        return Some("a nested path under the interpreter's scripts directory".into());
+    }
+    let leaf = rest.first()?.to_ascii_lowercase();
+    let base = leaf.split('.').next().unwrap_or("");
+    let hit = base.starts_with("python")
+        || is_pip_script(base)
+        || leaf == "pyvenv.cfg"
+        || base.starts_with("activate")
+        || base.starts_with("deactivate")
+        || reserved.contains(&leaf);
+    hit.then(|| format!("{leaf} is an interpreter or pip executable of the environment"))
+}
+
+/// Inspect one wheel for entries that run at interpreter start-up (CR-001) and
+/// for entries that must never be installed through the guard (RP-003/RP-004).
+/// `dist` is the wheel's normalized project name; `reserved` the lower-cased
+/// file names of the target interpreter. Nothing is extracted.
+pub fn scan(path: &Path, dist: &str, reserved: &[String]) -> Result<Scan, WheelError> {
+    let bad = |m: String| WheelError::Invalid(m);
+    let file = std::fs::File::open(path).map_err(|e| bad(format!("open: {e}")))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| bad(format!("not a zip archive: {e}")))?;
+    let mut out = Scan::default();
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| bad(format!("entry {i}: {e}")))?;
+        let name = String::from_utf8_lossy(entry.name_raw()).replace('\\', "/");
+        let mut deny: Option<String> = None;
+        let mut startup: Option<&'static str> = None;
+        match classify(&name) {
+            Dest::Site(rel) => {
+                let first = rel[0].to_ascii_lowercase();
+                let is_pip_dist = first
+                    .strip_prefix("pip-")
+                    .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+                    && first.ends_with(".dist-info");
+                if first == "pip" || is_pip_dist {
+                    deny = Some(if dist == "pip" {
+                        "upgrading pip through fail2commit is not supported: pip is the guard's own tool and its files are never replaced".into()
+                    } else {
+                        "the wheel overwrites files of pip, the guard's own tool".into()
+                    });
+                } else if rel.len() == 1 && first.ends_with(".pth") {
+                    let mut head = Vec::new();
+                    let _ = (&mut entry).take(MAX_METADATA + 1).read_to_end(&mut head);
+                    if head.len() as u64 > MAX_METADATA {
+                        startup = Some(".pth too large to inspect; Python may run import lines in it at every start");
+                    } else if pth_executes(&head) {
+                        startup = Some(".pth import line run by Python at every start");
+                    }
+                } else if matches!(
+                    first.split('.').next(),
+                    Some("sitecustomize" | "usercustomize")
+                ) {
+                    startup = Some("imported by Python at every start");
+                }
+            }
+            Dest::Data(rest) => {
+                let first = rest[0].to_ascii_lowercase();
+                if DATA_RESERVED.contains(&first.as_str()) || first.starts_with("python") {
+                    deny = Some(format!(
+                        "the data scheme would write {first} under the interpreter prefix (its layout, site directories or executables)"
+                    ));
+                } else if is_startup_name(rest[rest.len() - 1]) {
+                    deny = Some("a startup hook (.pth, sitecustomize, usercustomize) through the data scheme".into());
+                }
+            }
+            Dest::Scripts(rest) => deny = bad_script(&rest, reserved),
+            Dest::Other => {}
+        }
+        if let Some(why) = deny {
+            out.denied.push(LayoutViolation {
+                entry: name.clone(),
+                why,
+            });
+        }
+        if let Some(why) = startup {
+            out.startup.push(StartupFile { entry: name, why });
+        }
+    }
+    Ok(out)
+}
+
 fn check_entry_name(name: &str) -> Result<(), String> {
     let p = name.replace('\\', "/");
     if p.starts_with('/')
@@ -239,6 +438,132 @@ mod tests {
             inspect(build(&e).path(), "foo_bar-1.0-py3-none-any.whl", 1 << 20),
             Err(WheelError::DirectReference(_))
         ));
+    }
+
+    fn scan_of(e: &[(&str, &str)]) -> Scan {
+        let mut all = ok_entries();
+        all.extend_from_slice(e);
+        scan(build(&all).path(), "foo-bar", &["python.exe".into()]).unwrap()
+    }
+
+    fn startup_names(s: &Scan) -> Vec<&str> {
+        s.startup.iter().map(|s| s.entry.as_str()).collect()
+    }
+
+    #[test]
+    fn startup_files_are_found_where_site_would_run_them() {
+        let s = scan_of(&[
+            ("x.pth", "import os\n"),
+            ("plain.pth", "/some/dir\n# import not a command\n"),
+            ("sitecustomize.py", "x=1\n"),
+            ("foo_bar-1.0.data/purelib/y.pth", "import sys\n"),
+            (
+                "foo_bar-1.0.data/platlib/sitecustomize.cpython-312.pyc",
+                "x",
+            ),
+            ("foo_bar-1.0.data/scripts/z.pth", "import sys\n"),
+            ("pkg/inner.pth", "import sys\n"),
+        ]);
+        assert_eq!(
+            startup_names(&s),
+            [
+                "x.pth",
+                "sitecustomize.py",
+                "foo_bar-1.0.data/purelib/y.pth",
+                "foo_bar-1.0.data/platlib/sitecustomize.cpython-312.pyc"
+            ]
+        );
+        assert!(s.denied.is_empty(), "{:?}", s.denied);
+        assert_eq!(scan_of(&[]), Scan::default());
+    }
+
+    #[test]
+    fn pth_lines_are_detected_like_site_addpackage() {
+        // RP-001: bare CR, other separators, a BOM, and the tab form.
+        for ok in [
+            "import os\n",
+            "# pad\rimport os\n",
+            "/dir\r\nimport\tos",
+            "\u{feff}import os\n",
+            "/d\u{2028}import os",
+            "/d\x0cimport os",
+        ] {
+            assert!(pth_executes(ok.as_bytes()), "{ok:?}");
+        }
+        for no in [
+            "",
+            "/dir\n# import os\n",
+            "imports os\n",
+            " import os\n",
+            "importos\n",
+        ] {
+            assert!(!pth_executes(no.as_bytes()), "{no:?}");
+        }
+        assert!(pth_executes(&[0xff, 0xfe, b'i']), "undecodable is flagged");
+    }
+
+    #[test]
+    fn oversized_pth_is_flagged_not_skipped() {
+        let big = format!("{}\nimport os\n", "/x".repeat(MAX_METADATA as usize));
+        let s = scan_of(&[("big.pth", big.as_str())]);
+        assert_eq!(startup_names(&s), ["big.pth"]);
+    }
+
+    #[test]
+    fn layout_entries_are_denied() {
+        // RP-004: interpreter layout, the guard's tools, startup hooks in data.
+        let hostile = [
+            "foo_bar-1.0.data/data/pyvenv.cfg",
+            "foo_bar-1.0.data/data/Lib/site-packages/a.py",
+            "foo_bar-1.0.data/data/lib/python3.12/site-packages/a.py",
+            "foo_bar-1.0.data/data/lib64/x",
+            "foo_bar-1.0.data/data/include/x.h",
+            "foo_bar-1.0.data/data/bin/python",
+            "foo_bar-1.0.data/data/Scripts/python.exe",
+            "foo_bar-1.0.data/data/share/evil.pth",
+            "foo_bar-1.0.data/data/share/sitecustomize.py",
+            "foo_bar-1.0.data/scripts/python3.12",
+            "foo_bar-1.0.data/scripts/Python.EXE",
+            "foo_bar-1.0.data/scripts/pip3.exe",
+            "foo_bar-1.0.data/scripts/pip",
+            "foo_bar-1.0.data/scripts/pyvenv.cfg",
+            "foo_bar-1.0.data/scripts/sub/tool",
+            "foo_bar-1.0.data/purelib/pip/__init__.py",
+            "foo_bar-1.0.data/platlib/pip-24.0.dist-info/METADATA",
+            "pip/__init__.py",
+            "pip-25.0.dist-info/RECORD",
+        ];
+        for h in hostile {
+            let s = scan_of(&[(h, "x")]);
+            assert_eq!(s.denied.len(), 1, "{h}: {:?}", s.denied);
+        }
+        // reserved interpreter names come from the caller
+        let mut all = ok_entries();
+        all.push(("foo_bar-1.0.data/scripts/Custom.exe", "x"));
+        let s = scan(build(&all).path(), "foo-bar", &["custom.exe".into()]).unwrap();
+        assert_eq!(s.denied.len(), 1);
+        // allowed look-alikes
+        for ok in [
+            "foo_bar-1.0.data/data/share/jupyter/x.json",
+            "foo_bar-1.0.data/data/etc/x.conf",
+            "foo_bar-1.0.data/scripts/pipx",
+            "foo_bar-1.0.data/scripts/black.exe",
+            "foo_bar-1.0.data/headers/x.h",
+            "pip_tools/__init__.py",
+            "pip-tools-1.0.dist-info/RECORD",
+            "pipdeptree.py",
+        ] {
+            let s = scan_of(&[(ok, "x")]);
+            assert!(s.denied.is_empty(), "{ok}: {:?}", s.denied);
+        }
+    }
+
+    #[test]
+    fn upgrading_pip_itself_is_denied_with_its_own_reason() {
+        let mut all = ok_entries();
+        all.push(("pip/__init__.py", "x"));
+        let s = scan(build(&all).path(), "pip", &[]).unwrap();
+        assert!(s.denied[0].why.contains("upgrading pip"), "{:?}", s.denied);
     }
 
     #[test]

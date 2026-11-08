@@ -1,9 +1,10 @@
 //! Independent wave-2 security-review reproduction.
 //!
-//! `pip::interp` treats `python -I` as a code-free probe/apply boundary, but
-//! isolated mode still imports `site` and executes `.pth` import lines from the
-//! target environment. A wheel installed by one apply process can therefore
-//! execute host code when fail2commit starts its next interpreter process.
+//! `python -I` alone still imports `site` and executes `.pth` import lines from
+//! the target environment (the first test pins that premise). `pip::interp`
+//! therefore starts every interpreter with `-I -S`, and the second test is the
+//! W2-001 regression: the guard's process chain never runs the `.pth`, and the
+//! wheel needs an approval naming it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -83,16 +84,18 @@ fn isolated_python_still_executes_target_pth_files() {
 }
 // ---------------------------------------------------------------------------
 // W2-001, end to end: a wheel may ship a top-level `.pth` file, and the wheel
-// spec installs it into purelib. `pip::install` then runs the interpreter again
-// (verify_installed) inside the same guarded command, so the wheel's code runs
-// on the host with no sandbox and no `exec::authorize_scripts`.
+// spec installs it into purelib. Fixed (CR-001): the guard starts every
+// interpreter with `-I -S`, and the wheel is flagged for approval by name.
 // ---------------------------------------------------------------------------
 
 mod pip_support;
 
 use fail2commit_core::pip;
+use fail2commit_core::protocol::{ApprovalRequest, Decision};
+use fail2commit_core::{FindingAction, FindingKind};
 use pip_support::*;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 /// A valid wheel whose top level also carries a `.pth` file that writes
 /// `marker` when any interpreter for the environment starts.
@@ -133,8 +136,12 @@ fn has_pip(python: &Path) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// W2-001 / CR-001 regression: the guard's own process chain (probe, dry-run
+/// resolution, apply, verify) starts every interpreter without `site`, so the
+/// wheel's `.pth` never runs inside the guard; the wheel needs an approval that
+/// names the file.
 #[test]
-fn reviewed_pip_install_runs_wheel_code_on_the_host() {
+fn guarded_install_never_runs_wheel_startup_code_and_asks_approval_naming_it() {
     let env = Env::new();
     let index = TestIndex::start();
     let venv = tempfile::tempdir().unwrap();
@@ -149,19 +156,81 @@ fn reviewed_pip_install_runs_wheel_code_on_the_host() {
     let marker = env.home.path().join("wheel-code-ran");
     let (filename, bytes) = build_pth_wheel(&marker);
     index.add_raw("evilpth", &filename, bytes.clone(), &sha256_hex(&bytes));
+    index.add_wheel("other", "1.0", &[]);
 
-    let report = pip::install(
-        &env.ctx(),
-        &python,
-        &args(&["evilpth"]),
-        &env.workdir(),
-        &seams(&index),
-    )
-    .expect("a clean, hash-verified wheel install is expected to succeed");
-    assert!(!report.approved, "a clean plan asks for no approval");
-    assert!(has(&python, "evilpth", "1.0"), "the wheel is installed");
+    let asked: Arc<Mutex<Vec<ApprovalRequest>>> = Arc::default();
+    let a2 = asked.clone();
+    let mut s = seams(&index);
+    s.approve = Box::new(move |r| {
+        a2.lock().unwrap().push(r.clone());
+        Ok(Decision::ApproveOnce)
+    });
+    let report = pip::install(&env.ctx(), &python, &args(&["evilpth"]), &env.workdir(), &s)
+        .expect("an approved wheel install succeeds");
     assert!(
         !marker.exists(),
         "W2-001: the guarded install executed wheel code on the host"
     );
+    assert!(report.approved, "startup code needs an approval");
+    assert!(has(&python, "evilpth", "1.0"), "the wheel is installed");
+
+    let asked = asked.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    let f = asked[0]
+        .findings
+        .iter()
+        .find(|f| f.source == "pip.startup")
+        .expect("a pip.startup finding");
+    assert_eq!(f.kind, FindingKind::HostExecution);
+    assert_eq!(f.action, FindingAction::Approve);
+    assert_eq!(f.location.as_deref(), Some("f2c_review_marker.pth"));
+    assert!(f.evidence.contains(&filename), "{}", f.evidence);
+    assert!(
+        asked[0]
+            .details
+            .iter()
+            .any(|d| d.contains("f2c_review_marker.pth") && d.contains(&filename)),
+        "{:?}",
+        asked[0].details
+    );
+    assert!(report.findings.iter().any(|f| f.source == "pip.startup"));
+    drop(asked);
+
+    // The .pth is now installed. A later guarded run (probe, dry run, apply,
+    // verify against that environment) still must not execute it.
+    let r = pip::install(
+        &env.ctx(),
+        &python,
+        &args(&["other"]),
+        &env.workdir(),
+        &seams(&index),
+    )
+    .unwrap();
+    assert!(!r.approved, "a clean wheel asks nothing");
+    assert!(has(&python, "other", "1.0"));
+    assert!(
+        !marker.exists(),
+        "W2-001: a later guarded run executed the installed .pth"
+    );
+}
+
+#[test]
+fn declining_the_startup_approval_installs_nothing() {
+    let env = Env::new();
+    let index = TestIndex::start();
+    let venv = tempfile::tempdir().unwrap();
+    let python = make_venv(&venv.path().join("v"));
+    if !has_pip(&python) {
+        return;
+    }
+    let marker = env.home.path().join("wheel-code-ran");
+    let (filename, bytes) = build_pth_wheel(&marker);
+    index.add_raw("evilpth", &filename, bytes.clone(), &sha256_hex(&bytes));
+    let mut s = seams(&index);
+    s.approve = Box::new(|_| Ok(Decision::Cancel));
+    let e = pip::install(&env.ctx(), &python, &args(&["evilpth"]), &env.workdir(), &s).unwrap_err();
+    assert_eq!(e.code, fail2commit_core::ResultCode::Rejected, "{e}");
+    assert!(!has_name(&python, "evilpth"));
+    assert!(!marker.exists());
+    assert!(!env.journal_exists());
 }

@@ -285,16 +285,44 @@ pub fn make_venv(dir: &Path) -> PathBuf {
 }
 
 /// `(normalized name, version)` for everything installed in `python`.
+/// Runs `-I -S` like the guard does, so a wheel's `.pth` never runs here either.
 pub fn installed(python: &Path) -> Vec<(String, String)> {
+    // Without `site` a venv is not detected: point sys.prefix at it by hand
+    // (python is <venv>/Scripts/python.exe or <venv>/bin/python).
+    let root = python.parent().unwrap().parent().unwrap();
+    let code = format!(
+        "import sys, json\nsys.prefix = sys.exec_prefix = {:?}\nimport sysconfig\n\
+         sys.path.extend([sysconfig.get_path('purelib'), sysconfig.get_path('platlib')])\n\
+         from importlib import metadata as m\n\
+         print(json.dumps(sorted([d.metadata['Name'].lower().replace('_','-'),d.version] for d in m.distributions())))\n",
+        root.to_string_lossy()
+    );
     let out = Command::new(python)
-        .args([
-            "-I",
-            "-c",
-            "import json;from importlib import metadata as m;print(json.dumps(sorted([d.metadata['Name'].lower().replace('_','-'),d.version] for d in m.distributions())))",
-        ])
+        .args(["-I", "-S", "-c", &code])
         .output()
         .unwrap();
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// Every file under `root` (except `__pycache__`) with its SHA-256.
+pub fn snapshot(root: &Path) -> BTreeMap<String, String> {
+    fn walk(dir: &Path, root: &Path, out: &mut BTreeMap<String, String>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if e.file_name() == "__pycache__" {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, root, out);
+            } else if let Ok(b) = std::fs::read(&p) {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, sha256_hex(&b));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
 }
 
 pub fn has(python: &Path, name: &str, version: &str) -> bool {
@@ -352,6 +380,25 @@ impl Env {
                     .filter(|e| e.file_name().to_string_lossy().starts_with("run-"))
                     .count()
             })
+            .unwrap_or(0)
+    }
+
+    /// Bytes of the single pending journal, if any.
+    pub fn journal_bytes(&self) -> Option<Vec<u8>> {
+        std::fs::read_dir(self.paths.state_dir.join("pip"))
+            .ok()?
+            .flatten()
+            .find(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("journal-") && n.ends_with(".json")
+            })
+            .map(|e| std::fs::read(e.path()).unwrap())
+    }
+
+    /// Reviewed-wheel directories still on disk.
+    pub fn reviewed_dirs(&self) -> usize {
+        std::fs::read_dir(self.paths.cache_dir.join("pip").join("reviewed"))
+            .map(|d| d.count())
             .unwrap_or(0)
     }
 

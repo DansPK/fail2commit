@@ -8,7 +8,7 @@ use fail2commit_core::protocol::{ApprovalRequest, Decision};
 use fail2commit_core::scan::AdvisoryReport;
 use fail2commit_core::{Error, Finding, FindingAction, FindingKind, ResultCode};
 use pip_support::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 struct Fixture {
@@ -357,79 +357,6 @@ fn resolver_cancellation_leaves_everything_unchanged() {
     assert!(!has_name(&f.python, "alpha"));
     assert_eq!(f.env.leftover_runs(), 0);
     assert!(!f.env.journal_exists());
-}
-
-#[test]
-fn interrupted_apply_is_recovered_by_the_next_run() {
-    let f = fixture();
-    f.index.add_wheel("alpha", "1.0", &[]);
-    f.index.add_wheel("beta", "1.0", &[]);
-    let crashed = Arc::new(AtomicBool::new(false));
-    let c2 = crashed.clone();
-    let mut s = seams(&f.index);
-    s.hooks.before_wheel = Some(Box::new(move |i, _| {
-        if i == 1 {
-            c2.store(true, Ordering::SeqCst);
-            return Err(Error::internal("simulated crash"));
-        }
-        Ok(())
-    }));
-    let e = f.install(&["alpha", "beta"], &s).unwrap_err();
-    assert!(crashed.load(Ordering::SeqCst), "{e}");
-    // partially applied, but journaled with the reviewed wheels kept
-    assert!(has_name(&f.python, "alpha") && !has_name(&f.python, "beta"));
-    assert!(f.env.journal_exists());
-
-    // the next guarded run completes the reviewed set first
-    let r = f.install(&["alpha"], &seams(&f.index)).unwrap();
-    assert!(r.recovered);
-    assert!(has(&f.python, "alpha", "1.0") && has(&f.python, "beta", "1.0"));
-    assert!(!f.env.journal_exists());
-}
-
-#[test]
-fn cancel_during_apply_stops_between_wheels_and_is_recoverable() {
-    let f = fixture();
-    f.index.add_wheel("alpha", "1.0", &[]);
-    f.index.add_wheel("beta", "1.0", &[]);
-    let mut s = seams(&f.index);
-    let cancel = s.cancel.clone();
-    s.hooks.before_wheel = Some(Box::new(move |i, _| {
-        if i == 1 {
-            cancel.store(true, Ordering::SeqCst);
-        }
-        Ok(())
-    }));
-    let e = f.install(&["alpha", "beta"], &s).unwrap_err();
-    assert_eq!(e.code, ResultCode::Rejected);
-    assert!(!has_name(&f.python, "beta"));
-    assert!(f.env.journal_exists());
-    f.install(&["alpha"], &seams(&f.index)).unwrap();
-    assert!(has_name(&f.python, "beta"));
-}
-
-#[test]
-fn tampered_reviewed_set_blocks_recovery() {
-    let f = fixture();
-    f.index.add_wheel("alpha", "1.0", &[]);
-    f.index.add_wheel("beta", "1.0", &[]);
-    let mut s = seams(&f.index);
-    s.hooks.before_wheel = Some(Box::new(|i, _| {
-        if i == 1 {
-            return Err(Error::internal("simulated crash"));
-        }
-        Ok(())
-    }));
-    f.install(&["alpha", "beta"], &s).unwrap_err();
-    let reviewed = f.env.paths.cache_dir.join("pip").join("reviewed");
-    for d in std::fs::read_dir(&reviewed).unwrap() {
-        for w in std::fs::read_dir(d.unwrap().path()).unwrap() {
-            std::fs::write(w.unwrap().path(), b"substituted").unwrap();
-        }
-    }
-    let e = f.install(&["alpha"], &seams(&f.index)).unwrap_err();
-    assert_eq!(e.code, ResultCode::IntegrityFailure, "{e}");
-    assert!(!has_name(&f.python, "beta"));
 }
 
 #[test]
