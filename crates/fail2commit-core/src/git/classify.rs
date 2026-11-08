@@ -31,10 +31,17 @@ pub fn classify(git: &Path, repo: &Path, updates: &[RefUpdate]) -> crate::Result
             continue;
         }
         match gitcmd::object_type(git, repo, &u.old)? {
-            None => out.push(f(
-                FindingKind::IncompleteScan,
-                "remote's current commit is not in this repository (shallow or stale); cannot prove a fast-forward",
-            )),
+            None => {
+                out.push(f(
+                    FindingKind::IncompleteScan,
+                    "remote's current commit is not in this repository (shallow or stale); cannot prove a fast-forward",
+                ));
+                // Unprovable is treated as destructive: same password as a rewrite.
+                out.push(f(
+                    FindingKind::RefRewrite,
+                    "update cannot be proven non-destructive because the remote's old object is missing",
+                ));
+            }
             Some(t) if t != "commit" => out.push(f(
                 FindingKind::RefRewrite,
                 "remote ref points at a non-commit object that would be replaced",
@@ -47,10 +54,16 @@ pub fn classify(git: &Path, repo: &Path, updates: &[RefUpdate]) -> crate::Result
                         FindingKind::RefRewrite,
                         "non-fast-forward update: remote history would be rewritten",
                     )),
-                    _ => out.push(f(
-                        FindingKind::IncompleteScan,
-                        "ancestry check failed; cannot prove a fast-forward",
-                    )),
+                    _ => {
+                        out.push(f(
+                            FindingKind::IncompleteScan,
+                            "ancestry check failed; cannot prove a fast-forward",
+                        ));
+                        out.push(f(
+                            FindingKind::RefRewrite,
+                            "update cannot be proven non-destructive (ancestry check failed)",
+                        ));
+                    }
                 }
             }
         }

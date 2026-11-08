@@ -11,17 +11,10 @@ use std::path::Path;
 use std::process::Stdio;
 
 const SRC: &str = "git.secret-scan";
-/// shortcut: blobs larger than this are scanned by their first 4 MiB only;
-/// raise or stream the rest if large generated text files must be covered.
-const MAX_BLOB_PREFIX: u64 = 4 * 1024 * 1024;
+/// Largest single blob read into memory. Bigger blobs are never partially
+/// scanned: they are reported as unexamined (IncompleteScan).
+const MAX_BLOB_BYTES: u64 = 32 * 1024 * 1024;
 const ENTRIES_PER_NODE: u64 = 10;
-
-fn valid_remote_name(n: &str) -> bool {
-    !n.is_empty()
-        && !n.starts_with('-')
-        && n.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
 
 /// Entries of one changed path in outgoing history.
 struct Changes {
@@ -39,7 +32,10 @@ pub fn scan(
     git: &Path,
     repo: &Path,
     updates: &[RefUpdate],
-    remote: Option<&str>,
+    // Ignored on purpose: remote-tracking refs are repository-controlled and
+    // prove nothing about what the remote has (W1-001). Only the old OIDs of
+    // `updates`, which the remote itself reported, bound the walk.
+    _remote: Option<&str>,
     limits: &Limits,
 ) -> crate::Result<Vec<Finding>> {
     let mut tips: Vec<&str> = Vec::new();
@@ -80,18 +76,9 @@ pub fn scan(
     };
 
     let mut rev_args: Vec<String> = tips.iter().map(|s| s.to_string()).collect();
-    let remote_excl = remote
-        .filter(|n| valid_remote_name(n))
-        .filter(|n| {
-            gitcmd::run(git, repo, &["config", "--get", &format!("remote.{n}.url")])
-                .map(|o| o.ok())
-                .unwrap_or(false)
-        })
-        .map(|n| format!("--remotes={n}"));
-    if !excludes.is_empty() || remote_excl.is_some() {
+    if !excludes.is_empty() {
         rev_args.push("--not".into());
         rev_args.extend(excludes);
-        rev_args.extend(remote_excl);
     }
 
     let changes = collect_changes(git, repo, &rev_args, limits)?;
@@ -125,7 +112,7 @@ pub fn scan(
             }
         }
     }
-    let (content, incomplete) = scan_blobs(git, repo, &changes.added, limits)?;
+    let (content, unexamined) = scan_blobs(git, repo, &changes.added, limits)?;
     for (path, hit) in content {
         out.push(
             mk(
@@ -138,14 +125,8 @@ pub fn scan(
             .location(path),
         );
     }
-    if incomplete {
-        out.push(mk(
-            FindingKind::IncompleteScan,
-            format!(
-                "blob content read budget of {} bytes reached; remaining files were not scanned",
-                limits.scan_max_bytes
-            ),
-        ));
+    for why in unexamined {
+        out.push(mk(FindingKind::IncompleteScan, why));
     }
     Ok(out)
 }
@@ -228,7 +209,13 @@ fn collect_changes(
             let s = String::from_utf8_lossy(t);
             let f: Vec<&str> = s[1..].split(' ').collect();
             if f.len() == 5 && gitcmd::valid_oid(f[3]) {
-                pending = Some((f[4].bytes().next().unwrap_or(b'M'), f[3].to_string()));
+                // f[1] is the new mode; 160000 is a submodule commit, not a blob.
+                let status = if f[1] == "160000" {
+                    b'D'
+                } else {
+                    f[4].bytes().next().unwrap_or(b'M')
+                };
+                pending = Some((status, f[3].to_string()));
             } else {
                 return Err(crate::Error::internal("unexpected git log output"));
             }
@@ -248,71 +235,152 @@ fn collect_changes(
 
 type ContentHits = Vec<(String, super::detect::Hit)>;
 
-/// Read blobs in one `cat-file --batch` session, deduplicated and bounded.
+/// Read blobs, deduplicated and bounded. Every byte not examined is returned
+/// as an explanation (never silently clean): missing objects, blobs too large
+/// to read whole, and blobs that would exceed the byte budget. The full object
+/// size is charged against `scan_max_bytes`.
 fn scan_blobs(
     git: &Path,
     repo: &Path,
     blobs: &HashMap<String, Vec<u8>>,
     limits: &Limits,
-) -> crate::Result<(ContentHits, bool)> {
+) -> crate::Result<(ContentHits, Vec<String>)> {
     if blobs.is_empty() {
-        return Ok((vec![], false));
+        return Ok((vec![], vec![]));
     }
     let mut oids: Vec<&String> = blobs.keys().collect();
     oids.sort();
+    let request = |list: &[&String]| -> Vec<u8> {
+        list.iter()
+            .flat_map(|o| format!("{o}\n").into_bytes())
+            .collect()
+    };
+
+    // Pass 1: sizes only, so nothing over budget is ever streamed.
+    let sizes = batch(git, repo, "--batch-check", &request(&oids), |rd| {
+        let mut out = Vec::new();
+        let mut line = String::new();
+        for _ in 0..oids.len() {
+            line.clear();
+            if rd.read_line(&mut line)? == 0 {
+                break;
+            }
+            out.push(line.trim_end().to_string());
+        }
+        Ok(out)
+    })?;
+    let mut notes = Vec::new();
+    let (mut missing, mut too_large, mut over_budget) = (0usize, 0usize, 0usize);
+    let mut spent = 0u64;
+    let mut chosen: Vec<&String> = Vec::new();
+    missing += oids.len().saturating_sub(sizes.len());
+    for (oid, l) in oids.iter().zip(&sizes) {
+        let f: Vec<&str> = l.split(' ').collect();
+        let size = match (f.as_slice(), f.get(2).map(|s| s.parse::<u64>())) {
+            ([o, "blob", _], Some(Ok(n))) if *o == oid.as_str() => n,
+            _ => {
+                missing += 1;
+                continue;
+            }
+        };
+        if size > MAX_BLOB_BYTES {
+            too_large += 1;
+        } else if spent.saturating_add(size) > limits.scan_max_bytes {
+            over_budget += 1;
+        } else {
+            spent += size;
+            chosen.push(oid);
+        }
+    }
+    if missing > 0 {
+        notes.push(format!(
+            "{missing} outgoing blob(s) are missing or unreadable in this repository; they were not scanned"
+        ));
+    }
+    if too_large > 0 {
+        notes.push(format!(
+            "{too_large} outgoing blob(s) exceed the {MAX_BLOB_BYTES}-byte single-file scan limit; they were not scanned"
+        ));
+    }
+    if over_budget > 0 {
+        notes.push(format!(
+            "blob content read budget of {} bytes reached; {over_budget} file(s) were not scanned",
+            limits.scan_max_bytes
+        ));
+    }
+    if chosen.is_empty() {
+        return Ok((vec![], notes));
+    }
+
+    // Pass 2: read the chosen blobs whole. Binary content is scanned lossily
+    // as well, so nothing is skipped by a heuristic.
+    let mut hits = Vec::new();
+    let mut short = false;
+    batch(git, repo, "--batch", &request(&chosen), |rd| {
+        let mut line = String::new();
+        for oid in &chosen {
+            line.clear();
+            if rd.read_line(&mut line)? == 0 {
+                short = true;
+                break;
+            }
+            let f: Vec<&str> = line.trim_end().split(' ').collect();
+            let size = match (f.as_slice(), f.get(2).map(|s| s.parse::<u64>())) {
+                ([o, "blob", _], Some(Ok(n))) if *o == oid.as_str() => n,
+                _ => {
+                    short = true; // object vanished between the two passes
+                    continue;
+                }
+            };
+            let mut buf = Vec::with_capacity(size as usize);
+            rd.by_ref().take(size).read_to_end(&mut buf)?;
+            let mut nl = [0u8; 1];
+            rd.read_exact(&mut nl)?;
+            if buf.len() as u64 != size {
+                short = true;
+                break;
+            }
+            let path = String::from_utf8_lossy(&blobs[*oid]).into_owned();
+            for h in scan_text(&String::from_utf8_lossy(&buf)) {
+                hits.push((path.clone(), h));
+            }
+        }
+        Ok(())
+    })?;
+    if short {
+        notes
+            .push("some outgoing blobs could not be read completely; they were not scanned".into());
+    }
+    Ok((hits, notes))
+}
+
+/// Run `git cat-file <mode>` feeding `request`, handing the reader to `f`.
+fn batch<T>(
+    git: &Path,
+    repo: &Path,
+    mode: &str,
+    request: &[u8],
+    f: impl FnOnce(&mut BufReader<std::process::ChildStdout>) -> std::io::Result<T>,
+) -> crate::Result<T> {
     let mut cmd = gitcmd::command(git, repo);
-    cmd.args(["cat-file", "--batch"])
+    cmd.args(["cat-file", mode])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| crate::Error::internal(format!("cannot run git: {e}")))?;
     let mut stdin = child.stdin.take().expect("piped");
-    let request: Vec<u8> = oids
-        .iter()
-        .flat_map(|o| format!("{o}\n").into_bytes())
-        .collect();
+    let req = request.to_vec();
     let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&request);
+        let _ = stdin.write_all(&req);
     });
     let mut rd = BufReader::new(child.stdout.take().expect("piped"));
-    let mut hits = Vec::new();
-    let mut spent = 0u64;
-    let mut incomplete = false;
-    let mut line = String::new();
-    for oid in &oids {
-        line.clear();
-        if rd.read_line(&mut line)? == 0 {
-            incomplete = true;
-            break;
-        }
-        let f: Vec<&str> = line.trim_end().split(' ').collect();
-        if f.len() != 3 || f[0] != oid.as_str() {
-            continue; // missing object: nothing was sent for it
-        }
-        let size: u64 = f[2].parse().unwrap_or(0);
-        let take = size.min(MAX_BLOB_PREFIX);
-        if spent.saturating_add(take) > limits.scan_max_bytes {
-            incomplete = true;
-            break;
-        }
-        let mut buf = Vec::with_capacity(take as usize);
-        (&mut rd).take(take).read_to_end(&mut buf)?;
-        std::io::copy(&mut (&mut rd).take(size - take + 1), &mut std::io::sink())?;
-        spent += take;
-        if buf[..buf.len().min(8000)].contains(&0) {
-            continue; // binary
-        }
-        let path = String::from_utf8_lossy(&blobs[*oid]).into_owned();
-        for h in scan_text(&String::from_utf8_lossy(&buf)) {
-            hits.push((path.clone(), h));
-        }
-    }
-    if incomplete {
+    let r = f(&mut rd);
+    drop(rd);
+    if r.is_err() {
         let _ = child.kill();
     }
-    drop(rd);
     let _ = writer.join();
     let _ = child.wait();
-    Ok((hits, incomplete))
+    Ok(r?)
 }

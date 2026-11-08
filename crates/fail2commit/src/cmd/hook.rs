@@ -4,6 +4,7 @@
 
 use super::{CmdResult, Ctx, Outcome};
 use fail2commit_core::approval;
+use fail2commit_core::approver::ApproverChoice;
 use fail2commit_core::git::prepush;
 use fail2commit_core::protocol::{ApprovalRequest, Decision};
 use fail2commit_core::toolpath::find_real;
@@ -18,6 +19,11 @@ pub struct Args {
     pub args: Vec<OsString>,
 }
 
+/// When set (to anything non-empty) the hook never opens an approval channel:
+/// every pause fails closed. It can only tighten policy, so it needs no trust;
+/// disposable test environments use it to stay unattended.
+pub const FAIL_CLOSED_ENV: &str = "FAIL2COMMIT_HOOK_FAIL_CLOSED";
+
 pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
     let a: Vec<String> = args
         .args
@@ -26,8 +32,13 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         .collect();
     match a.as_slice() {
         [name, remote, url] if name == "pre-push" => {
+            let fail_closed = std::env::var_os(FAIL_CLOSED_ENV).is_some_and(|v| !v.is_empty());
             pre_push(ctx, remote, url, std::io::stdin().lock(), &|req| {
-                approval::approve(&ctx.approval(), req)
+                let mut a = ctx.approval();
+                if fail_closed {
+                    a.choice = ApproverChoice::None;
+                }
+                approval::approve(&a, req)
             })
         }
         _ => Err(Error::invalid("usage: hook pre-push <remote> <url>")),
@@ -140,9 +151,12 @@ mod tests {
         (r, asked)
     }
 
-    // One test: it changes the process cwd, which other tests must not race.
+    /// Tests change the process cwd; they take turns.
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn rewrite_prompts_once_and_cancel_aborts() {
+        let _g = CWD.lock().unwrap_or_else(|e| e.into_inner());
         let (d, old, new) = rewrite_setup();
         let (r, asked) = run_hook(&d, &old, &new, Decision::ApproveOnce);
         assert!(r.is_ok());
@@ -156,5 +170,53 @@ mod tests {
         let (r, asked) = run_hook(&d, &new, &new, Decision::Cancel);
         assert!(r.is_ok());
         assert_eq!(asked.get(), 0);
+    }
+
+    /// W1-002: direct hook path (no shim intent) asks for the password for
+    /// tag replacement, deletion and unprovable updates, not for a plain
+    /// fast-forward.
+    #[test]
+    fn destructive_updates_require_password_without_shim_intent() {
+        let _g = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(prepush::INTENT_ENV);
+        let (d, old, new) = rewrite_setup();
+        let missing = "1".repeat(old.len());
+        let zero = "0".repeat(old.len());
+        let home = tempfile::tempdir().unwrap();
+        let c = ctx(home.path());
+        fail2commit_core::approval::password::set(&c.paths, "synthetic-pw-hook").unwrap();
+        std::env::set_current_dir(d.path()).unwrap();
+        let wants_password = |line: String| {
+            let seen = std::cell::Cell::new(None);
+            let _ = pre_push(&c, "origin", "file:///x", line.as_bytes(), &|req| {
+                seen.set(Some(req.password_required));
+                Ok(Decision::Cancel)
+            });
+            seen.get()
+        };
+        // existing tag moved to a different object
+        let tag = format!(
+            "refs/tags/v1 {new} refs/tags/v1 {old}
+"
+        );
+        assert_eq!(wants_password(tag), Some(true));
+        // remote branch deleted
+        let del = format!(
+            "(delete) {zero} refs/heads/main {old}
+"
+        );
+        assert_eq!(wants_password(del), Some(true));
+        // remote's old object is unknown locally (shallow/stale)
+        let stale = format!(
+            "refs/heads/main {new} refs/heads/main {missing}
+"
+        );
+        assert_eq!(wants_password(stale), Some(true));
+        // control: a fast-forward with nothing else to report asks nothing
+        let ff = format!(
+            "refs/heads/main {old} refs/heads/main {old}
+"
+        );
+        assert_eq!(wants_password(ff), None);
     }
 }

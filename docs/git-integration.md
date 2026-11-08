@@ -36,11 +36,35 @@ Windows: new processes see the PATH change after the next sign-in or shell resta
 
 ## Secret scan
 
-Scope is `git rev-list <new> --not <remote's reported old oids> [remote-tracking refs]`,
-or everything for a first push. Added, modified and deleted paths are read from
-`git log --raw -z`; blobs via one `git cat-file --batch`, deduplicated. Bounds come from
-`Settings.limits` (`graph_max_nodes`, `scan_max_bytes`); a blob is scanned by its first
-4 MiB. Hitting a bound produces an `IncompleteScan` finding, which pauses.
+Scope is `git log <new> --not <remote's reported old oids>`, or everything for a first push.
+Only the old OIDs from Git's own ref-update tuples that exist locally exclude history (the
+remote reported them, so it has them). Local `refs/remotes/**` and every other
+repository-controlled ref are never used: they prove nothing about the remote. A missing
+(shallow/stale) old object excludes nothing, so more is scanned, and classification adds
+`IncompleteScan` plus a `RefRewrite` (password-requiring) finding.
+
+Added, modified and deleted paths are read from `git log --raw -z` (submodule commits are
+not blobs and are skipped); sizes come from `git cat-file --batch-check`, then the chosen
+blobs are read whole with `git cat-file --batch`. Bounds come from `Settings.limits`
+(`graph_max_nodes`, `scan_max_bytes`) and a 32 MiB single-blob limit. The **full object
+size** is charged against `scan_max_bytes`.
+
+**No byte goes unexamined silently.** Each of these yields an `IncompleteScan` finding
+(local: one-time approval; server secret policy: deny): history walk bound hit, missing or
+unreadable blob, blob over the single-file limit, blob that would exceed the byte budget.
+Binary blobs are scanned (lossily) rather than skipped, `.env` names are matched by path,
+and lines over 8 KiB are scanned in overlapping 8 KiB windows (512-byte overlap) rather than
+skipped.
+
+Force-push password: `ForceIntent`, `RefRewrite`, `TagReplacement` and `RefDeletion`
+findings all require the configured password on the direct hook path, with or without the
+shim's `FAIL2COMMIT_PUSH_INTENT`.
+
+## Unattended runs
+
+`FAIL2COMMIT_HOOK_FAIL_CLOSED=<non-empty>` makes the hook (and the push it belongs to) skip
+every approval channel, so any pause fails closed. It can only tighten policy. The Git
+integration tests set it so they never open CONIN$ or `/dev/tty`.
 
 Detectors: `.env` / `.env.*` (not `.example`, `.sample`, `.template`), private key headers,
 AWS access keys, GitHub / GitLab / Slack tokens, and `password=` / `secret=` style
