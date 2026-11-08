@@ -27,7 +27,7 @@ tempfile = "3.27.0"
 libc = "0.2.191"
 
 [target."cfg(windows)".dependencies]
-# SPEC-007: exact pin; source review recorded in docs/verify before claiming controls.
-sandboxrs-windows = "=0.1.1"
+# SPEC-007 AppContainer backend is implemented on windows-sys directly; the
+# sandboxrs-windows pin was dropped after source review (CR-006).
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Console"] }
 
