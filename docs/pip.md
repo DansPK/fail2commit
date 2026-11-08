@@ -8,6 +8,7 @@ text, pip config, package metadata and index responses are untrusted.
 
 ```sh
 fail2commit pip [--python <interpreter>] install <requirement>... | -r requirements.txt
+fail2commit pip [--python <interpreter>] recover [--discard]
 ```
 
 * The `pip` / `pip3` shims (installed by `fail2commit setup`, PATH ordering
@@ -55,7 +56,20 @@ trusted file; it is never read from a workspace.)
 
 ## Flow
 
-1. Parse and reject (above); bind to the interpreter via `python -I`
+0. **No `site`, ever.** Every interpreter fail2commit starts (probe, dry-run
+   resolution, each apply, `verify_installed`, pass-through commands) runs as
+   `python -I -S -c <prelude>`. Without `site`, no `*.pth` import line,
+   `sitecustomize` or `usercustomize` of the target environment executes
+   inside the guard (review W2-001, CR-001). The prelude does the two things
+   `site` would have done that pip needs, and nothing else: it points
+   `sys.prefix` at the venv found via `pyvenv.cfg` and appends the
+   environment's `purelib`/`platlib` and `site.getsitepackages()` to
+   `sys.path` (system directories as well when `pyvenv.cfg` has
+   `include-system-site-packages = true`). pip then runs through
+   `runpy.run_module("pip", run_name="__main__")`. Consequence: `.pth`-based
+   behavior (namespace shims, editable installs) is invisible to the guard's
+   own pip runs; it is still active when the user runs Python normally.
+1. Parse and reject (above); bind to the interpreter via `python -I -S`
    (`sys.executable`, prefix/venv, platform, pip's vendored
    `packaging.tags.sys_tags()`).
 2. **Wheel-only boundary.** A loopback staging index (random-token URL)
@@ -77,8 +91,19 @@ trusted file; it is never read from a workspace.)
    finding or an incomplete scan asks for approval of a `Digest` over
    interpreter identity (executable, prefix, tags, platform), the index, the
    requested set and the ordered wheel set with SHA-256. A clean complete
-   scan installs without a prompt. `exec::authorize_scripts` is called with
-   `has_scripts: false` (wheels run no install-time code; no sandbox).
+   scan installs without a prompt. **Startup files:** wheel inspection of the
+   reviewed copies flags every `*.pth` with an executable `import` line, and
+   every `sitecustomize`/`usercustomize` (module, bytecode or package), that
+   the wheel would place in `purelib`/`platlib` (top level or `*.data/purelib`,
+   `*.data/platlib`). Each is an `Approve` finding (`HostExecution`, source
+   `pip.startup`) naming the wheel and file, shown in the approval request
+   and its details. It is not a hard deny because common packages (for
+   example setuptools) ship a `.pth`. `exec::authorize_scripts` is called with
+   `has_scripts: false` because `has_scripts` describes code the *guard* would
+   run, and none does: pip only unpacks wheels and, per step 0, no interpreter
+   it starts processes `site`. The startup files run later, when the user
+   starts Python outside the guard, which is why they need the approval above
+   rather than a sandbox.
 5. **Apply offline.** Reviewed wheels are copied to a private directory and
    re-hashed; immediately before apply the directory must equal the plan
    byte for byte (changed plan ⇒ `IntegrityFailure`). Each wheel is installed
@@ -89,21 +114,39 @@ trusted file; it is never read from a workspace.)
 
 ## Cancel, interrupt, recovery
 
-Cancel before apply changes nothing (the dry run touches no environment).
-A cancel token kills the resolver or stops between wheels. Apply writes a
-journal (`state/pip/journal-<id>.json`, progress per wheel) and keeps the
-reviewed wheels until verification passes. The next guarded run for that
-interpreter first rolls the journal forward from the reviewed set (still
-hash-checked; tampering ⇒ `IntegrityFailure`, nothing installed), then
-continues. Ctrl-C in the CLI terminates the process like any other command;
-the journal makes that recoverable.
+* **Cancel before apply changes nothing** (the dry run touches no
+  environment); the reviewed copies are removed and no journal is written.
+* **Cancel during apply** stops at the next wheel boundary: a pip that is
+  already installing a wheel finishes it (it is never killed half way). The
+  journal (`state/pip/journal-<id>.json`: progress per wheel, `cancelled`)
+  and the reviewed wheels are kept. A cancel seen before the first wheel
+  removes the fresh journal again.
+* **Never rolled forward implicitly (W2-002, CR-002).** While any journal
+  exists for the target interpreter, a guarded `pip install` fails with
+  `InvalidInput` and a message pointing to recovery. A crash, a failed wheel
+  or a cancel all leave such a journal.
+* `fail2commit pip [--python <py>] recover` shows the remaining plan (what is
+  installed already, what remains, startup files), re-checks the reviewed
+  set byte for byte (tampering ⇒ `IntegrityFailure`, journal kept), re-runs
+  the advisory scan on the remaining wheels (`Deny` stops), asks a **fresh
+  approval bound to a new digest over the interpreter and the remaining
+  wheels**, then installs them and verifies. Cancel or decline changes
+  nothing and keeps the journal untouched.
+* `recover --discard` removes the journal and the reviewed copies and reports
+  which wheels the journal had recorded as installed (they stay installed;
+  nothing is rolled back) and which were never installed. No approval is
+  needed because nothing is installed or run.
 
 ## Limits / not covered
 
 * Windows/Linux AppContainer/Bubblewrap are not used: wheels execute no code
-  at install time. `.pth` files and entry points in installed wheels run
-  later, as with any Python package.
+  at install time and the guard's interpreters skip `site`. `.pth` files,
+  `sitecustomize` and entry points in installed wheels run later, as with any
+  Python package; the startup files are named in the approval (above).
+* The `pip`/`pip3` shims in the fail2commit bin dir are created only when
+  absent or already ours; an existing foreign file there makes `setup` fail
+  and is never replaced or removed (W2-006).
 * Index trust beyond HTTPS + SHA-256 from the same index (as PEP 503/691
   provide); no signature checking.
-* Recovery is roll-forward only; already replaced older versions are not
-  restored.
+* Recovery is roll-forward (or discard) only; already replaced older versions
+  are not restored.

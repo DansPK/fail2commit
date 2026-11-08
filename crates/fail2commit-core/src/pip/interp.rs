@@ -28,7 +28,61 @@ pub struct Interpreter {
     pub tags: Vec<String>,
 }
 
-const PROBE: &str = "import json, sys, platform\n\
+/// Every interpreter fail2commit starts runs as `python -I -S -c <BOOT...>`.
+/// `-S` skips `site`, so no `*.pth` import line, `sitecustomize` or
+/// `usercustomize` from the target environment (W2-001, CR-001) ever runs
+/// inside the guard. The prelude then adds the environment's `purelib`,
+/// `platlib` and `site.getsitepackages()` to `sys.path` by hand. Importing
+/// `site` under `-S` does not process `.pth` files and `getsitepackages`
+/// only computes directory names.
+///
+/// Without `site`, CPython does not notice a venv (`sys.prefix` stays the base
+/// install), so the prelude does what `site.venv()` does first: find
+/// `pyvenv.cfg` next to or above the executable and point `sys.prefix` at it,
+/// before `sysconfig` and `site` are imported. `include-system-site-packages`
+/// is honored by adding the base install's directories.
+pub(crate) const BOOT: &str = concat!(
+    "import os, sys\n",
+    "_x = os.path.dirname(sys.executable)\n",
+    "_base, _syssite = sys.prefix, False\n",
+    "for _c in (os.path.join(_x, 'pyvenv.cfg'), os.path.join(os.path.dirname(_x), 'pyvenv.cfg')):\n",
+    "    if os.path.isfile(_c):\n",
+    "        sys.prefix = sys.exec_prefix = os.path.dirname(_c)\n",
+    "        with open(_c, encoding='utf-8') as _f:\n",
+    "            for _l in _f:\n",
+    "                _k, _, _v = _l.partition('=')\n",
+    "                if _k.strip().lower() == 'include-system-site-packages':\n",
+    "                    _syssite = _v.strip().lower() == 'true'\n",
+    "        break\n",
+    "import sysconfig, site\n",
+    "_p = sysconfig.get_paths()\n",
+    "_dirs = [_p.get('platlib'), _p.get('purelib')] + list(site.getsitepackages())\n",
+    "if _syssite:\n",
+    "    _dirs += list(site.getsitepackages([_base]))\n",
+    "for _d in _dirs:\n",
+    "    if _d and _d not in sys.path and os.path.isdir(_d):\n",
+    "        sys.path.append(_d)\n",
+);
+
+/// Runs pip's `__main__`; pip's arguments follow `-c` as `sys.argv`.
+const PIP_MAIN: &str = "import runpy\n\
+runpy.run_module('pip', run_name='__main__', alter_sys=True)\n";
+
+/// A command running `body` after the site-free prelude.
+pub(crate) fn python_c(python: impl AsRef<std::ffi::OsStr>, body: &str) -> Command {
+    let mut cmd = Command::new(python);
+    cmd.args(["-I", "-S", "-c"]).arg(format!("{BOOT}{body}"));
+    cmd
+}
+
+/// `python -I -S` running pip with the given leading flags.
+pub(crate) fn pip_command(python: impl AsRef<std::ffi::OsStr>, flags: &[&str]) -> Command {
+    let mut cmd = python_c(python, PIP_MAIN);
+    cmd.args(flags);
+    cmd
+}
+
+const PROBE: &str = "import json, platform\n\
 from pip import __version__ as pv\n\
 from pip._vendor.packaging import tags\n\
 print(json.dumps({'executable': sys.executable, 'prefix': sys.prefix, 'base_prefix': sys.base_prefix, \
@@ -44,8 +98,7 @@ print(json.dumps([[d.metadata['Name'] or '', d.version or ''] for d in metadata.
 impl Interpreter {
     /// Ask `python` who it is. `-I` keeps the workspace and `PYTHON*` out.
     pub fn probe(python: &Path, limits: &RunLimits, cancel: &Cancel) -> crate::Result<Interpreter> {
-        let mut cmd = Command::new(python);
-        cmd.args(["-I", "-c", PROBE]);
+        let mut cmd = python_c(python, PROBE);
         let out = run(&mut cmd, limits, cancel)?;
         if out.status != Some(0) {
             return Err(Error::invalid(format!(
@@ -83,8 +136,7 @@ impl Interpreter {
         limits: &RunLimits,
         cancel: &Cancel,
     ) -> crate::Result<Vec<(String, String)>> {
-        let mut cmd = Command::new(&self.executable);
-        cmd.args(["-I", "-c", LIST_INSTALLED]);
+        let mut cmd = python_c(&self.executable, LIST_INSTALLED);
         let out = run(&mut cmd, limits, cancel)?;
         if out.status != Some(0) {
             return Err(Error::internal(format!(
@@ -97,18 +149,13 @@ impl Interpreter {
         Ok(raw.into_iter().map(|(n, v)| (normalize(&n), v)).collect())
     }
 
-    /// A pip command bound to this interpreter: isolated, no config, no env.
+    /// A pip command bound to this interpreter: isolated, no config, no env,
+    /// no `site`.
     pub fn pip(&self) -> Command {
-        let mut cmd = Command::new(&self.executable);
-        cmd.args([
-            "-I",
-            "-m",
-            "pip",
-            "--isolated",
-            "--disable-pip-version-check",
-            "--no-input",
-        ]);
-        cmd
+        pip_command(
+            &self.executable,
+            &["--isolated", "--disable-pip-version-check", "--no-input"],
+        )
     }
 }
 

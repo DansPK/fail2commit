@@ -173,3 +173,26 @@ fn end_to_end_install_pauses_without_an_approver_and_changes_nothing() {
     );
     assert_eq!(code(&j), "ok");
 }
+
+#[test]
+fn recover_without_a_journal_and_bad_usage_are_invalid_input() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let py = make_venv(&dir.path().join("v"));
+    let py = py.to_str().unwrap();
+    for extra in [&["recover"][..], &["recover", "--discard"]] {
+        let mut a = vec!["--json", "pip", "--python", py];
+        a.extend_from_slice(extra);
+        let (o, j) = run(Path::new(exe()), home.path(), &[], &a);
+        assert_eq!(o.status.code(), Some(2), "{j}");
+        assert_eq!(code(&j), "invalid_input");
+    }
+    let (o, j) = run(
+        Path::new(exe()),
+        home.path(),
+        &[],
+        &["--json", "pip", "--python", py, "recover", "--force"],
+    );
+    assert_eq!(o.status.code(), Some(2), "{j}");
+    assert_eq!(code(&j), "invalid_input");
+}

@@ -54,6 +54,19 @@ struct InterpId<'a> {
     tags: &'a [String],
 }
 
+fn interp_id(interp: &Interpreter) -> InterpId<'_> {
+    InterpId {
+        executable: &interp.executable,
+        prefix: &interp.prefix,
+        in_venv: interp.in_venv,
+        implementation: &interp.implementation,
+        python_version: &interp.python_version,
+        platform: &interp.platform,
+        machine: &interp.machine,
+        tags: &interp.tags,
+    }
+}
+
 /// Digest over interpreter identity, tags, index and the exact ordered
 /// wheel set with hashes.
 pub fn plan_digest(
@@ -65,19 +78,28 @@ pub fn plan_digest(
     Digest::of(
         "pip.install",
         &DigestInput {
-            interpreter: InterpId {
-                executable: &interp.executable,
-                prefix: &interp.prefix,
-                in_venv: interp.in_venv,
-                implementation: &interp.implementation,
-                python_version: &interp.python_version,
-                platform: &interp.platform,
-                machine: &interp.machine,
-                tags: &interp.tags,
-            },
+            interpreter: interp_id(interp),
             index,
             requested,
             wheels,
+        },
+    )
+}
+
+#[derive(Serialize)]
+struct RecoverInput<'a> {
+    interpreter: InterpId<'a>,
+    remaining: &'a [PlanWheel],
+}
+
+/// Digest of a recovery approval: the interpreter and the wheels that are
+/// still to be installed. It never equals an install digest (W2-002).
+pub fn recover_digest(interp: &Interpreter, remaining: &[PlanWheel]) -> crate::Result<Digest> {
+    Digest::of(
+        "pip.recover",
+        &RecoverInput {
+            interpreter: interp_id(interp),
+            remaining,
         },
     )
 }

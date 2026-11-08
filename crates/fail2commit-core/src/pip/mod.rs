@@ -8,6 +8,13 @@
 //!    offered, every wheel is hash-checked and inspected before pip sees it);
 //! 4. check advisories, ask for approval bound to a digest of the exact plan;
 //! 5. apply offline from the reviewed wheels, journaled, then verify.
+//!
+//! Every interpreter is started `-I -S` (see `interp::BOOT`): wheel-supplied
+//! `*.pth`, `sitecustomize` and `usercustomize` never run inside the guard.
+//! Wheels that install such files need an explicit approval naming them,
+//! because they run whenever the user next starts Python (FR-005, CR-001).
+//! An unfinished journal blocks guarded installs for its interpreter until
+//! [`recover`] completes it after a fresh approval or discards it (CR-002).
 
 mod apply;
 mod index;
@@ -78,8 +85,21 @@ pub struct InstallReport {
     /// Wheels installed, in apply order. Empty when everything was present.
     pub packages: Vec<PlanWheel>,
     pub findings: Vec<Finding>,
-    /// Set when an interrupted earlier install was completed first.
-    pub recovered: bool,
+}
+
+/// Result of `fail2commit pip recover`.
+#[derive(Debug, Clone)]
+pub struct RecoverReport {
+    pub interpreter: String,
+    /// Digest the fresh approval was bound to; empty when none was needed.
+    pub digest: String,
+    pub approved: bool,
+    pub discarded: bool,
+    /// Wheels the journal recorded as installed before recovery.
+    pub already_installed: Vec<PlanWheel>,
+    /// Wheels that were still to install: now installed, or (discard) dropped.
+    pub pending: Vec<PlanWheel>,
+    pub findings: Vec<Finding>,
 }
 
 /// Removes the per-run work directory on every exit path.
@@ -145,7 +165,10 @@ pub fn install(
         cancel: &seams.cancel,
         hooks: &seams.hooks,
     };
-    let recovered = apply::recover(&cx)?.is_some();
+    // An unfinished plan is never rolled forward from here.
+    if let Some(j) = apply::read_journal(ctx.paths, &interp.executable)? {
+        return Err(apply::pending_error(&j));
+    }
 
     // 3. wheel-only staging index + pip's dry-run report
     let run_dir = ctx
@@ -214,7 +237,6 @@ pub fn install(
             approved: false,
             packages: vec![],
             findings: vec![],
-            recovered,
         });
     }
 
@@ -238,8 +260,33 @@ pub fn install(
         approved,
         packages: wheels,
         findings,
-        recovered,
     })
+}
+
+/// One `pip.startup` approval finding per interpreter-startup file the
+/// wheels would install, read from the reviewed copies.
+fn startup_findings(dir: &Path, wheels: &[PlanWheel]) -> crate::Result<Vec<Finding>> {
+    let mut out = Vec::new();
+    for w in wheels {
+        let files = wheel::startup_files(&dir.join(&w.filename))
+            .map_err(|e| Error::integrity(format!("{}: {e:?}", w.filename)))?;
+        for f in files {
+            out.push(
+                Finding::new(
+                    FindingKind::HostExecution,
+                    FindingAction::Approve,
+                    "pip.startup",
+                    format!(
+                        "{} installs {} ({}): package code that runs on the host, outside fail2commit, whenever Python starts in this environment",
+                        w.filename, f.entry, f.why
+                    ),
+                )
+                .target(w.package().display())
+                .location(&f.entry),
+            );
+        }
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,11 +308,12 @@ fn review_and_apply(
                 .with_findings(adv.findings),
         );
     }
-    let needs_approval = !adv.complete
-        || adv
-            .findings
-            .iter()
-            .any(|f| f.action == FindingAction::Approve);
+    // Startup files in the reviewed copies need approval, not denial (CR-001).
+    let startup = startup_findings(reviewed, wheels)?;
+    let mut findings = adv.findings.clone();
+    findings.extend(startup.iter().cloned());
+    let needs_approval =
+        !adv.complete || findings.iter().any(|f| f.action == FindingAction::Approve);
     let mut approved = false;
     if needs_approval {
         let details: Vec<String> = std::iter::once(format!(
@@ -277,6 +325,11 @@ fn review_and_apply(
                 .iter()
                 .map(|w| format!("{}=={} sha256:{}", w.name, w.version, &w.sha256[..16])),
         )
+        .chain(
+            startup
+                .iter()
+                .map(|f| format!("startup code: {}", f.evidence)),
+        )
         .collect();
         let req = crate::approver::new_request(
             ApprovalKind::Operation,
@@ -287,7 +340,7 @@ fn review_and_apply(
                 interp.prefix
             ),
             details,
-            adv.findings.clone(),
+            findings.clone(),
             ctx.settings.approval.request_ttl_secs,
             false,
             vec![Decision::ApproveOnce],
@@ -296,13 +349,18 @@ fn review_and_apply(
             Decision::ApproveOnce => approved = true,
             _ => {
                 return Err(
-                    Error::rejected("canceled; nothing was installed").with_findings(adv.findings)
+                    Error::rejected("canceled; nothing was installed").with_findings(findings)
                 )
             }
         }
     }
     // The plan must still be exactly what was reviewed.
     apply::verify_reviewed(reviewed, wheels)?;
+    // `has_scripts` is about code the guard itself would run. Installing a
+    // wheel runs none: pip only unpacks it, and every interpreter we start
+    // skips `site`, so `*.pth`/`sitecustomize` files the wheel ships do not run
+    // here. Those files are reported above as `pip.startup` approvals because
+    // they run later, when the user starts Python outside this command.
     crate::exec::authorize_scripts(
         ctx,
         &*crate::sandbox::platform_backend(),
@@ -311,14 +369,135 @@ fn review_and_apply(
             required: false,
             flagged: false,
         },
-        "pip wheel install (no install-time code)",
+        "pip wheel install (no guard-run package code; interpreters start without site)",
         digest,
     )?;
     if seams.cancel.load(Ordering::SeqCst) {
         return Err(Error::rejected("canceled; nothing was installed"));
     }
     apply::apply(cx, digest.as_hex(), reviewed, wheels)?;
-    Ok((adv.findings, approved))
+    Ok((findings, approved))
+}
+
+/// `fail2commit pip recover [--discard]`: finish or drop an unfinished apply.
+///
+/// Completing shows the remaining plan and asks a fresh approval bound to a
+/// digest over the interpreter and the remaining wheels; canceling changes
+/// nothing and keeps the journal. `discard` removes the journal and the
+/// reviewed copies; wheels already installed stay installed.
+pub fn recover(
+    ctx: &ApprovalCtx<'_>,
+    python: &Path,
+    discard: bool,
+    seams: &Seams<'_>,
+) -> crate::Result<RecoverReport> {
+    let limits = interp::RunLimits::from_settings(&ctx.settings.limits);
+    let interp = Interpreter::probe(python, &limits, &seams.cancel)?;
+    let cx = apply::ApplyCtx {
+        paths: ctx.paths,
+        interp: &interp,
+        limits: &limits,
+        cancel: &seams.cancel,
+        hooks: &seams.hooks,
+    };
+    let jp = apply::journal_path(ctx.paths, &interp.executable);
+    crate::fsutil::with_lock(&jp, || recover_locked(ctx, &cx, &interp, discard, seams))
+}
+
+fn recover_locked(
+    ctx: &ApprovalCtx<'_>,
+    cx: &apply::ApplyCtx<'_>,
+    interp: &Interpreter,
+    discard: bool,
+    seams: &Seams<'_>,
+) -> crate::Result<RecoverReport> {
+    let Some(j) = apply::read_journal(ctx.paths, &interp.executable)? else {
+        return Err(Error::invalid(format!(
+            "no unfinished pip install is recorded for {}",
+            interp.executable
+        )));
+    };
+    let (done, left) = j.wheels.split_at(j.done);
+    let (done, left) = (done.to_vec(), left.to_vec());
+    let mut report = RecoverReport {
+        interpreter: interp.executable.clone(),
+        digest: String::new(),
+        approved: false,
+        discarded: discard,
+        already_installed: done.clone(),
+        pending: left.clone(),
+        findings: vec![],
+    };
+    if discard {
+        apply::discard(ctx.paths, &j);
+        return Ok(report);
+    }
+    apply::verify_pending(cx, &j)?;
+    if left.is_empty() {
+        // Everything was installed; only the final check was missing.
+        apply::resume(cx, j)?;
+        return Ok(report);
+    }
+    let pkgs: Vec<PackageId> = left.iter().map(PlanWheel::package).collect();
+    let adv = (seams.advisories)(&pkgs);
+    if adv.findings.iter().any(|f| f.action == FindingAction::Deny) {
+        return Err(
+            Error::rejected("blocked by a deny finding; nothing was installed")
+                .with_findings(adv.findings),
+        );
+    }
+    let startup = startup_findings(&j.reviewed, &left)?;
+    let mut findings = adv.findings.clone();
+    findings.extend(startup.iter().cloned());
+    let digest = plan::recover_digest(interp, &left)?;
+    let details: Vec<String> = std::iter::once(format!(
+        "interpreter {} ({}, {}); finishing an unfinished plan: {} of {} wheel(s) already installed",
+        interp.executable,
+        interp.python_version,
+        interp.platform,
+        done.len(),
+        j.wheels.len()
+    ))
+    .chain(left.iter().map(|w| {
+        format!(
+            "to install: {}=={} sha256:{}",
+            w.name,
+            w.version,
+            &w.sha256[..16]
+        )
+    }))
+    .chain(
+        startup
+            .iter()
+            .map(|f| format!("startup code: {}", f.evidence)),
+    )
+    .collect();
+    let req = crate::approver::new_request(
+        ApprovalKind::Operation,
+        &digest,
+        format!(
+            "finish unfinished pip install: {} remaining wheel(s) into {}",
+            left.len(),
+            interp.prefix
+        ),
+        details,
+        findings.clone(),
+        ctx.settings.approval.request_ttl_secs,
+        false,
+        vec![Decision::ApproveOnce],
+    )?;
+    match (seams.approve)(&req)? {
+        Decision::ApproveOnce => {}
+        _ => return Err(Error::rejected("canceled; nothing was changed").with_findings(findings)),
+    }
+    if seams.cancel.load(Ordering::SeqCst) {
+        return Err(Error::rejected("canceled; nothing was changed"));
+    }
+    report.digest = digest.to_string();
+    report.approved = true;
+    report.findings = findings;
+    apply::resume(cx, j)?;
+    Ok(report)
 }
 
 fn check_pins(req: &request::InstallRequest, wheels: &[PlanWheel]) -> crate::Result<()> {
@@ -426,14 +605,7 @@ pub fn passthrough(
             )));
         }
     }
-    let mut cmd = std::process::Command::new(python);
-    cmd.args([
-        "-I",
-        "-m",
-        "pip",
-        "--isolated",
-        "--disable-pip-version-check",
-    ]);
+    let mut cmd = interp::pip_command(python, &["--isolated", "--disable-pip-version-check"]);
     cmd.args(args);
     interp::scrub_env(&mut cmd);
     let start_err =

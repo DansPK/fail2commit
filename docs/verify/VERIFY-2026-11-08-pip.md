@@ -70,3 +70,25 @@ python .claude/hooks/trace_check.py
 - [x] **Not verified (pending evidence only):** every TC-005 behavior passes on Windows and Linux with injected
   approver/advisory seams; the Pending rows above (T-006/T-002 integration, live registry, Linux clippy/fmt) block
   marking FR-005 Verified. The coordinator owns the status change.
+
+## 6. 2026-11-09 fix: wave-2 review W2-001, W2-002, W2-006 (FR-005, FR-008)
+
+Implements CR-001 and CR-002 from `docs/change-requests.md`. Branch `DansPK/f2c-fix-wave2-pip` from `cdb67bd`.
+
+| Finding | Change | Evidence (tests) |
+|---|---|---|
+| W2-001 | All interpreters run `-I -S` with a `sys.path`/`sys.prefix` prelude (`pip::interp::BOOT`); wheel inspection flags startup files as `HostExecution` approvals (`pip.startup`); `has_scripts` stays `false` with the reasoning documented | `review_wave2_pth::guarded_install_never_runs_wheel_startup_code_and_asks_approval_naming_it`, `declining_the_startup_approval_installs_nothing`, `wheel::tests::startup_files_are_found_where_site_would_run_them` |
+| W2-002 | Boundary-only cancel, `cancelled` journal, installs blocked by any journal, `pip recover [--discard]` with a fresh digest | `pip_recover::*` (7 tests), `pip_cli::recover_without_a_journal_and_bad_usage_are_invalid_input` |
+| W2-006 | pip shim refuses to replace a foreign file and uninstall leaves it | `shim::tests::foreign_file_is_neither_replaced_nor_removed` |
+
+The old tests `interrupted_apply_is_recovered_by_the_next_run`, `cancel_during_apply_stops_between_wheels_and_is_recoverable` and `tampered_reviewed_set_blocks_recovery` described implicit roll-forward; they are replaced by `pip_recover.rs`. Test helpers query installed packages with `-I -S` as well (a venv is not detected without `site`, so the helper sets `sys.prefix`).
+
+Commands and results (tested tree = this commit's parent plus the fix commit; see the commit SHA reported by the worker):
+
+| Command | Exit | Result |
+|---|---|---|
+| `cargo fmt --all -- --check` | 0 | clean |
+| `cargo clippy -j 2 --workspace --all-targets -- -D warnings` | 0 | clean |
+| `cargo test -j 2 --workspace --no-fail-fast` (Windows, empty stdin) | 101 | all pip targets pass: `pip_cli` 6, `pip_install` 15, `pip_recover` 7, `pip_reject` 4, `review_wave2_pth` 3, core lib incl. `pip::` 17. Failures are only the other areas' intentional wave-2 reproductions and one npm test: `review_wave2_scan` (2), the git review reproductions (3) and `npm_flow::the_real_stub_scanner_pauses_in_production_wiring` (1); none touch pip files |
+| Linux: `docker run --rm -v "${PWD}:/src" -v f2c-fixpip-target:/target -e CARGO_TARGET_DIR=/target -w /src rust:1 bash -c "apt-get update -qq && apt-get install -y -qq python3-venv python3-pip && cargo test -j 2 -p fail2commit --test review_wave2_pth --test pip_install --test pip_recover --test pip_cli --test pip_reject --no-fail-fast"` | 0 | 3 + 15 + 7 + 6 + 4 tests pass |
+

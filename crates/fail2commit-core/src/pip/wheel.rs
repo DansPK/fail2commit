@@ -110,6 +110,71 @@ pub fn inspect(
     Ok(info)
 }
 
+/// A file the wheel installs into `purelib`/`platlib` that CPython's `site`
+/// module executes at every interpreter start of that environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupFile {
+    /// Entry name inside the wheel.
+    pub entry: String,
+    pub why: &'static str,
+}
+
+/// Where in `purelib`/`platlib` this entry would land, if it lands there.
+fn site_relative(name: &str) -> Option<&str> {
+    let Some((first, rest)) = name.split_once('/') else {
+        return Some(name);
+    };
+    if first.ends_with(".data") {
+        let (scheme, rest) = rest.split_once('/')?;
+        return matches!(scheme, "purelib" | "platlib").then_some(rest);
+    }
+    Some(name)
+}
+
+/// Files that run at interpreter start-up once installed (W2-001, CR-001):
+/// a top-level `*.pth` with an `import` line, `sitecustomize` and
+/// `usercustomize` (module, bytecode or package). Nothing is extracted.
+pub fn startup_files(path: &Path) -> Result<Vec<StartupFile>, WheelError> {
+    let bad = |m: String| WheelError::Invalid(m);
+    let file = std::fs::File::open(path).map_err(|e| bad(format!("open: {e}")))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| bad(format!("not a zip archive: {e}")))?;
+    let mut out = Vec::new();
+    for i in 0..zip.len() {
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| bad(format!("entry {i}: {e}")))?;
+        let name = String::from_utf8_lossy(entry.name_raw()).replace('\\', "/");
+        let Some(rel) = site_relative(&name) else {
+            continue;
+        };
+        let lower = rel.to_ascii_lowercase();
+        if !lower.contains('/') && lower.ends_with(".pth") {
+            let mut head = Vec::new();
+            let _ = (&mut entry).take(MAX_METADATA).read_to_end(&mut head);
+            // site.py: a line starting with `import` + space/tab is exec()'d.
+            let runs = head
+                .split(|b| *b == b'\n')
+                .any(|l| l.starts_with(b"import ") || l.starts_with(b"import\t"));
+            if runs {
+                out.push(StartupFile {
+                    entry: name,
+                    why: ".pth import line run by Python at every start",
+                });
+            }
+            continue;
+        }
+        let stem = lower.split('/').next().unwrap_or("");
+        let stem = stem.split('.').next().unwrap_or("");
+        if stem == "sitecustomize" || stem == "usercustomize" {
+            out.push(StartupFile {
+                entry: name,
+                why: "imported by Python at every start",
+            });
+        }
+    }
+    Ok(out)
+}
+
 fn check_entry_name(name: &str) -> Result<(), String> {
     let p = name.replace('\\', "/");
     if p.starts_with('/')
@@ -239,6 +304,34 @@ mod tests {
             inspect(build(&e).path(), "foo_bar-1.0-py3-none-any.whl", 1 << 20),
             Err(WheelError::DirectReference(_))
         ));
+    }
+
+    #[test]
+    fn startup_files_are_found_where_site_would_run_them() {
+        let mut e = ok_entries();
+        e.push(("x.pth", "import os\n"));
+        e.push(("plain.pth", "/some/dir\n# import not a command\n"));
+        e.push(("sitecustomize.py", "x=1\n"));
+        e.push(("foo_bar-1.0.data/purelib/y.pth", "import sys\n"));
+        e.push(("foo_bar-1.0.data/scripts/z.pth", "import sys\n"));
+        e.push(("pkg/inner.pth", "import sys\n"));
+        let f = build(&e);
+        let names: Vec<String> = startup_files(f.path())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.entry)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "x.pth",
+                "sitecustomize.py",
+                "foo_bar-1.0.data/purelib/y.pth"
+            ]
+        );
+        assert!(startup_files(build(&ok_entries()).path())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
