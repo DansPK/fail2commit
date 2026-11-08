@@ -173,8 +173,14 @@ mod tests {
             shim_argv(s(&["/x/bin/git", "push", "-f"])),
             s(&["fail2commit", "git", "push", "-f"])
         );
+        // Backslash is a path separator only on Windows.
+        #[cfg(windows)]
         assert_eq!(
             shim_argv(s(&["C:\\b\\NPM.exe", "ci"])),
+            s(&["fail2commit", "npm", "ci"])
+        );
+        assert_eq!(
+            shim_argv(s(&["/b/NPM", "ci"])),
             s(&["fail2commit", "npm", "ci"])
         );
         assert_eq!(
