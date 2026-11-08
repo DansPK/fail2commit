@@ -113,7 +113,7 @@ fn malware_is_classified_separately() {
         .iter()
         .find(|f| f.kind == FindingKind::Malware)
         .expect("malware finding");
-    assert_eq!(malware.action, FindingAction::Approve);
+    assert_eq!(malware.action, FindingAction::Deny, "CR-003");
     assert_eq!(malware.advisory_id.as_deref(), Some("MAL-2024-9999"));
     assert_eq!(malware.target.as_deref(), Some("npm:demo-malware@1.0.0"));
     assert!(report.complete);
@@ -349,4 +349,35 @@ fn live_osv_smoke() {
     };
     let report = scan::check_advisories(&paths, &settings, &[pkg("left-pad")]);
     assert!(report.complete, "{:?}", report.findings);
+}
+
+#[test]
+fn truncated_advisory_list_is_reported_and_keeps_malware() {
+    let mut ids: Vec<String> = (0..130).map(|i| format!("CVE-2024-{i:04}")).collect();
+    ids.push("MAL-2024-0001".to_string());
+    let vulns: Vec<serde_json::Value> =
+        ids.iter().map(|i| serde_json::json!({ "id": i })).collect();
+    let body = serde_json::json!({ "results": [{ "vulns": vulns }] }).to_string();
+    let server = TestServer::start(move |request| match request.path.as_str() {
+        "/v1/querybatch" => Response::json(body.clone()),
+        _ => Response::with_status(404, "{}"),
+    });
+    let (_dir, paths) = home();
+    let settings = advisory_settings(server.url());
+    let report = scan::check_advisories(&paths, &settings, &[pkg("demo")]);
+    assert!(!report.complete);
+    // 131 ids, 128 kept: 3 dropped. The MAL- id sorts first and is never dropped.
+    let note = report
+        .findings
+        .iter()
+        .find(|f| f.kind == FindingKind::IncompleteScan && f.evidence.starts_with("3 advisory id"))
+        .expect("truncation finding");
+    assert_eq!(note.target.as_deref(), Some("npm:demo@1.0.0"));
+    let malware: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == FindingKind::Malware)
+        .collect();
+    assert_eq!(malware.len(), 1);
+    assert_eq!(malware[0].action, FindingAction::Deny);
 }

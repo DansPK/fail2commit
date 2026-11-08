@@ -121,3 +121,10 @@ exit 0
 - [x] **No pending TC-006 items.** The remaining caveat is not a test gap but a design
       property: the script rules are evidence, not an execution boundary, and the
       Git shim (FR-001) plus the sandbox (FR-007) stay the enforcement points.
+## Addendum 2026-11-09: wave-2 review fixes (W2-003, W2-007, W2-008)
+
+CR-003/CR-004 implemented in `scan`: uninspected referenced content (binary, past the
+1 MiB prefix) is an `incomplete_scan` `deny` naming the file; advisory lists past 128
+ids set `complete = false` with a finding stating how many were dropped (`MAL-` ids are
+kept first); known malware is `deny`. Commands and results are in the commit that adds
+this section; see the npm report addendum for the shared full-workspace run.

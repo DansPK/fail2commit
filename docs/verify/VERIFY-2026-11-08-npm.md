@@ -73,3 +73,12 @@ $ python .claude/hooks/trace_check.py
 
 - [ ] **Verified:** all linked TCs pass; requirement status set to `Verified`
 - [x] **Not verified:** TC-004 passes on Windows and Linux against doubles for T-002/T-006/T-007/T-008, but the real native build and the production approval/scan/sandbox path are Pending the prerequisites named above. Status should stay below `Verified` until they are re-run after integration.
+
+## Addendum 2026-11-09: wave-2 review fixes (W2-004, W2-005)
+
+`npm::archive` now makes two passes: pass 1 validates entries and rejects names that
+collide under ASCII case or Windows trailing-dot/space folding (`integrity_mismatch`
+`deny`); pass 2 reads every referenced path token regardless of extension. A referenced
+file dropped by the size, total or count cap becomes an `incomplete_scan` `deny`.
+Covered by unit tests in `npm/archive.rs` (`extensionless_referenced_script_is_read`,
+`referenced_files_dropped_by_caps_are_reported`, `folding_collisions_are_rejected`).

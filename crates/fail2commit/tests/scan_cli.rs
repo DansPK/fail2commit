@@ -91,10 +91,15 @@ fn malware_is_reported_separately_as_json() {
     let home = tempdir().expect("tempdir");
     write_settings(home.path(), server.url());
     let (code, stdout, stderr) = run(home.path(), &["--json", "scan", "npm:demo-malware@1.0.0"]);
-    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        code, 10,
+        "known malware is a hard denial (CR-003); stderr: {stderr}"
+    );
     let json = response(&stdout);
     let findings = json["findings"].as_array().expect("findings array");
-    assert!(findings.iter().any(|f| f["kind"] == "malware"));
+    assert!(findings
+        .iter()
+        .any(|f| f["kind"] == "malware" && f["action"] == "deny"));
     assert!(!findings.iter().any(|f| f["kind"] == "advisory"));
 }
 

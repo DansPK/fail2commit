@@ -41,8 +41,8 @@ Exit status follows the frozen `ResultCode` table:
 | Situation | Code | Exit |
 |---|---|---|
 | Complete lookup, no findings | `ok` | 0 |
-| Complete lookup with advisory/malware findings | `ok` (findings need one-time approval) | 0 |
-| Any `Deny` finding (flagged script) | `rejected` | 10 |
+| Complete lookup with advisory findings | `ok` (findings need one-time approval) | 0 |
+| Any `Deny` finding (known malware, flagged or uninspected script) | `rejected` | 10 |
 | Lookup or detail fetch did not complete, or data is stale | `incomplete_scan` | 12 |
 | Bad package spec, unusable `--dir`, no target | `invalid_input` | 2 |
 
@@ -55,14 +55,14 @@ completeness flag is surfaced through the `code` (`incomplete_scan`) and the
 | Kind | Action | Target | Meaning |
 |---|---|---|---|
 | `advisory` | `approve` | `npm:name@ver` | CVE/GHSA-style advisory, `advisory_id` set. |
-| `malware` | `approve` | `npm:name@ver` | OSV `MAL-` id or an OpenSSF malicious-packages record. |
+| `malware` | `deny` | `npm:name@ver` | OSV `MAL-` id or an OpenSSF malicious-packages record (CR-003). |
 | `suspicious_script` | `deny` | `npm:name@ver` | `location` is `<script>:<line>` or `<file>:<line>`. |
 | `stale_data` | `approve` | `npm:name@ver` | Cached answer past its TTL was used. |
-| `incomplete_scan` | `approve` | `npm:name@ver` | No usable answer; treat the version as unreviewed. |
+| `incomplete_scan` | `approve` | `npm:name@ver` | No usable answer, or more than 128 advisory ids (the count dropped is in `evidence`; `MAL-` ids are kept first); treat the version as unreviewed. |
+| `incomplete_scan` | `deny` | `npm:name@ver` | Referenced script content was not fully inspected: binary content, longer than the 1 MiB prefix, or dropped by the npm archive caps (CR-004). `location` and `evidence` name the file. |
 
-Malware is deliberately a separate kind: an operator approves a vulnerability,
-but a known-malicious package is a different decision and must stay visible as
-one. Every `evidence` string is redacted (`redact::redact_url_credentials`) and
+Malware is deliberately a separate kind, and a hard denial: an operator may
+approve a vulnerability, but a known-malicious package cannot be approved away. Every `evidence` string is redacted (`redact::redact_url_credentials`) and
 length-bounded before it leaves the module.
 
 ## OSV client
@@ -136,8 +136,10 @@ Details that make the rules usable on real scripts:
 * `\`-continued lines are joined (at most 8 physical lines) and reported at the
   first physical line number.
 * Lines are bounded to 4096 characters, files to 1 MiB, findings per package to
-  256 (an `incomplete_scan` marker with `deny` follows), and binary files (a NUL
-  in the first 8 KiB) are skipped.
+  256 (an `incomplete_scan` marker with `deny` follows), and a binary file (a NUL
+  in the first 8 KiB) or a file past the 1 MiB prefix yields an `incomplete_scan`
+  `deny` naming the file; a clean result is never reported for content that was
+  not read.
 * Every finding carries `<script>:<line>` or `<file>:<line>` as `location` and
   the redacted command text as `evidence`.
 

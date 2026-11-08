@@ -15,9 +15,10 @@
 //!   miss an obfuscated form, so the Git shim (FR-001) and the isolated run
 //!   (FR-007) remain the enforcement points.
 //!
-//! Advisory and malware findings need one explicit one-time approval
-//! ([`FindingAction::Approve`]); a flagged script is a hard denial
-//! ([`FindingAction::Deny`]) for that script path.
+//! Advisory findings need one explicit one-time approval
+//! ([`FindingAction::Approve`]); known malware, a flagged script and script
+//! content that was not fully inspected are hard denials
+//! ([`FindingAction::Deny`]).
 
 use crate::paths::TrustedPaths;
 use crate::protocol::{Finding, FindingAction, FindingKind};
@@ -159,11 +160,10 @@ pub fn check_advisories(
         match fetched {
             Some(Ok(batch_ids)) => {
                 for (slot, &index) in fetch.iter().enumerate() {
-                    let mut ids = batch_ids[slot].clone();
+                    let ids = batch_ids[slot].clone();
                     let path = cache::path_for(&root, &batch_key(&pkgs[index]));
                     cache::write(&path, &ids, cache::now_secs(), settings.cache_max_bytes);
                     cache::evict(&root, settings.cache_max_bytes);
-                    ids.truncate(MAX_IDS_PER_PACKAGE);
                     lookups[index] = Lookup {
                         ids,
                         stale: false,
@@ -234,7 +234,22 @@ fn collect_package_findings(
     let mut stale = lookup.stale;
     let mut unseen_details = 0usize;
     let mut ids = lookup.ids.clone();
+    // Known-malware ids sort first so truncation can never drop them.
+    ids.sort_by_key(|id| !id.starts_with("MAL-"));
+    let dropped = ids.len().saturating_sub(MAX_IDS_PER_PACKAGE);
     ids.truncate(MAX_IDS_PER_PACKAGE);
+    if dropped > 0 {
+        findings.push(
+            Finding::new(
+                FindingKind::IncompleteScan,
+                FindingAction::Approve,
+                "osv",
+                format!("{dropped} advisory id(s) for {target} were dropped past the {MAX_IDS_PER_PACKAGE}-id limit"),
+            )
+            .target(target.clone()),
+        );
+        complete = false;
+    }
 
     for id in ids {
         let path = cache::path_for(root, &vuln_key(&id));
@@ -265,20 +280,16 @@ fn collect_package_findings(
         if detail.is_none() {
             unseen_details += 1;
         }
-        let kind = if osv::is_malware(&id, detail.as_ref()) {
-            FindingKind::Malware
+        // Known malware is a hard denial (CR-003); other advisories need approval.
+        let (kind, action) = if osv::is_malware(&id, detail.as_ref()) {
+            (FindingKind::Malware, FindingAction::Deny)
         } else {
-            FindingKind::Advisory
+            (FindingKind::Advisory, FindingAction::Approve)
         };
         findings.push(
-            Finding::new(
-                kind,
-                FindingAction::Approve,
-                "osv",
-                summarize(&id, detail.as_ref()),
-            )
-            .target(target.clone())
-            .advisory(id),
+            Finding::new(kind, action, "osv", summarize(&id, detail.as_ref()))
+                .target(target.clone())
+                .advisory(id),
         );
     }
 
@@ -350,6 +361,7 @@ pub fn inspect_scripts(
     let target = pkg.display();
     let mut hits: Vec<(String, rules::ForceHit)> = Vec::new();
     let mut overflow = false;
+    let mut uninspected: Vec<(&str, &'static str)> = Vec::new();
 
     'scripts: for (name, command) in scripts {
         for hit in rules::force_push_hits(command) {
@@ -362,9 +374,9 @@ pub fn inspect_scripts(
     }
     if !overflow {
         'files: for file in files {
-            let text = script_text(file);
-            if text.is_empty() {
-                continue;
+            let (text, gap) = script_text(file);
+            if let Some(why) = gap {
+                uninspected.push((&file.path, why));
             }
             for hit in rules::force_push_hits(&text) {
                 if hits.len() == MAX_SCRIPT_FINDINGS {
@@ -394,6 +406,21 @@ pub fn inspect_scripts(
             .location(location)
         })
         .collect();
+    for (path, why) in uninspected {
+        findings.push(
+            Finding::new(
+                FindingKind::IncompleteScan,
+                FindingAction::Deny,
+                "scan.scripts",
+                truncate(
+                    &format!("referenced script {path} was not fully inspected: {why}"),
+                    MAX_EVIDENCE_CHARS,
+                ),
+            )
+            .target(target.clone())
+            .location(path.to_string()),
+        );
+    }
     if overflow {
         findings.push(
             Finding::new(
@@ -408,15 +435,16 @@ pub fn inspect_scripts(
     findings
 }
 
-/// Decode one script file for inspection. Binary or oversized content is
-/// skipped: a file this module cannot read as text is unreviewable here.
-fn script_text(file: &ScriptFile) -> String {
+/// Decode one script file for inspection. Returns the text to scan plus why
+/// the file is only partly (or not at all) inspected, if so.
+fn script_text(file: &ScriptFile) -> (String, Option<&'static str>) {
     let len = file.bytes.len().min(MAX_SCRIPT_BYTES);
     let bytes = &file.bytes[..len];
     if bytes.iter().take(8192).any(|&byte| byte == 0) {
-        return String::new();
+        return (String::new(), Some("binary content cannot be read as text"));
     }
-    String::from_utf8_lossy(bytes).into_owned()
+    let gap = (file.bytes.len() > MAX_SCRIPT_BYTES).then_some("longer than the inspected prefix");
+    (String::from_utf8_lossy(bytes).into_owned(), gap)
 }
 
 #[cfg(test)]
@@ -505,7 +533,12 @@ mod tests {
             path: "blob.bin".into(),
             bytes: b"git push --force\0tail".to_vec(),
         };
-        assert!(inspect_scripts(&pkg(), &[], &[binary]).is_empty());
+        let findings = inspect_scripts(&pkg(), &[], &[binary]);
+        assert_eq!(findings.len(), 1, "binary content is an incomplete scan");
+        assert_eq!(findings[0].kind, FindingKind::IncompleteScan);
+        assert_eq!(findings[0].action, FindingAction::Deny);
+        assert_eq!(findings[0].location.as_deref(), Some("blob.bin"));
+        assert!(findings[0].evidence.contains("blob.bin"));
 
         let mut large = vec![b'\n'; MAX_SCRIPT_BYTES + 64];
         large[..20].copy_from_slice(b"git push --force\n\n\n\n");
@@ -520,8 +553,11 @@ mod tests {
                 bytes: large,
             }],
         );
-        assert_eq!(findings.len(), 1, "only the reviewed prefix is inspected");
+        assert_eq!(findings.len(), 2, "prefix hit plus an incomplete scan");
         assert_eq!(findings[0].location.as_deref(), Some("big.sh:1"));
+        assert_eq!(findings[1].kind, FindingKind::IncompleteScan);
+        assert_eq!(findings[1].action, FindingAction::Deny);
+        assert!(findings[1].evidence.contains("big.sh"));
     }
 
     #[test]

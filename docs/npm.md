@@ -41,7 +41,7 @@ structured arguments (on Linux it follows the real `npm` launcher or standard in
    integrity. The guard downloads each artifact itself (`ureq`, no redirects, bounded by
    `limits.artifact_max_bytes`) and verifies the SRI: a mismatch is `IntegrityMismatch`, exit 13,
    and cannot be approved. Archives are validated without extraction: no absolute paths, `..`,
-   backslashes, drive/stream markers, links, devices or oversize/over-long content. The archive's
+   backslashes, drive/stream markers, links, devices or oversize/over-long content. Entry names must be unique under ASCII case folding and Windows trailing-dot/space folding, or the archive is an `integrity_mismatch` `deny` (a second `PACKAGE.json` or `BUILD.js` could replace the reviewed file on disk). Every path token in a lifecycle command is read as a referenced file whatever its extension; a referenced file over 256 KiB, past 2 MiB in total, or past 32 files yields an `incomplete_scan` `deny`. Known malware is a `deny` before approval. The archive's
    `package.json` name/version must equal the lockfile entry (manifest confusion is a Deny).
    Optional packages that npm would skip on this OS/CPU are reviewed but not downloaded.
 6. **Scan.** `preinstall`/`install`/`postinstall` (plus the implicit `node-gyp rebuild` for a
