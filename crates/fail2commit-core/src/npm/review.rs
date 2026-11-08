@@ -109,6 +109,9 @@ fn fetch_one(
     }
     let info = archive::inspect(&bytes, limits.artifact_max_bytes).map_err(|mut e| {
         e.message = format!("{}: {}", id.display(), e.message);
+        for f in &mut e.findings {
+            f.target = Some(id.display());
+        }
         e
     })?;
     let mut findings = Vec::new();
@@ -121,6 +124,18 @@ fn fetch_one(
                 "archive package.json name/version differs from the lockfile entry",
             )
             .target(id.display()),
+        );
+    }
+    for name in &info.incomplete {
+        findings.push(
+            Finding::new(
+                FindingKind::IncompleteScan,
+                FindingAction::Deny,
+                "npm.archive",
+                format!("referenced script {name} was not inspected: over the archive size or count limit"),
+            )
+            .target(id.display())
+            .location(name.clone()),
         );
     }
     let file = dir.join(format!("{idx}.tgz"));

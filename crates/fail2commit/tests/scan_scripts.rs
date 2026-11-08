@@ -165,12 +165,16 @@ fn suspicious_fixture_package_is_denied() {
 }
 
 #[test]
-fn binary_files_are_skipped() {
+fn binary_files_are_an_incomplete_scan_deny() {
     let files = vec![ScriptFile {
         path: "blob.bin".to_string(),
         bytes: b"git push --force\0\x01\x02tail".to_vec(),
     }];
-    assert!(scan::inspect_scripts(&pkg(), &[], &files).is_empty());
+    let findings = scan::inspect_scripts(&pkg(), &[], &files);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].kind, FindingKind::IncompleteScan);
+    assert_eq!(findings[0].action, FindingAction::Deny);
+    assert!(findings[0].evidence.contains("blob.bin"));
 }
 
 #[test]
@@ -186,6 +190,9 @@ fn oversized_files_are_truncated_not_crashing() {
             bytes,
         }],
     );
-    assert_eq!(findings.len(), 1);
+    assert_eq!(findings.len(), 2);
     assert_eq!(findings[0].location.as_deref(), Some("huge.sh:1"));
+    assert_eq!(findings[1].kind, FindingKind::IncompleteScan);
+    assert_eq!(findings[1].action, FindingAction::Deny);
+    assert!(findings[1].evidence.contains("huge.sh"));
 }

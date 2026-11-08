@@ -7,7 +7,7 @@
 //! clean even though the same file contains a force-push form that is denied
 //! outright when it is plain text.
 
-use fail2commit_core::protocol::FindingAction;
+use fail2commit_core::protocol::{Finding, FindingAction, FindingKind};
 use fail2commit_core::scan::{inspect_scripts, Ecosystem, PackageId, ScriptFile};
 
 fn pkg() -> PackageId {
@@ -16,6 +16,19 @@ fn pkg() -> PackageId {
         name: "demo".into(),
         version: "1.0.0".into(),
     }
+}
+
+/// CR-004: content that was not fully inspected is a Deny naming the file.
+fn assert_incomplete_deny(findings: &[Finding], file: &str) {
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.kind == FindingKind::IncompleteScan
+                && f.action == FindingAction::Deny
+                && f.target.as_deref() == Some("npm:demo@1.0.0")
+                && f.evidence.contains(file)),
+        "expected an IncompleteScan Deny naming {file}: {findings:?}"
+    );
 }
 
 fn script(name: &str, command: &str) -> Vec<(String, String)> {
@@ -40,7 +53,7 @@ fn plain_referenced_script_with_a_force_push_is_denied() {
 }
 
 #[test]
-fn nul_prefixed_referenced_script_is_reported_clean() {
+fn nul_prefixed_referenced_script_is_an_incomplete_scan_deny() {
     // Same file, same force push, 8 KiB of NUL bytes in front of it.
     let mut bytes = vec![0u8; 8192];
     bytes.extend_from_slice(b"#!/bin/sh\ngit push --force origin main\n");
@@ -49,18 +62,11 @@ fn nul_prefixed_referenced_script_is_reported_clean() {
         bytes,
     }];
     let findings = inspect_scripts(&pkg(), &script("postinstall", "node ./setup.js"), &files);
-    assert!(
-        findings
-            .iter()
-            .any(|f| f.action == FindingAction::Deny
-                && f.location.as_deref() == Some("setup.js:2")),
-        "W2-003: a referenced script containing a force push must be denied \
-         (or reported as an incomplete scan), not silently skipped"
-    );
+    assert_incomplete_deny(&findings, "setup.js");
 }
 
 #[test]
-fn script_file_beyond_the_scan_prefix_is_silently_ignored() {
+fn script_file_beyond_the_scan_prefix_is_an_incomplete_scan_deny() {
     // A force push past the 1 MiB inspection prefix is also invisible, and the
     // report is still complete.
     let mut bytes = vec![b'\n'; 1024 * 1024 + 64];
@@ -75,8 +81,5 @@ fn script_file_beyond_the_scan_prefix_is_silently_ignored() {
             bytes,
         }],
     );
-    assert!(
-        !findings.is_empty(),
-        "W2-003: inspection stopped at the prefix without reporting incompleteness"
-    );
+    assert_incomplete_deny(&findings, "setup.js");
 }

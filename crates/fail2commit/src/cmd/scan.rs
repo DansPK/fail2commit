@@ -87,7 +87,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         .count();
     if denied > 0 {
         return Err(
-            Error::rejected(format!("{denied} script finding(s) block this package"))
+            Error::rejected(format!("{denied} deny finding(s) block this package"))
                 .with_findings(findings),
         );
     }

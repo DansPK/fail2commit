@@ -269,9 +269,11 @@ fn the_real_stub_scanner_pauses_in_production_wiring() {
         decision: Decision::Cancel,
         ..Default::default()
     });
-    deps.advisories = Box::new(|p| {
-        fail2commit_core::scan::check_advisories(&env.paths, &env.settings.advisories, p)
-    });
+    // Offline with an empty cache: deterministic, never touches the network.
+    let mut adv = env.settings.advisories.clone();
+    adv.offline = true;
+    let paths = env.paths.clone();
+    deps.advisories = Box::new(move |p| fail2commit_core::scan::check_advisories(&paths, &adv, p));
     let e = npm::execute(&deps, &env.request(&["install", "left-pad"])).unwrap_err();
     assert_eq!(e.code, ResultCode::Rejected);
     assert_eq!(run.requests.lock().unwrap().len(), 1);
