@@ -32,6 +32,14 @@ pub fn platform_backend() -> Box<dyn SandboxBackend> {
 /// Probe, run, then export declared paths only after a clean exit.
 /// Backends never export themselves.
 pub fn run_job(backend: &dyn SandboxBackend, job: &JobSpec) -> crate::Result<JobOutcome> {
+    // SPEC-012: one active sandbox build per user; later jobs wait their turn.
+    let lock = crate::paths::TrustedPaths::resolve()?
+        .state_dir
+        .join("sandbox-job");
+    crate::fsutil::with_lock(&lock, || run_job_locked(backend, job))
+}
+
+fn run_job_locked(backend: &dyn SandboxBackend, job: &JobSpec) -> crate::Result<JobOutcome> {
     let probe = backend.probe();
     if !probe.available {
         return Err(crate::Error::isolation_unavailable(format!(

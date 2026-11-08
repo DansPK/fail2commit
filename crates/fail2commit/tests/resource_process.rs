@@ -122,10 +122,9 @@ fn two_concurrent_builds_finish_and_leave_nothing() {
     assert_eq!(leftovers(&h.path().to_string_lossy()), Vec::<String>::new());
 }
 
-/// SPEC-012 default: one active sandbox build per user. NOT enforced today
-/// (finding in docs/resources.md); run with `--ignored` to see the gap.
+/// SPEC-012 default: one active sandbox build per user. `sandbox::run_job`
+/// holds a per-user lock, so the second build waits for the first.
 #[test]
-#[ignore = "NFR-012 gap: no per-user sandbox build limit is implemented"]
 fn second_concurrent_build_is_queued_or_refused() {
     let h = home("");
     if !sandbox_ready(h.path()) {

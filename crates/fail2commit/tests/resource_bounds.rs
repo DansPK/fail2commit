@@ -46,15 +46,22 @@ fn offline_advisory_scan_without_cache_is_incomplete_not_clean() {
     assert_eq!(out.status.code(), Some(12));
 }
 
-/// FINDING (docs/resources.md): no CLI surface prints the configured limit
-/// values; `status` omits them. Pinned so a future change is noticed: when
-/// limits are reported, update this test and the doc.
+/// SPEC-012: `status` reports the configured bounds in effect.
 #[test]
-fn status_does_not_yet_report_limits() {
+fn status_reports_configured_limits() {
     let (h, r) = (home(""), tempfile::tempdir().unwrap());
     let (_, v) = f2c(h.path(), r.path(), &["status"]);
-    assert!(
-        v["data"].get("limits").is_none(),
-        "limits now reported: update docs/resources.md"
-    );
+    let limits = &v["data"]["limits"];
+    for key in [
+        "job_timeout_secs",
+        "job_memory_mb",
+        "job_max_processes",
+        "job_max_output_bytes",
+        "scan_max_bytes",
+        "graph_max_nodes",
+        "artifact_max_bytes",
+    ] {
+        assert!(limits[key].is_u64(), "status lacks limits.{key}: {v}");
+    }
+    assert!(v["data"]["advisories"]["cache_max_bytes"].is_u64(), "{v}");
 }

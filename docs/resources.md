@@ -86,7 +86,7 @@ Read from the trusted `settings.toml` only. A malformed value fails closed
 | `limits.scan_max_bytes` | 256 MiB | blob bytes read per Git secret scan |
 | `limits.graph_max_nodes` | 100,000 | commits, packages or staged entries per operation |
 | `limits.artifact_max_bytes` | 512 MiB | one downloaded or staged artifact; also the `run --input` copy budget |
-| `advisories.cache_max_bytes` | 64 MiB | advisory cache (oldest entries evicted first) |
+| `advisories.cache_max_bytes` | 16 MiB (was 64 MiB; applied from the proposal below) | advisory cache (oldest entries evicted first) |
 | `advisories.ttl_secs` / `timeout_secs` | 6 h / 15 s | cache expiry; OSV request timeout |
 
 Incomplete versus clean is observable through `--json`: an exhausted scan
@@ -114,19 +114,15 @@ different number, which is itself recorded as a gap below.
 
 ## Known gaps and findings
 
-1. **One active sandbox build per user is not enforced.** SPEC-012 sets this
-   default. Two simultaneous `fail2commit run -- sleep 2` jobs under one
-   `FAIL2COMMIT_HOME` finished in 2.3 s on WSL (bubblewrap), so they overlap.
-   No per-user lock or queue exists in `cmd/run.rs` or `sandbox/`. Owner:
-   T-007/T-008 (the coordinator decides). `resource_process.rs`
-   `second_concurrent_build_is_queued_or_refused` is `#[ignore]` and fails with
-   `--ignored` until this is implemented; `two_concurrent_builds_finish_and_leave_nothing`
-   records the observation.
-2. **Configured limits are not reported by any command.** `status` and
-   `sandbox status` omit them. SPEC-012 says to report the exact configured
-   limits. Add a `limits` object to `status` data. `resource_bounds.rs`
-   `status_does_not_yet_report_limits` pins the current behaviour and fails
-   when that changes, as a reminder to update this page.
+1. **Fixed (2026-11-09): one active sandbox build per user.** Measured
+   first: two simultaneous `fail2commit run -- sleep 2` jobs finished in 2.3 s,
+   so they overlapped. `sandbox::run_job` now holds a per-user lock
+   (`<state>/sandbox-job.lock`) across probe, run and export, so later jobs
+   wait. `resource_process.rs` `second_concurrent_build_is_queued_or_refused`
+   asserts it (no longer ignored).
+2. **Fixed (2026-11-09): configured limits are reported.** `fail2commit status`
+   `data.limits` and `data.advisories` give the exact values in effect;
+   `resource_bounds.rs` `status_reports_configured_limits` asserts it.
 3. **`run` cannot bind a toolchain sysroot**, so a native build on a host with
    no root-owned gcc (WSL Ubuntu here) cannot run through the CLI. The harness
    measures the native build in the privileged `rust:1` container instead.
