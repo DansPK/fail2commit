@@ -1,0 +1,171 @@
+//! Secret detectors. Matched values are never returned, only redacted
+//! placeholders (FR-001).
+
+use regex::Regex;
+use std::sync::OnceLock;
+
+pub struct Hit {
+    pub detector: &'static str,
+    pub line: usize,
+    /// Already redacted.
+    pub evidence: String,
+}
+
+struct Rules {
+    fixed: Vec<(&'static str, Regex)>,
+    generic: Regex,
+}
+
+fn rules() -> &'static Rules {
+    static R: OnceLock<Rules> = OnceLock::new();
+    R.get_or_init(|| {
+        let re = |p: &str| Regex::new(p).expect("static regex");
+        Rules {
+            fixed: vec![
+                (
+                    "private-key",
+                    re(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
+                ),
+                (
+                    "aws-access-key",
+                    re(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}\b"),
+                ),
+                (
+                    "github-token",
+                    re(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})"),
+                ),
+                ("gitlab-token", re(r"\bglpat-[A-Za-z0-9_-]{20,}")),
+                ("slack-token", re(r"\bxox[abposr]-[A-Za-z0-9-]{10,}")),
+            ],
+            generic: re(
+                r#"(?i)[\w.-]*(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)[\w.-]*["']?\s*[:=]\s*["']?([^\s"'#,;]{8,})"#,
+            ),
+        }
+    })
+}
+
+/// Shannon entropy in bits per byte.
+pub fn entropy(s: &str) -> f64 {
+    let mut counts = [0u32; 256];
+    for b in s.bytes() {
+        counts[b as usize] += 1;
+    }
+    let n = s.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / n;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+fn placeholder(v: &str) -> bool {
+    let l = v.to_ascii_lowercase();
+    v.starts_with(['$', '<', '{', '%'])
+        || [
+            "changeme",
+            "example",
+            "your_",
+            "your-",
+            "placeholder",
+            "password",
+            "secret",
+            "xxxx",
+            "****",
+            "redacted",
+            "dummy",
+        ]
+        .iter()
+        .any(|p| l.contains(p))
+        || v.bytes().all(|b| b == v.as_bytes()[0])
+}
+
+/// Scan text for secrets; at most one hit per (detector, line).
+pub fn scan_text(text: &str) -> Vec<Hit> {
+    let r = rules();
+    let mut hits = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.len() > 8192 {
+            continue; // minified blobs: cheap guard against pathological lines
+        }
+        for (name, re) in &r.fixed {
+            if let Some(m) = re.find(line) {
+                hits.push(Hit {
+                    detector: name,
+                    line: i + 1,
+                    evidence: crate::redact::redact(m.as_str()),
+                });
+            }
+        }
+        if let Some(c) = r.generic.captures(line) {
+            let v = &c[1];
+            if !placeholder(v) && entropy(v) >= 3.0 {
+                hits.push(Hit {
+                    detector: "generic-assignment",
+                    line: i + 1,
+                    evidence: crate::redact::redact(v),
+                });
+            }
+        }
+    }
+    hits
+}
+
+/// `.env` / `.env.*` by basename bytes, except documented templates.
+pub fn is_env_file(path: &[u8]) -> bool {
+    let base = path.rsplit(|&b| b == b'/').next().unwrap_or(path);
+    let base = String::from_utf8_lossy(base).to_ascii_lowercase();
+    if base == ".env" {
+        return true;
+    }
+    match base.strip_prefix(".env.") {
+        Some(ext) => !matches!(ext, "example" | "sample" | "template"),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_names() {
+        for p in [".env", "a/b/.env", ".env.local", ".env.production"] {
+            assert!(is_env_file(p.as_bytes()), "{p}");
+        }
+        for p in [
+            ".env.example",
+            "x/.env.sample",
+            ".env.template",
+            "env",
+            ".envrc",
+        ] {
+            assert!(!is_env_file(p.as_bytes()), "{p}");
+        }
+    }
+
+    #[test]
+    fn detectors_redact_and_skip_placeholders() {
+        let aws = ["AKIA", "QX7M2K9P4R8T3V6W"].concat();
+        let pk = ["-----BEGIN ", "RSA PRIVATE KEY-----"].concat();
+        let gh = ["ghp", "_", "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0hJ3kL6"].concat();
+        let pw = ["pass", "word=", "t9Xq2LmZ8vB4nR7w"].concat();
+        let text = format!("a={aws}\n{pk}\n{gh}\n{pw}\npassword=changeme123\nsecret=aaaaaaaaaa\n");
+        let hits = scan_text(&text);
+        let names: Vec<_> = hits.iter().map(|h| h.detector).collect();
+        assert_eq!(
+            names,
+            [
+                "aws-access-key",
+                "private-key",
+                "github-token",
+                "generic-assignment"
+            ]
+        );
+        for h in &hits {
+            assert!(!h.evidence.contains("QX7M") && !h.evidence.contains("t9Xq"));
+        }
+    }
+}

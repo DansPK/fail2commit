@@ -8,6 +8,19 @@ use crate::protocol::Finding;
 use crate::settings::Limits;
 use std::path::Path;
 
+mod classify;
+mod detect;
+mod gitcmd;
+mod integ;
+pub mod intent;
+pub mod prepush;
+mod scan;
+
+pub use integ::{
+    default_path_editor, hooks_dir, shim_path, GitIntegration, PathEditor, ProfileEditor,
+    PATH_TARGET_ENV,
+};
+
 /// One proposed ref update, as Git reports it to pre-push / pre-receive.
 /// OIDs are lowercase hex; all-zero means "does not exist".
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -32,8 +45,7 @@ pub fn classify_updates(
     repo: &Path,
     updates: &[RefUpdate],
 ) -> crate::Result<Vec<Finding>> {
-    let _ = (git, repo, updates);
-    Err(crate::Error::not_implemented("git ref classification"))
+    classify::classify(git, repo, updates)
 }
 
 /// Secret findings in commits that `updates` would publish, excluding
@@ -46,11 +58,10 @@ pub fn scan_outgoing(
     remote: Option<&str>,
     limits: &Limits,
 ) -> crate::Result<Vec<Finding>> {
-    let _ = (git, repo, updates, remote, limits);
-    Err(crate::Error::not_implemented("git outgoing secret scan"))
+    scan::scan(git, repo, updates, remote, limits)
 }
 
 /// Git hook + shim integration for `fail2commit setup`.
 pub fn integration() -> Option<Box<dyn Integration>> {
-    None
+    Some(Box::new(GitIntegration::new(default_path_editor())))
 }
