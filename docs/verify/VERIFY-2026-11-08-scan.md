@@ -49,10 +49,14 @@ docker run -d --name f2c-t006-linux-scan -v "${PWD}:/src" -v f2c-t006-scan-targe
   scan_scripts                 : 8 passed;  0 failed
 ```
 
-The live-internet smoke test is never part of the default run:
+The live-internet smoke test is opt-in and was run once by hand here, against the
+default `https://api.osv.dev` endpoint:
 
 ```text
-cargo test -p fail2commit --test scan_advisories -- --ignored   # not run here
+cargo test -p fail2commit --test scan_advisories -- --ignored
+  exit 0
+  test live_osv_smoke ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.50s
 ```
 
 ## 2. Results
@@ -71,7 +75,7 @@ cargo test -p fail2commit --test scan_advisories -- --ignored   # not run here
 | TC-006 | FR-006 | Pass | `credentials_in_evidence_are_redacted`, `evidence_redacts_credentials` — credentials in a pushed URL appear as `***@host`; the synthetic secret never reaches evidence. |
 | TC-006 (matrix: npm/pip "stale/offline cache") | FR-006 | Pass | The scan-owned half of that matrix row: stale and offline cache behaviour proven on Windows and Linux. Wiring into the guarded npm/pip installs is T-004/T-005. |
 | TC-006 (matrix: platform) | FR-006 | Pass | The same suite is green on Windows 11 and in the Debian `rust:1` container (section 1). |
-| TC-006 (live OSV) | FR-006 | Pending | `live_osv_smoke` is `#[ignore]`. Missing prerequisite: an internet-enabled run (`cargo test -p fail2commit --test scan_advisories -- --ignored`), deliberately excluded from default and CI runs. |
+| TC-006 (live OSV) | FR-006 | Pass | `live_osv_smoke` (`#[ignore]`, so never in default or CI runs) passed against the real `https://api.osv.dev`: `1 passed; 0 failed` on 2026-11-09. Synthetic loopback fixtures remain the default evidence. |
 
 ## 3. Traceability Check
 
@@ -110,8 +114,10 @@ exit 0
 
 ## 5. Verdict
 
-- [x] **Verified for FR-006 / SPEC-006 / TC-006:** every linked TC row above passes on
-      both platforms; the single failure in the full Linux workspace run is in a
-      coordinator-owned file outside this task and is recorded in section 4.
-- [ ] **Not verified:** the `#[ignore]` live-OSV smoke test needs an internet-enabled
-      run and stays Pending.
+- [x] **Verified for FR-006 / SPEC-006 / TC-006:** every linked TC row above passes,
+      on Windows and on Linux, plus one opt-in run against the real OSV service. The
+      single failure in the full Linux workspace run is in a coordinator-owned file
+      outside this task and is recorded in section 4.
+- [x] **No pending TC-006 items.** The remaining caveat is not a test gap but a design
+      property: the script rules are evidence, not an execution boundary, and the
+      Git shim (FR-001) plus the sandbox (FR-007) stay the enforcement points.
