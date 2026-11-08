@@ -1,39 +1,16 @@
-//! Defensive tarball inspection (SPEC-004): validate every entry path and
-//! type, and pull out `package.json` plus the local files that install
-//! scripts reference. Nothing is extracted to disk and nothing is executed.
+//! Defensive tarball pre-checks (SPEC-004): validate every entry path and
+//! type before npm sees the archive. This is defence in depth only (CR-008):
+//! nothing the reader returns is a content decision; scripts, manifests and
+//! findings come from the tree npm extracts (`tree`).
 
 use super::scripts;
 use crate::protocol::{Finding, FindingAction, FindingKind};
-use crate::scan::ScriptFile;
 use crate::{Error, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Read;
 
 const MAX_ENTRIES: usize = 200_000;
-const MAX_REF_FILE: u64 = 256 * 1024;
-const MAX_REF_TOTAL: u64 = 2 * 1024 * 1024;
-const MAX_REF_FILES: usize = 32;
-const MAX_MANIFEST: u64 = 1024 * 1024;
-/// Nested `package.json` files read for their `main` field.
-const MAX_NESTED_MANIFEST: u64 = 64 * 1024;
-const MAX_NESTED: usize = 64;
-const EXTS: [&str; 4] = [".js", ".cjs", ".mjs", ".json"];
 const MAX_PATH_LEN: usize = 1024;
-
-#[derive(Debug, Default)]
-pub struct Inspected {
-    pub name: String,
-    pub version: String,
-    /// Install-time lifecycle entries (`preinstall`, `install`, `postinstall`),
-    /// plus the implicit `install: node-gyp rebuild` for `binding.gyp`.
-    pub scripts: Vec<(String, String)>,
-    /// Other `scripts` entries reachable from the lifecycle ones through
-    /// `npm run`, `yarn` or `pnpm` (inspected, never run by name).
-    pub chained: Vec<(String, String)>,
-    pub files: Vec<ScriptFile>,
-    /// Referenced files that were not read because of a size or count cap.
-    pub incomplete: Vec<String>,
-}
 
 /// Normalize one entry path exactly as npm's tar extraction (`strip: 1`)
 /// does: the first component goes, whatever it is (`.` included), then empty
@@ -96,13 +73,13 @@ fn io_err(e: std::io::Error) -> Error {
 }
 
 /// Stream every entry once: validate its type and path, then hand it to `visit`
-/// as `(normalized path, is_dir, size, body)`.
+/// as `(normalized path, is_dir)`.
 fn walk(
     tgz: &[u8],
     max_unpacked: u64,
-    mut visit: impl FnMut(&str, bool, u64, &mut dyn Read) -> Result<()>,
+    mut visit: impl FnMut(&str, bool) -> Result<()>,
 ) -> Result<()> {
-    let gz = flate2::read::GzDecoder::new(tgz).take(max_unpacked.saturating_add(1));
+    let gz = flate2::read::MultiGzDecoder::new(tgz).take(max_unpacked.saturating_add(1));
     let mut ar = tar::Archive::new(CountedReader {
         inner: gz,
         read: 0,
@@ -110,7 +87,7 @@ fn walk(
     });
     let mut count = 0usize;
     for entry in ar.entries().map_err(io_err)? {
-        let mut entry = entry.map_err(io_err)?;
+        let entry = entry.map_err(io_err)?;
         count += 1;
         if count > MAX_ENTRIES {
             return Err(Error::invalid("archive has too many entries"));
@@ -126,8 +103,7 @@ fn walk(
         let Some(rel) = normalize(&path)? else {
             continue;
         };
-        let size = entry.header().size().map_err(io_err)?;
-        visit(&rel, ty == T::Directory, size, &mut entry)?;
+        visit(&rel, ty == T::Directory)?;
     }
     Ok(())
 }
@@ -142,198 +118,17 @@ fn collision(a: &str, b: &str) -> Error {
     )])
 }
 
-pub fn inspect(tgz: &[u8], max_unpacked: u64) -> Result<Inspected> {
-    // Pass 1: validate, reject folding collisions, read the manifest.
-    let mut manifest: Option<Vec<u8>> = None;
+pub fn precheck(tgz: &[u8], max_unpacked: u64) -> Result<()> {
     // folded name -> (exact name, is_dir)
     let mut seen: BTreeMap<String, (String, bool)> = BTreeMap::new();
-    // folded directory -> `main` of its package.json; directories whose
-    // package.json was too large or too many to read.
-    let mut mains: BTreeMap<String, Option<String>> = BTreeMap::new();
-    let mut unread: BTreeSet<String> = BTreeSet::new();
-    walk(tgz, max_unpacked, |rel, dir, size, body| {
-        match seen.get(&fold(rel)) {
-            Some((exact, was_dir)) if !(dir && *was_dir && exact == rel) => {
-                return Err(collision(rel, exact));
-            }
-            Some(_) => {}
-            None => {
-                seen.insert(fold(rel), (rel.to_string(), dir));
-            }
-        }
-        if !dir && (rel == "package.json" || rel.ends_with("/package.json")) {
-            let root = rel == "package.json";
-            let key = fold(
-                rel.strip_suffix("package.json")
-                    .unwrap_or("")
-                    .trim_end_matches('/'),
-            );
-            if root && size > MAX_MANIFEST {
-                return Err(Error::invalid("archive package.json is too large"));
-            }
-            if root || (size <= MAX_NESTED_MANIFEST && mains.len() < MAX_NESTED) {
-                let mut buf = Vec::with_capacity(size as usize);
-                body.read_to_end(&mut buf).map_err(io_err)?;
-                let main = serde_json::from_slice::<serde_json::Value>(&buf)
-                    .ok()
-                    .and_then(|v| v.get("main").and_then(|m| m.as_str()).map(String::from));
-                mains.insert(key, main);
-                if root {
-                    manifest = Some(buf);
-                }
-            } else {
-                unread.insert(key);
-            }
-        }
-        Ok(())
-    })?;
-    let Some(manifest) = manifest else {
-        return Err(Error::invalid("archive has no package.json"));
-    };
-    let pj: serde_json::Value = serde_json::from_slice(&manifest)
-        .map_err(|e| Error::invalid(format!("archive package.json is invalid: {e}")))?;
-    let text = |k: &str| pj.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let mut out = Inspected {
-        name: text("name"),
-        version: text("version"),
-        ..Default::default()
-    };
-    if let Some(s) = pj.get("scripts").and_then(|s| s.as_object()) {
-        for k in ["preinstall", "install", "postinstall"] {
-            if let Some(cmd) = s.get(k).and_then(|c| c.as_str()) {
-                out.scripts.push((k.to_string(), cmd.to_string()));
-            }
-        }
-    }
-    let gyp = seen.get("binding.gyp").is_some_and(|(_, dir)| !dir);
-    let gypfile_off = pj.get("gypfile").and_then(|g| g.as_bool()) == Some(false);
-    let has_install = out
-        .scripts
-        .iter()
-        .any(|(k, _)| k == "install" || k == "preinstall");
-    if gyp && !gypfile_off && !has_install {
-        out.scripts
-            .push(("install".into(), "node-gyp rebuild".into()));
-    }
-
-    let scripts_map: BTreeMap<String, String> = pj
-        .get("scripts")
-        .and_then(|s| s.as_object())
-        .map(|s| {
-            s.iter()
-                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    out.chained = scripts::follow(&out.scripts, &scripts_map)?;
-
-    // Every path word of a lifecycle (or chained) command is a candidate,
-    // resolved the way node and the shell would. Words naming no archive file
-    // (`node`, `echo`) fall away.
-    let mut wanted: BTreeSet<String> = BTreeSet::new();
-    if gyp {
-        wanted.insert("binding.gyp".into());
-    }
-    for (_, cmd) in out.scripts.iter().chain(&out.chained) {
-        for p in scripts::paths(cmd)? {
-            expand(&p, &seen, &mains, &unread, &mut wanted, &mut out.incomplete)?;
-        }
-    }
-    wanted.retain(|w| seen.get(w).is_some_and(|(_, dir)| !dir));
-
-    // Pass 2: read only the referenced files. A referenced file the caps drop
-    // is reported, never silently skipped (CR-004).
-    let mut total = 0u64;
-    if !wanted.is_empty() {
-        walk(tgz, max_unpacked, |rel, dir, size, body| {
-            if dir || !wanted.contains(&fold(rel)) {
-                return Ok(());
-            }
-            if size > MAX_REF_FILE
-                || total + size > MAX_REF_TOTAL
-                || out.files.len() >= MAX_REF_FILES
-            {
-                out.incomplete.push(rel.to_string());
-                return Ok(());
-            }
-            let mut bytes = Vec::with_capacity(size as usize);
-            body.read_to_end(&mut bytes).map_err(io_err)?;
-            total += size;
-            out.files.push(ScriptFile {
-                path: rel.to_string(),
-                bytes,
-            });
+    walk(tgz, max_unpacked, |rel, dir| match seen.get(&fold(rel)) {
+        Some((exact, was_dir)) if !(dir && *was_dir && exact == rel) => Err(collision(rel, exact)),
+        Some(_) => Ok(()),
+        None => {
+            seen.insert(fold(rel), (rel.to_string(), dir));
             Ok(())
-        })?;
-    }
-    Ok(out)
-}
-
-fn join(dir: &str, name: &str) -> String {
-    if dir.is_empty() {
-        name.to_string()
-    } else {
-        format!("{dir}/{name}")
-    }
-}
-
-/// Add every file `node` or the shell could open for the path `p` (relative
-/// to the package root; `""` is the root): the path itself, node's extension
-/// and `index` resolution, and a directory's `package.json` `main`.
-fn expand(
-    p: &str,
-    seen: &BTreeMap<String, (String, bool)>,
-    mains: &BTreeMap<String, Option<String>>,
-    unread: &BTreeSet<String>,
-    wanted: &mut BTreeSet<String>,
-    incomplete: &mut Vec<String>,
-) -> Result<()> {
-    let base = fold(p);
-    if base.contains(['*', '?']) {
-        wanted.extend(
-            seen.keys()
-                .filter(|k| scripts::glob_match(base.as_bytes(), k.as_bytes()))
-                .cloned(),
-        );
-        return Ok(());
-    }
-    let mut add_tree = |t: &str| {
-        if !t.is_empty() {
-            wanted.insert(t.to_string());
-            wanted.extend(EXTS.iter().map(|e| format!("{t}{e}")));
         }
-        for e in EXTS {
-            wanted.insert(join(t, &format!("index{e}")));
-        }
-        wanted.insert(join(t, "package.json"));
-    };
-    add_tree(&base);
-    if unread.contains(&base) {
-        incomplete.push(join(&base, "package.json"));
-    }
-    if let Some(Some(main)) = mains.get(&base) {
-        let mut parts: Vec<&str> = base.split('/').filter(|c| !c.is_empty()).collect();
-        for c in main.split('/') {
-            match c {
-                "" | "." => {}
-                ".." if parts.pop().is_some() => {}
-                ".." => {
-                    return Err(Error::invalid(format!(
-                        "package.json `main` of `{base}` escapes the package root"
-                    ))
-                    .with_findings(vec![Finding::new(
-                        FindingKind::UnsupportedInput,
-                        FindingAction::Deny,
-                        "npm.archive",
-                        format!("package.json `main` of `{base}` escapes the package root"),
-                    )]));
-                }
-                c => parts.push(c),
-            }
-        }
-        add_tree(&fold(&parts.join("/")));
-    }
-    Ok(())
+    })
 }
 
 /// Fails once more than `max` bytes were produced by the decompressor.
@@ -384,41 +179,6 @@ mod tests {
         br#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"node ./setup.js && echo hi"}}"#;
 
     #[test]
-    fn extracts_scripts_and_referenced_files() {
-        let t = tgz(&[
-            ("package/package.json", PJ, None),
-            ("package/setup.js", b"console.log(1)", None),
-            ("package/unrelated.js", b"x", None),
-        ]);
-        let i = inspect(&t, 1 << 20).unwrap();
-        assert_eq!((i.name.as_str(), i.version.as_str()), ("a", "1.0.0"));
-        assert_eq!(
-            i.scripts,
-            vec![("postinstall".into(), "node ./setup.js && echo hi".into())]
-        );
-        assert_eq!(i.files.len(), 1);
-        assert_eq!(i.files[0].path, "setup.js");
-    }
-
-    #[test]
-    fn implicit_gyp_install() {
-        let t = tgz(&[
-            (
-                "package/package.json",
-                br#"{"name":"n","version":"1.0.0"}"#,
-                None,
-            ),
-            ("package/binding.gyp", b"{}", None),
-        ]);
-        let i = inspect(&t, 1 << 20).unwrap();
-        assert_eq!(
-            i.scripts,
-            vec![("install".into(), "node-gyp rebuild".into())]
-        );
-        assert_eq!(i.files[0].path, "binding.gyp");
-    }
-
-    #[test]
     fn hostile_entries_are_rejected() {
         for p in [
             "package/../evil",
@@ -430,7 +190,7 @@ mod tests {
             "package/x:stream",
         ] {
             let t = tgz(&[("package/package.json", PJ, None), (p, b"x", None)]);
-            assert!(inspect(&t, 1 << 20).is_err(), "{p}");
+            assert!(precheck(&t, 1 << 20).is_err(), "{p}");
         }
         for ty in [
             tar::EntryType::Symlink,
@@ -443,10 +203,9 @@ mod tests {
                 ("package/package.json", PJ, None),
                 ("package/l", b"", Some(ty)),
             ]);
-            assert!(inspect(&t, 1 << 20).is_err(), "{ty:?}");
+            assert!(precheck(&t, 1 << 20).is_err(), "{ty:?}");
         }
-        assert!(inspect(&tgz(&[("package/readme", b"x", None)]), 1 << 20).is_err());
-        assert!(inspect(b"not a tarball", 1 << 20).is_err());
+        assert!(precheck(b"not a tarball", 1 << 20).is_err());
     }
 
     #[test]
@@ -456,91 +215,8 @@ mod tests {
             ("package/package.json", PJ, None),
             ("package/big.bin", &big, None),
         ]);
-        assert!(inspect(&t, 100_000).is_err());
-        assert!(inspect(&t, 1 << 20).is_ok());
-    }
-
-    #[test]
-    fn extensionless_referenced_script_is_read() {
-        let pj = br#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"sh ./run"}}"#;
-        let t = tgz(&[
-            ("package/package.json", pj, None),
-            ("package/run", b"git push --force origin main", None),
-        ]);
-        let i = inspect(&t, 1 << 20).unwrap();
-        assert_eq!(i.files.len(), 1);
-        assert_eq!(i.files[0].path, "run");
-        assert!(i.incomplete.is_empty());
-    }
-
-    #[test]
-    fn referenced_files_dropped_by_caps_are_reported() {
-        // 33 referenced files: the 33rd exceeds the count cap.
-        let cmd: Vec<String> = (0..33).map(|n| format!("./f{n}")).collect();
-        let pj = format!(
-            r#"{{"name":"a","version":"1.0.0","scripts":{{"postinstall":"sh {}"}}}}"#,
-            cmd.join(" ")
-        );
-        let mut entries: Vec<(String, Vec<u8>)> =
-            vec![("package/package.json".into(), pj.into_bytes())];
-        for n in 0..33 {
-            entries.push((format!("package/f{n}"), b"x".to_vec()));
-        }
-        let refs: Vec<(&str, &[u8], Option<tar::EntryType>)> = entries
-            .iter()
-            .map(|(p, d)| (p.as_str(), d.as_slice(), None))
-            .collect();
-        let i = inspect(&tgz(&refs), 1 << 20).unwrap();
-        assert_eq!(i.files.len(), MAX_REF_FILES);
-        assert_eq!(i.incomplete.len(), 1);
-
-        // One referenced file over the per-file cap.
-        let pj = br#"{"name":"a","version":"1.0.0","scripts":{"postinstall":"sh ./big"}}"#;
-        let big = vec![b'a'; MAX_REF_FILE as usize + 1];
-        let t = tgz(&[
-            ("package/package.json", pj, None),
-            ("package/big", &big, None),
-        ]);
-        let i = inspect(&t, 1 << 20).unwrap();
-        assert!(i.files.is_empty());
-        assert_eq!(i.incomplete, vec!["big".to_string()]);
-
-        // Referenced files together over the total cap (9 x 256 KiB > 2 MiB).
-        let cmd: Vec<String> = (0..9).map(|n| format!("./g{n}")).collect();
-        let pj = format!(
-            r#"{{"name":"a","version":"1.0.0","scripts":{{"postinstall":"sh {}"}}}}"#,
-            cmd.join(" ")
-        );
-        let body = vec![b'a'; MAX_REF_FILE as usize];
-        let mut entries: Vec<(String, Vec<u8>)> =
-            vec![("package/package.json".into(), pj.into_bytes())];
-        for n in 0..9 {
-            entries.push((format!("package/g{n}"), body.clone()));
-        }
-        let refs: Vec<(&str, &[u8], Option<tar::EntryType>)> = entries
-            .iter()
-            .map(|(p, d)| (p.as_str(), d.as_slice(), None))
-            .collect();
-        let i = inspect(&tgz(&refs), 1 << 24).unwrap();
-        assert_eq!(i.files.len(), 8);
-        assert_eq!(i.incomplete.len(), 1);
-    }
-
-    #[test]
-    fn unrelated_large_entries_do_not_hide_the_referenced_file() {
-        let filler = vec![b'a'; 1024 * 1024];
-        let mut entries: Vec<(String, Vec<u8>)> = (0..20)
-            .map(|n| (format!("package/a{n}.js"), filler.clone()))
-            .collect();
-        entries.push(("package/package.json".into(), PJ.to_vec()));
-        entries.push(("package/setup.js".into(), b"console.log(1)".to_vec()));
-        let refs: Vec<(&str, &[u8], Option<tar::EntryType>)> = entries
-            .iter()
-            .map(|(p, d)| (p.as_str(), d.as_slice(), None))
-            .collect();
-        let i = inspect(&tgz(&refs), 1 << 26).unwrap();
-        assert_eq!(i.files.len(), 1);
-        assert!(i.incomplete.is_empty());
+        assert!(precheck(&t, 100_000).is_err());
+        assert!(precheck(&t, 1 << 20).is_ok());
     }
 
     #[test]
@@ -558,7 +234,7 @@ mod tests {
                 (a, b"1", None),
                 (b, b"2", None),
             ]);
-            let e = inspect(&t, 1 << 20).unwrap_err();
+            let e = precheck(&t, 1 << 20).unwrap_err();
             assert_eq!(e.code, crate::ResultCode::IntegrityFailure, "{a} {b}");
             assert_eq!(e.findings[0].kind, FindingKind::IntegrityMismatch);
             assert_eq!(e.findings[0].action, FindingAction::Deny);
@@ -569,13 +245,13 @@ mod tests {
             ("package/lib", b"", Some(tar::EntryType::Directory)),
             ("package/lib", b"", Some(tar::EntryType::Directory)),
         ]);
-        assert!(inspect(&t, 1 << 20).is_ok());
+        assert!(precheck(&t, 1 << 20).is_ok());
     }
 
     #[test]
     fn names_normalize_like_npm_tar_before_review() {
         // `./package.json` strips to the root manifest and collides with the real one.
-        let e = inspect(
+        let e = precheck(
             &tgz(&[
                 ("package/package.json", PJ, None),
                 ("./package.json", PJ, None),
@@ -590,7 +266,7 @@ mod tests {
             ("package//a/./b", b"1", None),
             ("package/a/b", b"2", None),
         ]);
-        let e = inspect(&t, 1 << 20).unwrap_err();
+        let e = precheck(&t, 1 << 20).unwrap_err();
         assert_eq!(e.findings[0].action, FindingAction::Deny);
         // Unicode case folds; 8.3 shapes are refused.
         let t = tgz(&[
@@ -598,43 +274,12 @@ mod tests {
             ("package/\u{dc}.js", b"1", None),
             ("package/\u{fc}.js", b"2", None),
         ]);
-        assert!(inspect(&t, 1 << 20).is_err());
+        assert!(precheck(&t, 1 << 20).is_err());
         let t = tgz(&[
             ("package/package.json", PJ, None),
             ("package/BUILD~1.JS", b"1", None),
         ]);
-        let e = inspect(&t, 1 << 20).unwrap_err();
+        let e = precheck(&t, 1 << 20).unwrap_err();
         assert_eq!(e.findings[0].kind, FindingKind::UnsupportedInput);
-    }
-
-    #[test]
-    fn node_resolution_candidates_are_read() {
-        let pj = |cmd: &str| {
-            let scripts = serde_json::json!({ "postinstall": cmd });
-            serde_json::json!({ "name": "a", "version": "1.0.0", "scripts": scripts }).to_string()
-        };
-        for (cmd, file) in [
-            ("node ./setup", "setup.js"),
-            ("node ./lib", "lib/index.js"),
-            ("node .", "index.js"),
-            ("sh \"./my script\"", "my script"),
-            ("sh $PWD/x/../run", "run"),
-        ] {
-            let pj = pj(cmd);
-            let t = tgz(&[
-                ("package/package.json", pj.as_bytes(), None),
-                (&format!("package/{file}"), b"x", None),
-            ]);
-            let files = inspect(&t, 1 << 20).unwrap().files;
-            assert!(files.iter().any(|f| f.path == file), "{cmd}");
-        }
-        let pj = pj("node ./lib");
-        let t = tgz(&[
-            ("package/package.json", pj.as_bytes(), None),
-            ("package/lib/package.json", br#"{"main":"./entry"}"#, None),
-            ("package/lib/entry.js", b"x", None),
-        ]);
-        let files = inspect(&t, 1 << 20).unwrap().files;
-        assert!(files.iter().any(|f| f.path == "lib/entry.js"));
     }
 }

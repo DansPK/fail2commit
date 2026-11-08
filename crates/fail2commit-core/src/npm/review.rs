@@ -16,7 +16,10 @@ pub struct ReviewedPkg {
     pub plan: PlanPkg,
     /// Verified tarball on disk; `None` for platform-skipped optionals.
     pub file: Option<PathBuf>,
+    /// Install-time lifecycle scripts, read from the extracted tree (`tree`).
     pub scripts: Vec<(String, String)>,
+    /// `(package-relative path, sha256)` of every reviewed on-disk input.
+    pub inputs: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -75,20 +78,12 @@ fn unique(plan: &Plan) -> Vec<(usize, Vec<usize>)> {
     out
 }
 
-struct Fetched {
-    file: PathBuf,
-    scripts: Vec<(String, String)>,
-    chained: Vec<(String, String)>,
-    scan_files: Vec<crate::scan::ScriptFile>,
-    findings: Vec<Finding>,
-}
-
 fn fetch_one(
     limits: &crate::settings::Limits,
     p: &PlanPkg,
     idx: usize,
     dir: &Path,
-) -> Result<Fetched> {
+) -> Result<PathBuf> {
     let id = package_id(p);
     let bytes = download(
         &p.resolved,
@@ -108,56 +103,27 @@ fn fetch_one(
         )
         .target(id.display())]));
     }
-    let info = archive::inspect(&bytes, limits.artifact_max_bytes).map_err(|mut e| {
+    // Defence in depth only: content is reviewed from what npm extracts.
+    archive::precheck(&bytes, limits.artifact_max_bytes).map_err(|mut e| {
         e.message = format!("{}: {}", id.display(), e.message);
         for f in &mut e.findings {
             f.target = Some(id.display());
         }
         e
     })?;
-    let mut findings = Vec::new();
-    if info.name != p.name || info.version != p.version {
-        findings.push(
-            Finding::new(
-                FindingKind::IntegrityMismatch,
-                FindingAction::Deny,
-                "npm.manifest",
-                "archive package.json name/version differs from the lockfile entry",
-            )
-            .target(id.display()),
-        );
-    }
-    for name in &info.incomplete {
-        findings.push(
-            Finding::new(
-                FindingKind::IncompleteScan,
-                FindingAction::Deny,
-                "npm.archive",
-                format!("referenced script {name} was not inspected: over the archive size or count limit"),
-            )
-            .target(id.display())
-            .location(name.clone()),
-        );
-    }
     let file = dir.join(format!("{idx}.tgz"));
     std::fs::write(&file, &bytes)?;
-    Ok(Fetched {
-        file,
-        scripts: info.scripts,
-        chained: info.chained,
-        scan_files: info.files,
-        findings,
-    })
+    Ok(file)
 }
 
-/// Download and verify the whole graph, then run script inspection.
-/// Advisory lookup happens in the caller so it sees the full package set.
+/// Download and verify the whole graph. Script inspection happens later on
+/// the extracted tree (`tree::review`); advisory lookup in the caller.
 pub fn review(deps: &Deps<'_>, plan: &Plan, dir: &Path) -> Result<Reviewed> {
     std::fs::create_dir_all(dir)?;
     let uniq = unique(plan);
     let limits = &deps.settings.limits;
     let next = AtomicUsize::new(0);
-    let slots: Vec<Mutex<Option<Result<Fetched>>>> =
+    let slots: Vec<Mutex<Option<Result<PathBuf>>>> =
         uniq.iter().map(|_| Mutex::new(None)).collect();
     std::thread::scope(|s| {
         for _ in 0..uniq.len().clamp(1, 8) {
@@ -189,20 +155,14 @@ pub fn review(deps: &Deps<'_>, plan: &Plan, dir: &Path) -> Result<Reviewed> {
         return Err(pick.with_findings(findings));
     }
 
-    let mut findings = Vec::new();
     let mut slots: Vec<Option<ReviewedPkg>> = vec![None; plan.pkgs.len()];
     for ((_, users), f) in uniq.iter().zip(&fetched) {
-        findings.extend(f.findings.clone());
         for &u in users {
-            let p = &plan.pkgs[u];
-            if !f.scripts.is_empty() {
-                let all = [f.scripts.clone(), f.chained.clone()].concat();
-                findings.extend((deps.inspect)(&package_id(p), &all, &f.scan_files));
-            }
             slots[u] = Some(ReviewedPkg {
-                plan: p.clone(),
-                file: Some(f.file.clone()),
-                scripts: f.scripts.clone(),
+                plan: plan.pkgs[u].clone(),
+                file: Some(f.clone()),
+                scripts: vec![],
+                inputs: vec![],
             });
         }
     }
@@ -215,8 +175,12 @@ pub fn review(deps: &Deps<'_>, plan: &Plan, dir: &Path) -> Result<Reviewed> {
                 plan: p.clone(),
                 file: None,
                 scripts: vec![],
+                inputs: vec![],
             })
         })
         .collect();
-    Ok(Reviewed { pkgs, findings })
+    Ok(Reviewed {
+        pkgs,
+        findings: vec![],
+    })
 }

@@ -36,34 +36,62 @@ structured arguments (on Linux it follows the real `npm` launcher or standard in
    (registry, script-shell, git, auth, ...) stops the command. Values are never echoed.
 4. **Resolve.** `npm install --package-lock-only --ignore-scripts` (install). `ci` uses the
    existing lockfile as the plan.
-5. **Review the exact graph.** Every `packages` entry must have its name, version, a `resolved`
+5. **Fetch and extract (CR-008).** Every `packages` entry must have its name, version, a `resolved`
    URL on the pinned registry (same origin and path prefix, no userinfo/query), and a `sha512`
    integrity. The guard downloads each artifact itself (`ureq`, no redirects, bounded by
    `limits.artifact_max_bytes`) and verifies the SRI: a mismatch is `IntegrityMismatch`, exit 13,
-   and cannot be approved. Archives are validated without extraction: no absolute paths, `..`,
-   backslashes, drive/stream markers, links, devices or oversize/over-long content. Entry names are normalized exactly as npm's tar extraction (`strip: 1`) does: the first component is dropped whatever it is (so `./package.json` becomes the root manifest), then empty and `.` components collapse. All review (manifest, scripts, referenced files) uses the normalized names. Two entries that normalize to the same path, or that collide under Unicode case folding plus Windows trailing-dot/space folding, make the archive an `integrity_mismatch` `deny` (a second `PACKAGE.json`, `BUILD.js` or `Ü.js`/`ü.js` could replace the reviewed file on disk). An entry whose name has an 8.3 short-name shape (`BUILD~1.JS`) is an `unsupported_input` `deny`. Lifecycle commands are tokenized as shell words (quotes, escapes, `sh -c "..."` text, `;`/`&&`/`|`), and every word is resolved to a package-relative path: `.//x`, `./a/../x` and `$PWD`/`${PWD}`/`$INIT_CWD`/`%cd%` prefixes normalize to the package root; `*`/`?` globs match archive entries. Each path is a candidate as given and the way node resolves it (`.js`, `.cjs`, `.mjs`, `.json`, `<dir>/index.*`, `<dir>/package.json` and its `main`); every candidate that exists is read. A path that escapes the package root or names an 8.3 alias is an `unsupported_input` `deny`; a path with an unresolvable `$VAR`/`$(...)`/backtick prefix is an `incomplete_scan` `deny`. `npm run|run-script <name>`, `npm test|start|stop|restart`, `yarn <name>` and `pnpm <name>` are followed through the package's own `scripts` map (including `pre<name>`/`post<name>`), up to 8 hops with cycle detection; the followed scripts are inspected like lifecycle scripts. A chain that cannot be fully followed (`-w`/`--workspace`/`--prefix`/`-r`/`--filter`, a `$`/glob script name, too deep or too wide) is an `incomplete_scan` `deny`. A referenced file over 256 KiB, past 2 MiB in total, or past 32 files yields an `incomplete_scan` `deny`. Known malware is a `deny` before approval. The archive's
-   `package.json` name/version must equal the lockfile entry (manifest confusion is a Deny).
-   Optional packages that npm would skip on this OS/CPU are reviewed but not downloaded.
-6. **Scan.** `preinstall`/`install`/`postinstall` (plus the implicit `node-gyp rebuild` for a
-   `binding.gyp`) and the bounded local files they reference go to `scan::inspect_scripts`; the
-   whole graph goes to `scan::check_advisories`. Deny findings stop the command; Approve findings
-   (advisories, malware, stale or incomplete data) share one approval.
+   and cannot be approved. The archive pre-checks are defence in depth only (they decide nothing
+   about content): every gzip member is read; no absolute paths, `..`, backslashes, drive/stream
+   markers, links, devices or oversize content; names are normalized as npm's `strip: 1`
+   extraction does; two entries that collide under Unicode case folding or Windows
+   trailing-dot/space folding, or an 8.3 short-name shape (`BUILD~1.JS`), are a `deny`. The
+   verified tarballs are then put into the private cache (`npm cache add <file>`) and **npm itself
+   extracts them**: `npm ci --offline --ignore-scripts` into the staging tree (`ignore-scripts` is
+   in the staged userconfig and on the command line, so no package code runs). Optional packages
+   that npm would skip on this OS/CPU are reviewed but not downloaded.
+6. **Review the extracted tree.** Every content decision is made from `node_modules/**` as npm
+   wrote it, never from the archive reader, so a disagreement between a tar reader and npm's `tar`
+   (extra gzip members, a lone zero block, directory entries with a body, pacote's
+   `.gitignore` -> `.npmignore` rename) cannot hide anything. The tree is checked against the plan:
+   every installed package directory is a lockfile entry with the same name and version, nothing
+   else is under `node_modules` (a stray directory, a dot-directory other than `.bin`, a file),
+   npm's hidden lockfile matches resolved/integrity, and any symlink or junction is a `deny`
+   (npm's own `.bin` links are not followed). Then, per installed package: its `package.json`;
+   `preinstall`/`install`/`postinstall` (plus the implicit `node-gyp rebuild` for a `binding.gyp`);
+   `prepare` and its pre/post hooks (inspected, never run); and the bounded files those commands
+   reference, resolved on disk. Lifecycle commands are tokenized as shell words (quotes, escapes,
+   `sh -c "..."` text, `;`/`&&`/`|`), and every word is resolved to a package-relative path:
+   `.//x`, `./a/../x` and `$PWD`/`${PWD}`/`$INIT_CWD`/`%cd%` prefixes normalize to the package
+   root; `*`/`?` globs match files under the package. Each path is a candidate as given and the way
+   node resolves it (`.js`, `.cjs`, `.mjs`, `.json`, `<dir>/index.*`, `<dir>/package.json` and its
+   `main`); every candidate that exists on disk is read, so the filesystem decides case and
+   trailing-dot questions. A path or `main` that escapes the package root or names an 8.3 alias
+   (trailing dots and spaces ignored) is an `unsupported_input` `deny`; a path with an unresolvable
+   `$VAR`/`$(...)`/backtick prefix is an `incomplete_scan` `deny`. `npm run|run-script <name>`,
+   `npm test|start|stop|restart`, `yarn <name>` and `pnpm <name>` are followed through the
+   package's own `scripts` map (including `pre<name>`/`post<name>`), up to 8 hops with cycle
+   detection; a chain that cannot be fully followed (`-w`/`--workspace`/`--prefix`/`-r`/`--filter`,
+   a `$`/glob script name, too deep or too wide) is an `incomplete_scan` `deny`. A referenced file
+   over 256 KiB, past 2 MiB in total, or past 32 files yields an `incomplete_scan` `deny`. The
+   scripts and files go to `scan::inspect_scripts`; the whole graph goes to
+   `scan::check_advisories`. Known malware is a `deny` before approval. Deny findings stop the
+   command; Approve findings (advisories, malware, stale or incomplete data) share one approval.
 7. **Approve.** One `ApprovalKind::Operation` request bound to a `Digest` over the reviewed plan:
    command, specs, save options, project, pinned registry, project settings, npm version, sandbox
-   setting, final `package.json` and lockfile hashes, the ordered artifacts with integrity and
-   scripts, and the findings. Any change produces a different digest. Cancel applies nothing.
+   setting, final `package.json` and lockfile hashes, the ordered artifacts with integrity,
+   scripts and the digests of the reviewed on-disk manifest and referenced files, and the
+   findings. Any change produces a different digest. Cancel applies nothing.
 8. **Scripts.** `exec::authorize_scripts` applies the FR-008 table (sandbox on: run in the
    sandbox; off: skip; off and a `node-gyp` script: separate host-once approval). Failure to
    isolate launches nothing.
-9. **Apply offline.** The project fingerprint (`package.json`, lockfile, `.npmrc`) is re-checked;
-   a change since review is `IntegrityFailure`. The verified tarballs are put into the private
-   cache (`npm cache add <file>`) and `npm ci --offline --ignore-scripts` builds the tree in a
-   scratch directory inside the project directory (same volume, so the swap is a rename). The
-   tree is checked against the plan (every installed package is in the plan with the same
-   name/version and npm's hidden lockfile matches resolved/integrity). Approved lifecycle scripts
-   then run through `sandbox::run_job` with npm's context: `npm_lifecycle_event`,
-   `npm_lifecycle_script`, `npm_package_name`, `npm_package_version`, `npm_node_execpath`,
-   `npm_execpath`, `INIT_CWD`, `.bin` directories on `PATH`, cwd = the package directory.
+9. **Run scripts in the reviewed tree.** The project fingerprint (`package.json`, lockfile,
+   `.npmrc`) is re-checked; a change since review is `IntegrityFailure`. The reviewed manifest and
+   referenced files are hashed again and must equal the digests that were approved. Approved
+   lifecycle scripts run through `sandbox::run_job` in that same staging tree, with npm's context:
+   `npm_lifecycle_event`, `npm_lifecycle_script`, `npm_package_name`, `npm_package_version`,
+   `npm_node_execpath`, `npm_execpath`, `INIT_CWD`, `.bin` directories on `PATH`, cwd = the
+   package directory. Nothing is extracted a second time. The tree's `node_modules` is then moved
+   (renamed, or copied across volumes) into a scratch directory inside the project directory.
 10. **Commit with a journal.** Original `package.json`/lockfile copies and a journal go under
     `<state>/npm/<key>/`. `node_modules` is renamed aside, the new tree renamed in, `package.json`
     and the lockfile replaced (only if changed), then the backup is deleted. A failure or a crash
