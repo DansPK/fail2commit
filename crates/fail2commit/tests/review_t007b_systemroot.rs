@@ -1,16 +1,15 @@
 #![cfg(windows)]
 
-//! Independent review reproduction for T-007b (FR-007, SPEC-007), S7B-001.
+//! Review reproduction for T-007b (FR-007, SPEC-007), S7B-002.
 //!
-//! `verify_no_loopback_exemption` launches `<SystemRoot>\System32\
-//! CheckNetIsolation.exe` to prove that the fresh AppContainer has no loopback
-//! exemption. `<SystemRoot>` comes from the process environment and the binary
-//! is executed unsandboxed with no integrity check, so a caller-controlled
-//! environment substitutes both the executable and the verdict.
+//! The pre-fix probe launched `<SystemRoot>\System32\CheckNetIsolation.exe`,
+//! taking `<SystemRoot>` from the process environment, so a caller-controlled
+//! environment substituted both the executable and the verdict. This test points
+//! `SystemRoot` at a directory holding a marker-writing stand-in and asserts:
 //!
-//! This test only proves the primitive (an environment-selected binary runs in
-//! the trusted parent while the probe is evaluating a mandatory control). It
-//! writes nothing outside disposable temp directories.
+//! * nothing from that directory is executed, and
+//! * the probe does not report the backend as available, because the process
+//!   environment disagrees with the operating system's own Windows directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,22 +45,20 @@ fn compile_stand_in(marker: &Path, dir: &Path) -> PathBuf {
 }
 
 #[test]
-fn probe_runs_an_environment_selected_binary_to_verify_the_loopback_control() {
+fn an_environment_selected_system_root_cannot_answer_the_loopback_control() {
     let real_root = real_system_root();
     let fake_root = tempfile::Builder::new()
-        .prefix("f2c-review-fake-systemroot-")
+        .prefix("fake-systemroot-")
         .tempdir()
         .expect("fake system root");
     let system32 = fake_root.path().join("System32");
     fs::create_dir_all(&system32).unwrap();
-    // The probe also stages `<SystemRoot>\System32\cmd.exe`, so the fake root
-    // has to carry a real copy for the probe to get as far as the control.
+    // A real cmd.exe, so a pre-fix probe would have got as far as the control.
     fs::copy(
         real_root.join("System32").join("cmd.exe"),
         system32.join("cmd.exe"),
     )
     .expect("stage a real cmd.exe");
-
     let marker = fake_root.path().join("hijack-marker.txt");
     let stand_in = compile_stand_in(&marker, fake_root.path());
     fs::rename(&stand_in, system32.join("CheckNetIsolation.exe")).expect("install the stand-in");
@@ -75,8 +72,16 @@ fn probe_runs_an_environment_selected_binary_to_verify_the_loopback_control() {
         report.available, report.detail, report.controls
     );
     assert!(
-        marker.exists(),
-        "the probe did not execute the SystemRoot-selected binary; detail={}",
+        !marker.exists(),
+        "the probe executed a binary from the environment-selected SystemRoot"
+    );
+    assert!(
+        !report.available,
+        "the probe reported the backend available from a caller-controlled SystemRoot"
+    );
+    assert!(
+        report.detail.contains("SystemRoot"),
+        "the refusal should name the inconsistent SystemRoot: {}",
         report.detail
     );
 }

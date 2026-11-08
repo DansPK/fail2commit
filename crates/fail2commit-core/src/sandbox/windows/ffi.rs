@@ -5,21 +5,22 @@
 //! `windows.rs` stay safe Rust. Every failure here maps to
 //! `IsolationUnavailable` because it happens before package code runs.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, LocalFree, SetHandleInformation, ERROR_PIPE_CONNECTED, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    GetLastError, LocalFree, SetHandleInformation, ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED,
+    ERROR_SHARING_VIOLATION, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+    ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W,
     GRANT_ACCESS, REVOKE_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT, TRUSTEE_IS_SID,
     TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
@@ -28,10 +29,17 @@ use windows_sys::Win32::Security::{
     TokenAppContainerSid, TokenCapabilities, TokenIsAppContainer,
     TokenIsLessPrivilegedAppContainer, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
     ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-    TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
+    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
     JobObjectAssociateCompletionPortInformation, JobObjectBasicAccountingInformation,
@@ -152,6 +160,11 @@ fn sid_to_string(sid: PSID) -> crate::Result<String> {
     Ok(s)
 }
 
+/// String form of a SID the caller still owns.
+pub(super) fn sid_text(sid: PSID) -> crate::Result<String> {
+    sid_to_string(sid)
+}
+
 /// A freshly created, uniquely named AppContainer profile. Deleted on drop.
 pub(super) struct Profile {
     name: Vec<u16>,
@@ -218,211 +231,303 @@ impl Drop for Profile {
     }
 }
 
-/// Add an allow ACE for `sid` with `mask` to the DACL of `path`. Directory
-/// grants inherit to children (the system propagates them).
-#[allow(unsafe_code)]
-pub(super) fn grant(path: &Path, sid: PSID, mask: u32, is_dir: bool) -> crate::Result<()> {
-    let path_w = wide(path.as_os_str());
-    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: `path_w` is NUL-terminated; out-pointers are valid; `sd` owns
-    // the returned DACL and is LocalFree'd below.
-    let st = unsafe {
-        GetNamedSecurityInfoW(
-            path_w.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut dacl,
-            std::ptr::null_mut(),
-            &mut sd,
-        )
-    };
-    if st != 0 {
-        return Err(crate::Error::isolation_unavailable(format!(
-            "reading ACL of {} failed: Win32 error {st}",
-            path.display()
-        )));
-    }
-    let ea = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: mask,
-        grfAccessMode: GRANT_ACCESS,
-        grfInheritance: if is_dir {
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT
-        } else {
-            NO_INHERITANCE
-        },
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.cast(),
-        },
-    };
-    let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: `ea` and `dacl` are valid for the call; `new_dacl` is a
-    // LocalAlloc'd ACL freed below.
-    let st = unsafe { SetEntriesInAclW(1, &ea, dacl, &mut new_dacl) };
-    if st != 0 {
-        local_free(sd);
-        return Err(crate::Error::isolation_unavailable(format!(
-            "building ACL for {} failed: Win32 error {st}",
-            path.display()
-        )));
-    }
-    // SAFETY: `new_dacl` is a valid ACL from SetEntriesInAclW.
-    let st = unsafe {
-        SetNamedSecurityInfoW(
-            path_w.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            new_dacl,
-            std::ptr::null(),
-        )
-    };
-    local_free(new_dacl);
-    local_free(sd);
-    if st != 0 {
-        return Err(crate::Error::isolation_unavailable(format!(
-            "writing ACL of {} failed: Win32 error {st}",
-            path.display()
-        )));
-    }
-    Ok(())
+/// One staged file or directory, addressed by an open handle.
+///
+/// Every ACL read and write in this backend runs through a handle opened with
+/// `FILE_FLAG_OPEN_REPARSE_POINT`, so a reparse point can never redirect a
+/// grant, and the identity of the object is fixed before its DACL is touched.
+/// `GetFileInformationByHandle` reports the link count and attribute bits for
+/// exactly that object, and `GetFinalPathNameByHandleW` reports where it really
+/// lives, which the caller compares against the stage root.
+pub(super) struct StagedObject {
+    handle: OwnedHandle,
+    path: PathBuf,
+    attributes: u32,
+    links: u32,
 }
 
-/// Remove every explicit allow ACE for this operation's unique AppContainer
-/// SID from one staged path. Cleanup is best-effort from `StagingGrants::drop`.
-#[allow(unsafe_code)]
-pub(super) fn revoke(path: &Path, sid: PSID) -> crate::Result<()> {
-    let path_w = wide(path.as_os_str());
-    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: NUL-terminated path and valid out-pointers; `sd` owns `dacl`.
-    let st = unsafe {
-        GetNamedSecurityInfoW(
-            path_w.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut dacl,
-            std::ptr::null_mut(),
-            &mut sd,
-        )
-    };
-    if st != 0 {
-        return Err(crate::Error::isolation_unavailable(format!(
-            "reading ACL for cleanup of {} failed: Win32 error {st}",
-            path.display()
-        )));
+impl StagedObject {
+    /// Open `path` without following a reparse point. `READ_CONTROL` and
+    /// `WRITE_DAC` are requested because every ACL call below needs them on
+    /// the object itself; `FILE_READ_ATTRIBUTES` feeds
+    /// `GetFileInformationByHandle`.
+    #[allow(unsafe_code)]
+    pub(super) fn open(path: &Path) -> crate::Result<StagedObject> {
+        let path_w = wide(path.as_os_str());
+        // SAFETY: `path_w` is NUL-terminated; the returned handle is owned by
+        // the `OwnedHandle` below and closed exactly once.
+        let h = unsafe {
+            CreateFileW(
+                path_w.as_ptr(),
+                READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "opening staged path {} failed: {}",
+                path.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        let handle = owned(h);
+        // SAFETY: `info` is a correctly sized out-struct for the call and the
+        // handle is live for the duration.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(raw(&handle), &mut info) } == 0 {
+            return Err(unavailable("GetFileInformationByHandle"));
+        }
+        Ok(StagedObject {
+            handle,
+            path: path.to_path_buf(),
+            attributes: info.dwFileAttributes,
+            links: info.nNumberOfLinks,
+        })
     }
-    let ea = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: 0,
-        grfAccessMode: REVOKE_ACCESS,
-        grfInheritance: NO_INHERITANCE,
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.cast(),
-        },
-    };
-    let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: valid ACL and explicit-access entry; output is LocalAlloc'd.
-    let st = unsafe { SetEntriesInAclW(1, &ea, dacl, &mut new_dacl) };
-    if st != 0 {
-        local_free(sd);
-        return Err(crate::Error::isolation_unavailable(format!(
-            "building cleanup ACL for {} failed: Win32 error {st}",
-            path.display()
-        )));
-    }
-    // SAFETY: `new_dacl` is valid until freed below.
-    let st = unsafe {
-        SetNamedSecurityInfoW(
-            path_w.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            new_dacl,
-            std::ptr::null(),
-        )
-    };
-    local_free(new_dacl);
-    local_free(sd);
-    if st != 0 {
-        return Err(crate::Error::isolation_unavailable(format!(
-            "writing cleanup ACL of {} failed: Win32 error {st}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
 
-/// The union of allow-ACE masks for `sid` in the DACL of `path`.
-#[allow(unsafe_code)]
-pub(super) fn allowed_mask(path: &Path, sid: PSID) -> crate::Result<u32> {
-    let path_w = wide(path.as_os_str());
-    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-    let mut dacl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: as in `grant`.
-    let st = unsafe {
-        GetNamedSecurityInfoW(
-            path_w.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut dacl,
-            std::ptr::null_mut(),
-            &mut sd,
-        )
-    };
-    if st != 0 || dacl.is_null() {
-        local_free(sd);
-        return Err(crate::Error::isolation_unavailable(
-            "reading back staging ACL",
-        ));
+    pub(super) fn path(&self) -> &Path {
+        &self.path
     }
-    let mut mask = 0u32;
-    // SAFETY: `info` is a correctly sized out-struct for AclSizeInformation;
-    // GetAce returns pointers into `dacl`, which lives until `sd` is freed;
-    // allow ACEs carry their SID inline starting at `SidStart`.
-    unsafe {
-        let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
-        if GetAclInformation(
-            dacl,
-            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        ) != 0
-        {
-            for i in 0..info.AceCount {
-                let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-                if GetAce(dacl, i, &mut ace) == 0 || ace.is_null() {
-                    continue;
-                }
-                let header = &*(ace as *const ACE_HEADER);
-                if header.AceType != 0 {
-                    continue; // only ACCESS_ALLOWED_ACE_TYPE
-                }
-                let allowed = ace as *const ACCESS_ALLOWED_ACE;
-                let ace_sid = std::ptr::addr_of!((*allowed).SidStart) as PSID;
-                if EqualSid(ace_sid, sid) != 0 {
-                    mask |= (*allowed).Mask;
+
+    pub(super) fn is_dir(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+
+    pub(super) fn is_reparse_point(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    /// Number of directory entries that name this file object. A hard link
+    /// makes this exceed one without any reparse attribute.
+    pub(super) fn link_count(&self) -> u32 {
+        self.links
+    }
+
+    /// Canonical path of the object this handle refers to, in the same
+    /// extended-length form `std::fs::canonicalize` returns.
+    #[allow(unsafe_code)]
+    pub(super) fn final_path(&self) -> crate::Result<PathBuf> {
+        let mut buf = vec![0u16; 260];
+        loop {
+            // SAFETY: the buffer is valid for `buf.len()` UTF-16 units and the
+            // handle is live; the call writes at most that many units.
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    raw(&self.handle),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                )
+            };
+            if len == 0 {
+                return Err(unavailable("GetFinalPathNameByHandleW"));
+            }
+            if (len as usize) < buf.len() {
+                return Ok(PathBuf::from(OsString::from_wide(&buf[..len as usize])));
+            }
+            buf.resize(len as usize + 1, 0);
+        }
+    }
+
+    /// Add an allow ACE for `sid` with `mask` to this object's DACL. A
+    /// directory gets an inheritable ACE; the caller also walks children.
+    ///
+    /// A NULL DACL means "everyone has full access"; adding an explicit entry
+    /// would replace that with a package-only list and drop the owner's own
+    /// access, so it is refused before anything is written.
+    #[allow(unsafe_code)]
+    pub(super) fn grant(&self, sid: PSID, mask: u32) -> crate::Result<()> {
+        let (sd, dacl) = self.dacl()?;
+        if dacl.is_null() {
+            local_free(sd);
+            return Err(crate::Error::isolation_unavailable(format!(
+                "staged path has a NULL DACL (unrestricted access); refusing to replace it: {}",
+                self.path.display()
+            )));
+        }
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: mask,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: if self.is_dir() {
+                SUB_CONTAINERS_AND_OBJECTS_INHERIT
+            } else {
+                NO_INHERITANCE
+            },
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: sid.cast(),
+            },
+        };
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `ea` and `dacl` are valid for the call; `new_dacl` is a
+        // LocalAlloc'd ACL freed below.
+        let st = unsafe { SetEntriesInAclW(1, &ea, dacl, &mut new_dacl) };
+        if st != 0 {
+            local_free(sd);
+            return Err(crate::Error::isolation_unavailable(format!(
+                "building ACL for {} failed: Win32 error {st}",
+                self.path.display()
+            )));
+        }
+        // SAFETY: `new_dacl` is a valid ACL from SetEntriesInAclW and the
+        // handle was opened with WRITE_DAC for exactly this object.
+        let st = unsafe {
+            SetSecurityInfo(
+                raw(&self.handle),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                new_dacl,
+                std::ptr::null(),
+            )
+        };
+        local_free(new_dacl);
+        local_free(sd);
+        if st != 0 {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "writing ACL of {} failed: Win32 error {st}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Remove every explicit entry for `sid` from this object's DACL.
+    #[allow(unsafe_code)]
+    pub(super) fn revoke(&self, sid: PSID) -> crate::Result<()> {
+        let (sd, dacl) = self.dacl()?;
+        if dacl.is_null() {
+            // A NULL DACL names nobody: there is nothing to remove.
+            local_free(sd);
+            return Ok(());
+        }
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: 0,
+            grfAccessMode: REVOKE_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: sid.cast(),
+            },
+        };
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: valid ACL and explicit-access entry; output is LocalAlloc'd.
+        let st = unsafe { SetEntriesInAclW(1, &ea, dacl, &mut new_dacl) };
+        if st != 0 {
+            local_free(sd);
+            return Err(crate::Error::isolation_unavailable(format!(
+                "building cleanup ACL for {} failed: Win32 error {st}",
+                self.path.display()
+            )));
+        }
+        // SAFETY: `new_dacl` is valid until freed below and the handle was
+        // opened with WRITE_DAC for this object.
+        let st = unsafe {
+            SetSecurityInfo(
+                raw(&self.handle),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                new_dacl,
+                std::ptr::null(),
+            )
+        };
+        local_free(new_dacl);
+        local_free(sd);
+        if st != 0 {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "writing cleanup ACL of {} failed: Win32 error {st}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The union of allow-ACE masks for `sid` in this object's DACL.
+    #[allow(unsafe_code)]
+    pub(super) fn allowed_mask(&self, sid: PSID) -> crate::Result<u32> {
+        let (sd, dacl) = self.dacl()?;
+        if dacl.is_null() {
+            local_free(sd);
+            return Err(crate::Error::isolation_unavailable(format!(
+                "staged path has a NULL DACL; access cannot be read back: {}",
+                self.path.display()
+            )));
+        }
+        let mut mask = 0u32;
+        // SAFETY: `info` is a correctly sized out-struct for AclSizeInformation;
+        // GetAce returns pointers into `dacl`, which lives until `sd` is freed;
+        // allow ACEs carry their SID inline starting at `SidStart`.
+        unsafe {
+            let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+            if GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            ) != 0
+            {
+                for i in 0..info.AceCount {
+                    let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                    if GetAce(dacl, i, &mut ace) == 0 || ace.is_null() {
+                        continue;
+                    }
+                    let header = &*(ace as *const ACE_HEADER);
+                    if header.AceType != 0 {
+                        continue; // only ACCESS_ALLOWED_ACE_TYPE
+                    }
+                    let allowed = ace as *const ACCESS_ALLOWED_ACE;
+                    let ace_sid = std::ptr::addr_of!((*allowed).SidStart) as PSID;
+                    if EqualSid(ace_sid, sid) != 0 {
+                        mask |= (*allowed).Mask;
+                    }
                 }
             }
         }
+        local_free(sd);
+        Ok(mask)
     }
-    local_free(sd);
-    Ok(mask)
+
+    /// Read this object's DACL. The returned descriptor owns `dacl` and must be
+    /// released with `local_free`.
+    #[allow(unsafe_code)]
+    fn dacl(&self) -> crate::Result<(PSECURITY_DESCRIPTOR, *mut ACL)> {
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: live handle; every returned pointer belongs to `sd`.
+        let st = unsafe {
+            GetSecurityInfo(
+                raw(&self.handle),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if st != 0 || sd.is_null() {
+            local_free(sd);
+            return Err(crate::Error::isolation_unavailable(format!(
+                "reading ACL of {} failed: Win32 error {st}",
+                self.path.display()
+            )));
+        }
+        Ok((sd, dacl))
+    }
 }
 
 /// Job Object owning the sandboxed process tree, with a completion port for
@@ -556,23 +661,34 @@ impl Job {
         Ok(info.ActiveProcesses)
     }
 
+    /// Terminate every process in the job. The result is checked: a failed
+    /// termination must not be reported as a clean timeout.
     #[allow(unsafe_code)]
-    pub(super) fn terminate(&self) -> bool {
+    pub(super) fn terminate(&self) -> crate::Result<()> {
         // SAFETY: live job handle owned by self.
-        unsafe { TerminateJobObject(raw(&self.handle), 1) != 0 }
+        if unsafe { TerminateJobObject(raw(&self.handle), 1) } == 0 {
+            return Err(unavailable("TerminateJobObject"));
+        }
+        Ok(())
     }
 
-    /// Wait until kernel accounting reports that every process in the job
-    /// has exited. Job handles are not waitable objects; waiting directly on
-    /// one can block forever even when `ActiveProcesses` is already zero.
-    pub(super) fn wait_empty(&self) {
-        loop {
-            if self.active_processes().is_ok_and(|active| active == 0)
-                || self.next_message(25) == Some(MSG_ACTIVE_PROCESS_ZERO)
-            {
-                return;
+    /// Wait until kernel accounting reports that every process in the job has
+    /// exited, giving up at `deadline`. Job handles are not waitable objects;
+    /// waiting directly on one can block forever even when `ActiveProcesses`
+    /// is already zero. A query error and an expired deadline are errors, so a
+    /// caller can never mistake them for a stopped tree.
+    pub(super) fn wait_empty(&self, deadline: Instant) -> crate::Result<()> {
+        while Instant::now() < deadline {
+            if self.active_processes()? == 0 {
+                return Ok(());
+            }
+            if self.next_message(25) == Some(MSG_ACTIVE_PROCESS_ZERO) {
+                return Ok(());
             }
         }
+        Err(crate::Error::isolation_unavailable(
+            "sandbox processes did not stop before the cleanup deadline",
+        ))
     }
 
     /// Next job notification for this job, waiting at most `ms`.
@@ -621,14 +737,30 @@ pub(super) struct Spawned {
 }
 
 impl Spawned {
-    /// Kill a suspended or running root process and wait for it.
+    /// Kill a suspended or running root process and wait for it to exit.
+    /// Both results are checked so a leaked process is never silent.
     #[allow(unsafe_code)]
-    pub(super) fn kill(&self) {
-        // SAFETY: live process handle owned by self.
-        unsafe {
-            TerminateProcess(raw(&self.process), 1);
-            WaitForSingleObject(raw(&self.process), 10_000);
+    pub(super) fn kill(&self) -> crate::Result<()> {
+        // SAFETY: live process handle owned by self; the error is read
+        // immediately after the failing call.
+        let terminated = unsafe { TerminateProcess(raw(&self.process), 1) } != 0;
+        let err = unsafe { GetLastError() };
+        // SAFETY: live process handle; WAIT_OBJECT_0 is 0.
+        let waited = unsafe { WaitForSingleObject(raw(&self.process), 5_000) };
+        if waited != 0 {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "waiting for the sandbox root process to stop failed: {}",
+                io::Error::from_raw_os_error(err as i32)
+            )));
         }
+        // ERROR_ACCESS_DENIED means the process had already exited.
+        if !terminated && err != ERROR_ACCESS_DENIED {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "TerminateProcess on the sandbox root process failed: {}",
+                io::Error::from_raw_os_error(err as i32)
+            )));
+        }
+        Ok(())
     }
 
     #[allow(unsafe_code)]
@@ -899,4 +1031,332 @@ pub(super) fn pipe_has_client(h: &OwnedHandle) -> bool {
     let ok = unsafe { ConnectNamedPipe(raw(h), std::ptr::null_mut()) };
     // SAFETY: read immediately after the call.
     ok != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED
+}
+
+// ---------------------------------------------------------------------------
+// Operating-system facts. These are resolved from the OS, never from the
+// process environment, so a caller-controlled environment cannot steer where a
+// grant is written or which binary answers a control question (S7B-002,
+// S7B-003). The windows-sys feature set pinned by the coordinator does not
+// include `Win32_System_SystemInformation` or `Win32_UI_Shell`, so the four
+// entry points are declared here exactly like the `userenv` block above.
+// ---------------------------------------------------------------------------
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    fn LoadLibraryW(name: *const u16) -> HANDLE;
+    fn GetProcAddress(module: HANDLE, name: *const u8) -> *mut core::ffi::c_void;
+    fn FreeLibrary(module: HANDLE) -> i32;
+    fn GetProcessHeap() -> HANDLE;
+    fn HeapFree(heap: HANDLE, flags: u32, memory: *mut core::ffi::c_void) -> i32;
+}
+
+#[repr(C)]
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+/// `FOLDERID_LocalAppData` and `FOLDERID_Profile` (knownfolders.h).
+const FOLDERID_LOCAL_APPDATA: Guid = Guid {
+    data1: 0xF1B3_2785,
+    data2: 0x6FBA,
+    data3: 0x4FCF,
+    data4: [0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91],
+};
+const FOLDERID_PROFILE: Guid = Guid {
+    data1: 0x5E6C_858F,
+    data2: 0x0E22,
+    data3: 0x4760,
+    data4: [0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73],
+};
+
+#[link(name = "shell32")]
+extern "system" {
+    fn SHGetKnownFolderPath(
+        folder: *const Guid,
+        flags: u32,
+        token: HANDLE,
+        path: *mut *mut u16,
+    ) -> i32;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    fn CoTaskMemFree(memory: *mut core::ffi::c_void);
+}
+
+/// A `u32` count of UTF-16 units is plenty for any system path.
+#[allow(unsafe_code)]
+fn system_path(
+    call: unsafe extern "system" fn(*mut u16, u32) -> u32,
+    what: &str,
+) -> crate::Result<PathBuf> {
+    let mut buf = vec![0u16; 512];
+    // SAFETY: the buffer is valid for `buf.len()` UTF-16 units and the callee
+    // writes at most that many; a return value of zero means failure.
+    let len = unsafe { call(buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 {
+        return Err(unavailable(what));
+    }
+    let len = len as usize;
+    if len > buf.len() {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "{what} reported an implausible length {len}"
+        )));
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buf[..len])))
+}
+
+/// `<Windows>\System32`, as the operating system reports it.
+pub(super) fn system_directory() -> crate::Result<PathBuf> {
+    system_path(GetSystemDirectoryW, "GetSystemDirectoryW")
+}
+
+/// The Windows directory, as the operating system reports it. This is the
+/// trusted source for the child's `SystemRoot`.
+pub(super) fn windows_directory() -> crate::Result<PathBuf> {
+    system_path(GetSystemWindowsDirectoryW, "GetSystemWindowsDirectoryW")
+}
+
+#[allow(unsafe_code)]
+fn known_folder(folder: &Guid, what: &str) -> crate::Result<PathBuf> {
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `folder` is a valid GUID constant; the callee allocates a
+    // NUL-terminated string with CoTaskMemAlloc, freed below.
+    let hr = unsafe { SHGetKnownFolderPath(folder, 0, std::ptr::null_mut(), &mut raw) };
+    if hr < 0 || raw.is_null() {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "SHGetKnownFolderPath({what}) failed: HRESULT 0x{:08X}",
+            hr as u32
+        )));
+    }
+    let mut len = 0usize;
+    // SAFETY: the string is NUL-terminated by the callee.
+    let path = unsafe {
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+        PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(raw, len)))
+    };
+    // SAFETY: `raw` came from CoTaskMemAlloc and is freed exactly once.
+    unsafe { CoTaskMemFree(raw.cast()) };
+    Ok(path)
+}
+
+/// The user's `%LOCALAPPDATA%` as a known folder, not as an environment value.
+pub(super) fn known_local_app_data() -> crate::Result<PathBuf> {
+    known_folder(&FOLDERID_LOCAL_APPDATA, "FOLDERID_LocalAppData")
+}
+
+/// The user profile directory as a known folder.
+pub(super) fn known_user_profile() -> crate::Result<PathBuf> {
+    known_folder(&FOLDERID_PROFILE, "FOLDERID_Profile")
+}
+
+/// AppContainer SIDs that the operating system currently allows to send
+/// loopback traffic (`NetworkIsolationGetAppContainerConfig` in
+/// FirewallAPI.dll, the same configuration `CheckNetIsolation LoopbackExempt`
+/// edits). No process is launched and no environment value is consulted; a
+/// missing export or a failing call is an error, so the caller fails closed.
+#[allow(unsafe_code)]
+pub(super) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
+    type GetConfig = unsafe extern "system" fn(*mut u32, *mut *mut SID_AND_ATTRIBUTES) -> u32;
+    let library = wide(OsStr::new("FirewallAPI.dll"));
+    // SAFETY: NUL-terminated module name; the loaded module is freed below.
+    let module = unsafe { LoadLibraryW(library.as_ptr()) };
+    if module.is_null() {
+        return Err(unavailable("LoadLibraryW(FirewallAPI.dll)"));
+    }
+    // SAFETY: NUL-terminated export name in a C string literal; the module is
+    // still loaded.
+    let proc = unsafe {
+        GetProcAddress(
+            module,
+            c"NetworkIsolationGetAppContainerConfig".as_ptr().cast(),
+        )
+    };
+    if proc.is_null() {
+        // SAFETY: `module` is a live module handle from LoadLibraryW.
+        unsafe { FreeLibrary(module) };
+        return Err(crate::Error::isolation_unavailable(
+            "FirewallAPI.dll does not export NetworkIsolationGetAppContainerConfig",
+        ));
+    }
+    // SAFETY: the export has the documented signature for this name.
+    let get_config: GetConfig = unsafe { std::mem::transmute(proc) };
+    let mut count = 0u32;
+    let mut sids: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
+    // SAFETY: both out-parameters are valid; the callee allocates the array
+    // from the process heap and every SID inside it.
+    let status = unsafe { get_config(&mut count, &mut sids) };
+    let mut out = Vec::new();
+    if status == 0 && !sids.is_null() {
+        // SAFETY: the callee guarantees `count` valid entries when it succeeds.
+        for i in 0..count as usize {
+            let entry = unsafe { &*sids.add(i) };
+            if entry.Sid.is_null() {
+                continue;
+            }
+            if let Ok(sid) = sid_to_string(entry.Sid) {
+                out.push(sid);
+            }
+        }
+        // SAFETY: the documented sample frees each SID and then the array with
+        // HeapFree(GetProcessHeap(), ...).
+        unsafe {
+            let heap = GetProcessHeap();
+            for i in 0..count as usize {
+                let entry = &*sids.add(i);
+                if !entry.Sid.is_null() {
+                    HeapFree(heap, 0, entry.Sid.cast());
+                }
+            }
+            HeapFree(heap, 0, sids.cast());
+        }
+    }
+    // SAFETY: `module` is a live module handle from LoadLibraryW.
+    unsafe { FreeLibrary(module) };
+    if status != 0 {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "NetworkIsolationGetAppContainerConfig failed: Win32 error {status}"
+        )));
+    }
+    Ok(out)
+}
+
+/// A SID owned through `LocalFree`, for SIDs parsed back from a state file.
+pub(super) struct OwnedSid(PSID);
+
+impl OwnedSid {
+    pub(super) fn as_psid(&self) -> PSID {
+        self.0
+    }
+}
+
+impl Drop for OwnedSid {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: `self.0` came from ConvertStringSidToSidW (LocalAlloc) and is
+        // freed exactly once.
+        local_free(self.0);
+    }
+}
+
+/// Parse a string SID (`S-1-15-2-...`).
+#[allow(unsafe_code)]
+pub(super) fn sid_from_string(text: &str) -> crate::Result<OwnedSid> {
+    let text_w = wide(OsStr::new(text));
+    let mut sid: PSID = std::ptr::null_mut();
+    // SAFETY: NUL-terminated input; `sid` is a LocalAlloc'd SID owned by the
+    // returned `OwnedSid`.
+    if unsafe { ConvertStringSidToSidW(text_w.as_ptr(), &mut sid) } == 0 || sid.is_null() {
+        return Err(unavailable("ConvertStringSidToSidW"));
+    }
+    Ok(OwnedSid(sid))
+}
+
+/// Open a file read-only with a share mode that keeps the object alive while
+/// any other handle (including an inherited one in a child) is open, and with
+/// `bInheritHandle` set.
+#[allow(unsafe_code)]
+pub(super) fn open_inheritable(path: &Path) -> crate::Result<OwnedHandle> {
+    let path_w = wide(path.as_os_str());
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    // SAFETY: NUL-terminated path and valid attributes; the returned handle is
+    // owned by the caller and closed once.
+    let h = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "opening the inheritance canary {} failed: {}",
+            path.display(),
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(owned(h))
+}
+
+/// True when `path` can be opened exclusively (share mode 0), that is, when no
+/// other handle to that file object exists anywhere in the system. A child that
+/// inherited an unlisted handle keeps the object open, so this fails with
+/// `ERROR_SHARING_VIOLATION`: a direct measurement of the explicit stdio handle
+/// list rather than an inference from the spawn call.
+#[allow(unsafe_code)]
+pub(super) fn exclusive_open_succeeds(path: &Path) -> crate::Result<bool> {
+    let path_w = wide(path.as_os_str());
+    // SAFETY: NUL-terminated path; a successful handle is closed immediately.
+    let h = unsafe {
+        CreateFileW(
+            path_w.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if h != INVALID_HANDLE_VALUE {
+        drop(owned(h));
+        return Ok(true);
+    }
+    // SAFETY: read immediately after the failing call.
+    let err = unsafe { GetLastError() };
+    if err == ERROR_SHARING_VIOLATION {
+        return Ok(false);
+    }
+    Err(crate::Error::isolation_unavailable(format!(
+        "exclusive open of {} failed: {}",
+        path.display(),
+        io::Error::from_raw_os_error(err as i32)
+    )))
+}
+
+/// Replace a staged object's DACL with a NULL DACL. Test-only: it exists to
+/// prove `StagedObject::grant` refuses that case instead of rewriting it
+/// (S7B-007). Only ever called on a disposable path inside the stage root.
+#[cfg(test)]
+#[allow(unsafe_code)]
+pub(super) fn set_null_dacl_for_tests(path: &Path) -> crate::Result<()> {
+    use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+
+    let path_w = wide(path.as_os_str());
+    // SAFETY: NUL-terminated path; a null DACL pointer is the documented way to
+    // write "no access control", and this is only reachable from tests.
+    let st = unsafe {
+        SetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if st != 0 {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "setting a NULL DACL on {} failed: Win32 error {st}",
+            path.display()
+        )));
+    }
+    Ok(())
 }

@@ -90,3 +90,62 @@ The dependency review used the resolved registry sources for `sandboxrs-windows-
 
 - [ ] **Verified:** all linked TCs pass; requirement status set to `Verified`
 - [x] **Not verified:** Windows offline controls pass, but live external TCP and a full staged GCC build remain Pending; Linux evidence is outside T-007b and was explicitly deferred.
+
+---
+
+## 7. Fix pass for review findings S7B-001..013 (2026-11-09)
+
+> **Branch:** `DansPK/f2c-fix-t007b` (this worktree); final SHA in
+> `docs/verify/FIX-T007B-SUMMARY.md`
+> **Findings addressed:** `docs/verify/REVIEW-2026-11-09-t007b.md` §2, S7B-001..013
+> **Author:** T-007b fix pass (a different agent from the reviewer and the original author)
+
+Every finding was fixed rather than re-documented. Two findings changed the *product* contract and are
+recorded as change requests for the coordinator:
+
+1. **CHANGE REQUEST (stager contract, from S7B-003).** A job stage must now be a direct child of
+   `<TrustedPaths::cache_dir>/sandbox-stage`. T-004, T-005, T-008 and `fail2commit run` must create
+   stages there; a stage anywhere else (including `%TEMP%`) is refused with `IsolationUnavailable`.
+   Documented in `docs/sandbox-windows.md` §2 because `sandbox/mod.rs` belongs to T-007a.
+2. **CHANGE REQUEST (T-009 coupling, from S7B-005).** The probe measures the approval pipe against the
+   tray's DACL shape reproduced locally in `windows.rs`
+   (`fail2commit-approval-<SID>-probe-<nonce>`). When `ipc/winsec.rs` lands, both places must carry the
+   same SDDL, or it must move to a shared coordinator-owned constant.
+| Finding | Status | Fix | Evidence on this host |
+|---|---|---|---|
+| S7B-001 | Fixed | `StagedObject` opens each staged path with `FILE_FLAG_OPEN_REPARSE_POINT`, rejects reparse points and files with `nNumberOfLinks != 1`, requires `GetFinalPathNameByHandleW` to stay under the stage root, and grants/revokes through that handle with `SetSecurityInfo`/`GetSecurityInfo`. The pre-grant walk also rejects links. | `review_t007b_paths::hard_link_inside_staged_tree_is_rejected` (also compares the outside file's `icacls` DACL before and after), `review_t007b_paths::junction_inside_staged_tree_is_rejected`, `review_t007b_paths::a_read_only_root_from_another_stage_is_rejected`, `windows::tests::a_hard_link_in_the_stage_is_rejected_before_any_grant` |
+| S7B-002 | Fixed | System32 comes from `GetSystemDirectoryW`; the child's `SystemRoot` comes from `GetSystemWindowsDirectoryW` and a disagreeing process `SystemRoot` is refused. The loopback control reads `NetworkIsolationGetAppContainerConfig` from FirewallAPI.dll dynamically: no process launch, no environment input, fail-closed errors. | `windows::tests::host_probe_verifies_every_mandatory_control`, `review_t007b_systemroot::an_environment_selected_system_root_cannot_answer_the_loopback_control` |
+| S7B-003 | Fixed | Stage root is `<cache_dir>/sandbox-stage`; LOCALAPPDATA and profile anchors come from `SHGetKnownFolderPath`; refusal rules in `docs/sandbox-windows.md` §2; `std::env::temp_dir()` is not referenced anywhere in the backend. | `review_t007b_tempdir::temp_dir_anchor_is_not_used` (caller-selected `TMP`/`TEMP` and the profile fallback are both refused and the caller directory's `icacls` DACL is unchanged), `windows::tests::a_work_dir_outside_the_stage_root_is_rejected` |
+| S7B-004 | Fixed | `Job::terminate` returns a checked result; `Job::wait_empty(deadline)` and `collect_drain(deadline, ...)` bound every post-run wait; a surviving tree is an error, never a success. `Spawned::kill` is checked too. | `windows::tests::a_drain_that_misses_its_deadline_is_an_error`, `windows::tests::a_drain_that_reports_in_time_returns_its_bytes`, `process_memory_time_and_output_limits_are_enforced` (timeout path) |
+| S7B-005 | Fixed | No permanent probe cache: a positive verdict lives at most 30 s and only for an identical environment fingerprint. Handle containment is now *measured* (inheritable canary plus an exclusive-open check before resume) instead of inferred. Approval IPC is measured against the tray DACL shape and pipe-name pattern. | `windows::tests::a_second_probe_reuses_a_short_lived_positive_verdict`, `sandbox_windows_matrix::explicit_handle_list_excludes_an_inheritable_secret_handle`, `windows::tests::host_probe_verifies_every_mandatory_control` (APPROVAL-DENIED / DEFAULT-DENIED markers plus "no client") |
+| S7B-006 | Fixed | `StagingGrants::release` reports every revoke failure: stderr log, `<stage root>/pending-revoke.json` record under a file lock, and `IsolationUnavailable` for the operation. `clear_pending_revokes` runs at the start of `probe()`/`run()` and refuses while a record remains. | `windows::tests::stale_revoke_state_blocks_the_next_operation_until_it_is_cleared`, `windows::tests::a_recorded_revoke_failure_is_cleared_once_the_object_is_gone` |
+| S7B-007 | Fixed | A NULL DACL is refused before any write, in `grant`, in `revoke` (nothing to remove) and in `allowed_mask` (cannot read back). | `windows::tests::a_null_dacl_is_refused_before_any_write` (sets a NULL DACL on a disposable staged file and requires the refusal) |
+| S7B-008 | Fixed | `SystemRoot`/`SystemDrive` come from the OS; `LOCALAPPDATA` is `<work_dir>\localappdata` unless the caller already points it inside the work dir. Required variables documented. | `sandbox_windows_matrix::clean_environment_and_native_workload_succeed` (fixture requires `PATH` absent, allowlist present and `LOCALAPPDATA` based inside the work dir), probe `LAD=` marker check |
+| S7B-009 | Fixed (reported) | Dead reference removed; no API of `sandboxrs-windows 0.1.1` is used. `docs/sandbox-windows.md` §1 lists each candidate API with source citations and the reason it was rejected, for the coordinator's dependency decision. `Cargo.toml` untouched. | Documentation review only; `cargo clippy --workspace --all-targets -D warnings` still passes with the crate unused. |
+| S7B-010 | Fixed | The disabled/unavailable case drives the FR-008 decision table through a launcher that *really* executes the package code and counts calls, with a positive control proving the marker appears when the gate allows it. | `sandbox_windows_matrix::disabled_and_unavailable_policy_never_launches_package_code` |
+| S7B-011 | Fixed | The helper records the Git outcome (`git_version`, `git_ls_remote`) in a report file; the test asserts Git cannot read a disposable bare remote outside the stage, after proving unsandboxed that the same remote *is* readable. | `sandbox_windows_matrix::parent_and_grandchild_cannot_reach_network_secret_checkout_or_git` |
+| S7B-012 | Fixed | The handle canary is a real inheritable handle to a synthetic secret outside the granted roots; the child must fail `ReadFile` with exactly `ERROR_INVALID_HANDLE`, the parent clears the inheritance flag afterwards, and the secret is compared before and after. | `sandbox_windows_matrix::explicit_handle_list_excludes_an_inheritable_secret_handle` |
+| S7B-013 | Fixed | `probe()` performs exactly one sandboxed launch, starts no external process, and is covered by a 30 s positive-verdict TTL. Measured: cold probe about 4.1 s (dominated by the timeout it measures), cached probe 0.4-0.5 ms. | `windows::tests::a_second_probe_reuses_a_short_lived_positive_verdict`, `sandbox_windows_matrix::probe_verifies_every_control_in_one_launch_and_then_reuses_it_briefly` |
+### Commands and exit codes for this section
+
+```text
+cargo fmt --all -- --check
+# exit 0
+cargo clippy --workspace --all-targets -j 2 -- -D warnings
+# exit 0
+cargo test -j 2 -p fail2commit-core
+# exit 0; 25 passed; 0 failed (sandbox::windows::tests: 10 passed)
+cargo test -j 2 -p fail2commit --test sandbox_windows_matrix --test review_t007b_paths --test review_t007b_tempdir --test review_t007b_systemroot
+# exit 0; matrix 6 passed / 1 ignored; paths 3 passed; tempdir 1 passed; systemroot 1 passed
+python .claude/hooks/trace_check.py
+# exit 0
+```
+
+Limitations of this fix pass:
+
+* The termination-failure branches (a `TerminateJobObject` error, a process that survives termination)
+  cannot be forced on a live Job Object without kernel-level tricks. They are covered by deadline unit
+  tests and checked return values rather than by an injected fault.
+* The approval-pipe DACL is reproduced locally; reconciling it with `ipc/winsec.rs` is the recorded
+  change request above.
+* The live external endpoint and the full staged GCC closure remain pending exactly as in §3.

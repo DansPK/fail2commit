@@ -1,10 +1,15 @@
-//! Standalone Windows helper compiled by `sandbox_windows_matrix.rs`.
-//! It has no third-party dependencies and never prints secret contents.
+//! Standalone Windows helper compiled by `sandbox_windows_matrix.rs` and the
+//! review regression tests. It has no third-party dependencies and never prints
+//! secret contents.
+//!
+//! Every outcome a test needs to assert is written to a report file the test
+//! passes in, so a discarded result can never look like a pass.
 
 #![cfg(windows)]
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::process::{self, Command};
 use std::time::Duration;
@@ -15,8 +20,9 @@ fn main() {
         Some("hostile-parent") => hostile(&args, true),
         Some("hostile-child") => hostile(&args, false),
         Some("native-work") => native_work(&args),
-        Some("environment") => environment(),
+        Some("environment") => environment(&args),
         Some("read-handle") => read_handle(&args),
+        Some("create-marker") => create_marker(&args),
         Some("allocate") => allocate(),
         Some("spawn-many") => spawn_many(),
         Some("noisy") => noisy(),
@@ -27,37 +33,87 @@ fn main() {
     process::exit(if ok { 0 } else { 71 });
 }
 
+fn report(path: &str, label: &str, check: &str, value: &str) {
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{label}:{check}={value}");
+    }
+}
+
 fn hostile(args: &[String], spawn_child: bool) -> bool {
-    if args.len() != 7 {
+    if args.len() != 9 {
+        eprintln!("hostile: expected 9 arguments, got {}", args.len());
         return false;
     }
+    let label = if spawn_child { "parent" } else { "child" };
     let secret = &args[2];
     let checkout = &args[3];
     let local: SocketAddr = match args[4].parse() {
         Ok(addr) => addr,
-        Err(_) => return false,
+        Err(error) => {
+            eprintln!("hostile: bad address {:?}: {error}", args[4]);
+            return false;
+        }
     };
     let git = &args[5];
-    let marker = &args[6];
+    let git_remote = &args[6];
+    let launch_marker = &args[7];
+    let report_path = &args[8];
 
     let mut denied = true;
-    for (label, result) in [
+    for (name, result) in [
         (
             "tcp",
             TcpStream::connect_timeout(&local, Duration::from_millis(300)).is_err(),
         ),
         ("secret", fs::read(secret).is_err()),
         ("checkout", fs::write(checkout, b"sandbox escape").is_err()),
-        ("marker", !std::path::Path::new(marker).exists()),
+        ("marker", !std::path::Path::new(launch_marker).exists()),
     ] {
+        report(
+            report_path,
+            label,
+            name,
+            if result { "denied" } else { "OPEN" },
+        );
         if !result {
-            eprintln!("unexpected access: {label}");
+            eprintln!("unexpected access: {name}");
             denied = false;
         }
     }
-    // Either execution itself is denied or Git runs in the same verified
-    // zero-network AppContainer token whose direct TCP attempt just failed.
-    let _ = Command::new(git).arg("--version").status();
+
+    // Git is installed under Program Files, which AppContainers may execute, so
+    // reaching the executable proves nothing. What matters is that Git cannot
+    // read a repository outside the stage: `ls-remote` against a disposable bare
+    // remote must fail. Both outcomes are recorded, never discarded.
+    let version = Command::new(git).arg("--version").output();
+    match &version {
+        Ok(output) => report(
+            report_path,
+            label,
+            "git_version",
+            &format!("SPAWNED:success={}", output.status.success()),
+        ),
+        Err(error) => report(
+            report_path,
+            label,
+            "git_version",
+            &format!("SPAWN_DENIED:{}", error.raw_os_error().unwrap_or(0)),
+        ),
+    }
+    match Command::new(git).args(["ls-remote", git_remote]).output() {
+        Ok(output) if output.status.success() => {
+            report(report_path, label, "git_ls_remote", "OPEN");
+            eprintln!("git read a repository outside the stage");
+            denied = false;
+        }
+        Ok(_) => report(report_path, label, "git_ls_remote", "denied"),
+        Err(error) => report(
+            report_path,
+            label,
+            "git_ls_remote",
+            &format!("denied:spawn:{}", error.raw_os_error().unwrap_or(0)),
+        ),
+    }
     if !denied {
         return false;
     }
@@ -66,7 +122,10 @@ fn hostile(args: &[String], spawn_child: bool) -> bool {
     }
     let me = match env::current_exe() {
         Ok(path) => path,
-        Err(_) => return false,
+        Err(error) => {
+            eprintln!("hostile: current_exe failed: {error}");
+            return false;
+        }
     };
     let child = Command::new(me)
         .arg("hostile-child")
@@ -93,16 +152,46 @@ fn native_work(args: &[String]) -> bool {
     fs::write(&args[3], output).is_ok()
 }
 
-fn environment() -> bool {
-    env::var_os("PATH").is_none()
-        && env::var("F2C_TEST_ALLOWED").as_deref() == Ok("yes")
-        && env::var_os("SystemRoot").is_some()
-        && env::var_os("LOCALAPPDATA").is_some()
+/// `LOCALAPPDATA` must be the caller-declared path inside the work directory,
+/// `PATH` must be absent, the allowlisted value must be present and
+/// `SystemRoot` must be set by the backend.
+fn environment(args: &[String]) -> bool {
+    if args.len() != 3 {
+        return false;
+    }
+    let expected = &args[2];
+    let path_absent = env::var_os("PATH").is_none();
+    let allowed = env::var("F2C_TEST_ALLOWED").as_deref() == Ok("yes");
+    let system_root = env::var_os("SystemRoot").is_some();
+    // Windows derives the container's own profile folder from LOCALAPPDATA, so
+    // the child's value is our work-scoped base plus the package path. What
+    // matters is that the base is inside the work directory and never the real
+    // user profile.
+    let local_app_data_matches = env::var("LOCALAPPDATA")
+        .map(|value| value.starts_with(expected.as_str()))
+        .unwrap_or(false);
+    if !path_absent || !allowed || !system_root || !local_app_data_matches {
+        eprintln!(
+            "environment mismatch: path_absent={path_absent} allowed={allowed} \
+             system_root={system_root} local_app_data_matches={local_app_data_matches} \
+             local_app_data={:?} expected={expected:?}",
+            env::var("LOCALAPPDATA")
+        );
+        return false;
+    }
+    true
 }
 
+/// Read a numeric handle the parent passed. The read must fail with exactly the
+/// error code the test declares, so a numeric value that happens to name a
+/// different object in the child's handle table cannot look like containment.
 fn read_handle(args: &[String]) -> bool {
     let raw = match args.get(2).and_then(|value| value.parse::<usize>().ok()) {
         Some(raw) => raw,
+        None => return false,
+    };
+    let expected = match args.get(3).and_then(|value| value.parse::<i32>().ok()) {
+        Some(code) => code,
         None => return false,
     };
     let handle = raw as *mut core::ffi::c_void;
@@ -110,7 +199,35 @@ fn read_handle(args: &[String]) -> bool {
     let mut read = 0u32;
     // SAFETY: ReadFile validates the untrusted numeric handle in the child
     // handle table. The one-byte output buffer and count pointer are valid.
-    unsafe { ReadFile(handle, byte.as_mut_ptr().cast(), 1, &mut read, std::ptr::null_mut()) == 0 }
+    let ok = unsafe {
+        ReadFile(
+            handle,
+            byte.as_mut_ptr().cast(),
+            1,
+            &mut read,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok != 0 {
+        eprintln!("the inherited handle was readable");
+        return false;
+    }
+    // SAFETY: read immediately after the failing call.
+    let error = unsafe { GetLastError() } as i32;
+    if error != expected {
+        eprintln!("unexpected error code {error}, expected {expected}");
+        return false;
+    }
+    true
+}
+
+/// Create the marker file. Used as the launch canary: if anything runs this
+/// helper, the marker appears.
+fn create_marker(args: &[String]) -> bool {
+    if args.len() != 3 {
+        return false;
+    }
+    fs::write(&args[2], b"package code ran").is_ok()
 }
 
 fn allocate() -> bool {
@@ -165,5 +282,6 @@ extern "system" {
         bytes_read: *mut u32,
         overlapped: *mut core::ffi::c_void,
     ) -> i32;
+    fn GetLastError() -> u32;
 }
 

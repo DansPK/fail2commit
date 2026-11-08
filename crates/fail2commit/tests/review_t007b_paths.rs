@@ -1,25 +1,37 @@
 #![cfg(windows)]
 
-//! Independent review reproductions for T-007b (FR-007, SPEC-007).
+//! Review reproductions for T-007b (FR-007, SPEC-007), S7B-001.
 //!
-//! Review artifact only: no product code is modified by these tests.
+//! These started as failing reproductions of the review finding and now assert
+//! the fixed behaviour:
 //!
-//! * `hard_link_inside_staged_tree_...` reproduces S7B-002: a hard link is not
-//!   a reparse point, so `reject_reparse_tree` accepts it and `ffi::grant`
-//!   writes an AppContainer ACE onto a file object that lives outside the
-//!   staged tree. The sandboxed child then reads content that was never
-//!   staged as a copy.
-//! * `junction_inside_staged_tree_is_rejected` and
-//!   `parent_traversal_out_of_the_stage_is_rejected` record positive evidence
-//!   for the reparse-point and `..` rejections.
+//! * `hard_link_inside_staged_tree_is_rejected` — a hard link is not a reparse
+//!   point, so the pre-fix backend granted an AppContainer ACE onto a file object
+//!   whose other directory entry lives outside the stage. The backend now rejects
+//!   multi-link files before any ACL write, and the outside file's ACL is
+//!   compared before and after to prove nothing was written there.
+//! * `junction_inside_staged_tree_is_rejected` — reparse points stay rejected.
+//! * `a_read_only_root_from_another_stage_is_rejected` — every granted path must
+//!   share the job's own stage below the stage root.
 
-use fail2commit_core::isolation::{JobLimits, JobSpec, JobStatus, SandboxBackend};
+use fail2commit_core::isolation::{JobLimits, JobSpec, SandboxBackend};
+use fail2commit_core::paths::TrustedPaths;
 use fail2commit_core::sandbox;
+use fail2commit_core::ResultCode;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+const STAGE_DIR: &str = "sandbox-stage";
+
+fn stage_root() -> PathBuf {
+    let paths = TrustedPaths::resolve().expect("trusted paths");
+    let root = paths.cache_dir.join(STAGE_DIR);
+    fs::create_dir_all(&root).expect("create stage root");
+    root
+}
 
 fn limits() -> JobLimits {
     JobLimits {
@@ -37,12 +49,19 @@ fn backend() -> Box<dyn SandboxBackend> {
     backend
 }
 
-/// Stage `<temp>/<random>/{read-only,work}` plus the dependency-free helper.
-fn compile_helper() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+struct Stage {
+    root: tempfile::TempDir,
+    read_only: PathBuf,
+    work: PathBuf,
+    helper: PathBuf,
+}
+
+/// Stage `<stage_root>/<job>/{read-only,work}` plus the dependency-free helper.
+fn compile_helper() -> Stage {
     let root = tempfile::Builder::new()
-        .prefix("f2c-review-paths-")
-        .tempdir()
-        .expect("review stage");
+        .prefix("job-")
+        .tempdir_in(stage_root())
+        .expect("job stage");
     let read_only = root.path().join("read-only");
     let work = root.path().join("work");
     fs::create_dir_all(&read_only).unwrap();
@@ -63,7 +82,12 @@ fn compile_helper() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         .status()
         .expect("run rustc for the review helper");
     assert!(status.success(), "helper compilation failed: {status}");
-    (root, read_only, work, helper)
+    Stage {
+        root,
+        read_only,
+        work,
+        helper,
+    }
 }
 
 fn native_work_job(
@@ -72,7 +96,6 @@ fn native_work_job(
     output: &Path,
     read_only: &Path,
     work: &Path,
-    cwd: PathBuf,
 ) -> JobSpec {
     JobSpec {
         program,
@@ -81,7 +104,7 @@ fn native_work_job(
             input.as_os_str().to_os_string(),
             output.as_os_str().to_os_string(),
         ],
-        cwd,
+        cwd: work.to_path_buf(),
         env: Vec::new(),
         read_only: vec![read_only.to_path_buf()],
         work_dir: work.to_path_buf(),
@@ -104,64 +127,131 @@ fn make_directory_link(link: &Path, target: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The DACL of a path as `icacls` prints it, so "no ACE was written here" can be
+/// asserted instead of assumed.
+fn acl(path: &Path) -> String {
+    let output = Command::new("icacls.exe")
+        .arg(path)
+        .output()
+        .expect("run icacls");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
 #[test]
-fn hard_link_inside_staged_tree_grants_access_to_a_file_outside_the_stage() {
-    let (root, read_only, work, helper) = compile_helper();
-    // A file object that is deliberately outside the staged tree.
-    let outside_dir = tempfile::Builder::new()
-        .prefix("f2c-review-outside-")
-        .tempdir()
+fn hard_link_inside_staged_tree_is_rejected() {
+    let stage = compile_helper();
+    // A file object deliberately outside the job's stage: another stage below
+    // the same stage root, so nothing about the path looks suspicious.
+    let outside = tempfile::Builder::new()
+        .prefix("outside-")
+        .tempdir_in(stage_root())
         .expect("outside stage");
-    let outside = outside_dir.path().join("outside-secret.txt");
-    fs::write(&outside, b"outside-secret").unwrap();
+    let outside_file = outside.path().join("outside-secret.txt");
+    fs::write(&outside_file, b"outside-secret").unwrap();
+    let acl_before = acl(&outside_file);
 
-    let link = read_only.join("linked-input.txt");
-    fs::hard_link(&outside, &link).expect("create a hard link inside the staged tree");
+    let link = stage.read_only.join("linked-input.txt");
+    fs::hard_link(&outside_file, &link).expect("create a hard link inside the staged tree");
     assert!(
-        !outside.starts_with(root.path()),
-        "the link target must live outside the staged tree"
+        !outside_file.starts_with(stage.root.path()),
+        "the link target must live outside the job stage"
     );
 
-    let output = work.join("artifact.txt");
-    let job = native_work_job(helper, &link, &output, &read_only, &work, work.clone());
-    let outcome = backend().run(&job).expect("sandbox run");
-    assert_eq!(
-        outcome.status,
-        JobStatus::Exited(0),
-        "stderr={}",
-        String::from_utf8_lossy(&outcome.stderr)
+    let output = stage.work.join("artifact.txt");
+    let job = native_work_job(
+        stage.helper.clone(),
+        &link,
+        &output,
+        &stage.read_only,
+        &stage.work,
     );
+    let error = backend()
+        .run(&job)
+        .expect_err("the hard link must be refused");
     assert_eq!(
-        fs::read(&output).unwrap(),
-        b"native-work: OUTSIDE-SECRET",
-        "the sandbox read file content from outside the staged tree"
+        error.code,
+        ResultCode::IsolationUnavailable,
+        "{}",
+        error.message
     );
+    assert!(
+        error.message.contains("hard links"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert!(!output.exists(), "the job produced an artifact");
+    assert_eq!(
+        acl(&outside_file),
+        acl_before,
+        "a grant was written onto a file object outside the job stage"
+    );
+    assert_eq!(fs::read(&outside_file).unwrap(), b"outside-secret");
 }
 
 #[test]
 fn junction_inside_staged_tree_is_rejected() {
-    let (_root, read_only, work, helper) = compile_helper();
+    let stage = compile_helper();
     let target = tempfile::Builder::new()
-        .prefix("f2c-review-junction-target-")
-        .tempdir()
+        .prefix("junction-target-")
+        .tempdir_in(stage_root())
         .expect("junction target");
-    let link = read_only.join("junction");
+    let link = stage.read_only.join("junction");
     assert!(
         make_directory_link(&link, target.path()),
         "could not create a directory reparse point for the review"
     );
 
-    let output = work.join("artifact.txt");
-    let job = native_work_job(helper, &link, &output, &read_only, &work, work.clone());
-    let error = backend().run(&job).unwrap_err();
+    let output = stage.work.join("artifact.txt");
+    let job = native_work_job(
+        stage.helper.clone(),
+        &link,
+        &output,
+        &stage.read_only,
+        &stage.work,
+    );
+    let error = backend()
+        .run(&job)
+        .expect_err("the junction must be refused");
     assert_eq!(
         error.code,
-        fail2commit_core::ResultCode::IsolationUnavailable,
+        ResultCode::IsolationUnavailable,
         "{}",
         error.message
     );
     assert!(
         error.message.contains("reparse point"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn a_read_only_root_from_another_stage_is_rejected() {
+    let stage = compile_helper();
+    let other = compile_helper();
+    let input = other.read_only.join("input.txt");
+    fs::write(&input, b"other stage").unwrap();
+    let output = stage.work.join("artifact.txt");
+    // Everything except the writable root belongs to the other stage, so only
+    // the "one job stage" rule can reject this job.
+    let job = native_work_job(
+        other.helper.clone(),
+        &input,
+        &output,
+        &other.read_only,
+        &stage.work,
+    );
+    let error = backend()
+        .run(&job)
+        .expect_err("a grant spanning two stages must be refused");
+    assert_eq!(
+        error.code,
+        ResultCode::IsolationUnavailable,
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("one fail2commit job stage"),
         "unexpected error: {}",
         error.message
     );
