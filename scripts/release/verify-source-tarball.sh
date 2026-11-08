@@ -13,7 +13,8 @@ docker run --rm --network none -v "$archive:/input/source.tar.gz:ro" rust:1 bash
   export CARGO_HOME=/tmp/cargo-home
   export CARGO_TARGET_DIR=/tmp/target
   source "$source_dir/scripts/release/release-env.sh" "$source_dir"
-  cargo build --manifest-path "$source_dir/Cargo.toml" --release --locked --offline -p fail2commit
+  cd "$source_dir"
+  cargo build --release --locked --offline -p fail2commit
   test -x /tmp/target/release/fail2commit
   /tmp/target/release/fail2commit --version
 '
