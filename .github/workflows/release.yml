@@ -1,0 +1,157 @@
+name: release-candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_integration:
+        description: Run platform-gated integration checks
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Rust components
+        run: rustup component add rustfmt clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Release build
+        shell: pwsh
+        run: scripts/release/build-windows.ps1
+      - name: NSIS installer when available
+        shell: pwsh
+        run: |
+          if (Test-Path packaging/windows/build.ps1) {
+            & packaging/windows/build.ps1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "packaging/windows/build.ps1 is not present; NSIS artifact pending T-009 integration"
+          }
+      - name: Collect Windows packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/dist | Out-Null
+          Get-ChildItem packaging/windows,target -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(setup|installer).*\.exe$' } |
+            ForEach-Object { Copy-Item -Force $_.FullName target/dist/ }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-artifacts
+          path: target/dist/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Rust components
+        run: rustup component add rustfmt clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Dependency notices
+        run: python3 scripts/release/notices.py
+      - name: Verify committed notices
+        run: git diff --exit-code -- THIRD-PARTY-NOTICES.md
+      - name: Debian package in rust container
+        run: scripts/release/build-deb.sh "$GITHUB_SHA" target/dist
+      - name: Verify Debian package in clean Ubuntu
+        run: scripts/release/verify-deb.sh target/dist/*.deb
+      - name: Vendored source archive
+        run: scripts/release/source-tarball.sh "$GITHUB_SHA" target/dist
+      - name: Verify offline source build
+        run: scripts/release/verify-source-tarball.sh target/dist/*-src.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-artifacts
+          path: |
+            target/dist/*.deb
+            target/dist/*-linux-amd64
+            target/dist/*-src.tar.gz
+          if-no-files-found: error
+
+  vsix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build VSIX when extension is present
+        shell: bash
+        run: |
+          mkdir -p target/dist
+          if [[ -f extensions/vscode/package.json ]]; then
+            cd extensions/vscode
+            npm ci
+            npm test --if-present
+            npx --yes @vscode/vsce@3.6.2 package --out ../../target/dist/
+          else
+            printf '%s\n' 'VSIX pending T-010 integration' > target/dist/VSIX-PENDING.txt
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vsix-artifacts
+          path: target/dist/*
+          if-no-files-found: error
+
+  hashes:
+    needs: [windows, linux, vsix]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: target/dist
+          merge-multiple: true
+      - name: SHA-256 manifest
+        run: scripts/release/hashes.sh target/dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SHA256SUMS
+          path: target/dist/SHA256SUMS
+          if-no-files-found: error
+
+  windows-integration:
+    if: ${{ inputs.run_integration }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Platform-gated Windows integration
+        shell: pwsh
+        run: |
+          if (Test-Path packaging/windows/integration.ps1) {
+            & packaging/windows/integration.ps1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            throw "Windows integration harness is not present in this commit"
+          }
+
+  linux-integration:
+    if: ${{ inputs.run_integration }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Platform-gated Linux integration
+        run: |
+          if [[ -x scripts/integration/linux.sh ]]; then
+            scripts/integration/linux.sh
+          else
+            echo "Linux integration harness is not present in this commit" >&2
+            exit 1
+          fi
