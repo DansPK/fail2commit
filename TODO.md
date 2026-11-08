@@ -3,7 +3,7 @@ Coordinator owns this file and marks claims on the integration branch before dis
 
 Integration branch: `DansPK/f2-commit-coordinator`. Contracts frozen at CHORE-001 (`fe411ba`); workers build against the frozen area APIs, so "Depends on" is the integration order, not a dispatch gate. Candidate merges land on `DansPK/f2c-int-wave1` and reach the integration branch only after the full gate and an independent security review.
 
-**Concurrency limit:** the host lagged with ~10 parallel worktrees, and some agents crashed. Run at most 3 workers at once with cargo `-j 2`. Paused tasks keep their uncommitted work in their worktree and resume in the order below as slots free.
+**Concurrency limit:** the host lagged with ~10 parallel worktrees, and some agents crashed. Run at most 4 workers at once with cargo `-j 2`; WSL/Docker is capped at 4 CPUs and 16 GB. If Codex runs out of usage, its task moves to Cline DeepSeek or Claude. Paused tasks keep their uncommitted work in their worktree and resume in the order below as slots free.
 
 | ID | Task | Req IDs | Owner | Status | Depends on |
 |---|---|---|---|---|---|
