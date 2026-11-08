@@ -327,6 +327,7 @@ version = "0.1.0"
 dependencies = [
  "fail2commit-core",
  "serde_json",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 
