@@ -102,7 +102,7 @@ type Seen = Vec<(Vec<(String, String)>, Vec<(String, Vec<u8>)>)>;
 /// `<rel>` of `name` in the staging tree npm extracted. The tree exists while
 /// the review runs, which is when the inspector calls this.
 fn staged(cache: &std::path::Path, name: &str, rel: &str) -> Vec<u8> {
-    for d in std::fs::read_dir(cache.join("npm-staging"))
+    for d in std::fs::read_dir(cache.join("sandbox-stage"))
         .unwrap()
         .flatten()
     {

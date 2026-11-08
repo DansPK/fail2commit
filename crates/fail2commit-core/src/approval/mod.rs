@@ -7,6 +7,7 @@
 
 pub mod console;
 pub mod password;
+pub mod relay;
 
 mod channels;
 mod replay;

@@ -137,7 +137,7 @@ impl Approver for Terminal {
 /// `ClientMessage` line on stdin.
 pub(crate) struct Stdio;
 
-fn read_message() -> Option<ClientMessage> {
+fn read_stdin_line() -> Option<ClientMessage> {
     let mut buf = Zeroizing::new(Vec::new());
     std::io::stdin()
         .lock()
@@ -151,21 +151,43 @@ fn read_message() -> Option<ClientMessage> {
     serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
 }
 
+/// Write the request as one `approval_request` line on stdout.
+pub(crate) fn write_request(req: &ApprovalRequest) -> bool {
+    let Ok(line) = serde_json::to_string(&ServerMessage::ApprovalRequest(req.clone())) else {
+        return false;
+    };
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{line}").and_then(|_| out.flush()).is_ok()
+}
+
+/// The client's next line, or `None` for EOF, timeout, malformed or oversized input.
+pub(crate) fn read_message(req: &ApprovalRequest) -> Option<ClientMessage> {
+    until_expiry(req, read_stdin_line)
+}
+
 impl Approver for Stdio {
     fn name(&self) -> &'static str {
         "stdio"
     }
 
     fn ask(&self, req: &ApprovalRequest) -> crate::Result<ApprovalResponse> {
-        let line = serde_json::to_string(&ServerMessage::ApprovalRequest(req.clone()))
-            .map_err(|e| crate::Error::internal(format!("serialize approval request: {e}")))?;
+        // CR-008: inside a Git hook the request goes through the relay that
+        // `fail2commit git push` hosts for the api client.
+        let answer = match std::env::var(super::relay::ENV)
+            .ok()
+            .filter(|v| !v.is_empty())
         {
-            let mut out = std::io::stdout().lock();
-            writeln!(out, "{line}")
-                .and_then(|_| out.flush())
-                .map_err(|_| crate::Error::approval_unavailable("approval client is gone"))?;
-        }
-        Ok(match until_expiry(req, read_message) {
+            Some(target) => super::relay::ask(req, &target),
+            None => {
+                if !write_request(req) {
+                    return Err(crate::Error::approval_unavailable(
+                        "approval client is gone",
+                    ));
+                }
+                read_message(req)
+            }
+        };
+        Ok(match answer {
             Some(ClientMessage::ApprovalResponse(r)) => r,
             // Cancel, EOF, timeout, malformed or oversized input.
             _ => reply(req, Decision::Cancel, None),

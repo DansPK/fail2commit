@@ -21,6 +21,7 @@ mod review;
 mod runner;
 mod scripts;
 mod shim;
+mod stage;
 mod tree;
 
 use crate::approval::ApprovalCtx;
@@ -216,7 +217,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     };
 
     // 1. Stage: nothing from the project except the three inputs.
-    let stage_root = paths.cache_dir.join("npm-staging");
+    let stage_root = paths.cache_dir.join("sandbox-stage"); // CR-007
     crate::fsutil::ensure_private_dir(&stage_root)?;
     let stage = tempfile::Builder::new()
         .prefix("npm-")
@@ -466,7 +467,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         std::fs::write(apply_dir.join("package.json"), &final_pj)?;
         std::fs::write(apply_dir.join("package-lock.json"), &final_lock)?;
         tree::recheck(&proj_stage, &reviewed)?;
-        let ran = apply::run_scripts(deps, &tc, &proj_stage, &reviewed, &found, mode)?;
+        let ran = apply::run_scripts(deps, &tc, sd, &proj_stage, &reviewed, &found, mode)?;
         let _ = std::fs::remove_dir_all(proj_stage.join(".f2c-tmp"));
         apply::move_tree(
             &proj_stage.join("node_modules"),

@@ -401,6 +401,15 @@ fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, O
     {
         e.push(("npm_config_node_gyp".into(), gyp.into()));
     }
+    // An AppContainer cannot lstat the ancestors of its stage (`C:\`), which is
+    // what node's default realpath of the main script and of every required
+    // module does. npm on Windows creates no symlinks, so resolving without it
+    // is equivalent.
+    #[cfg(windows)]
+    e.push((
+        "NODE_OPTIONS".into(),
+        "--preserve-symlinks --preserve-symlinks-main".into(),
+    ));
     #[cfg(windows)]
     for k in ["SystemRoot", "windir", "ComSpec"] {
         if let Some(v) = std::env::var_os(k) {
@@ -415,6 +424,7 @@ fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, O
 pub fn run_scripts(
     deps: &Deps<'_>,
     tc: &Toolchain,
+    stage_dir: &Path,
     tree: &Path,
     reviewed: &Reviewed,
     found: &BTreeSet<String>,
@@ -423,26 +433,32 @@ pub fn run_scripts(
     if !matches!(mode, ScriptRun::Sandboxed | ScriptRun::Host) {
         return Ok(vec![]);
     }
+    // CR-007: sandboxed scripts run in a stage below `sandbox-stage`; an
+    // approved host run uses the tree and toolchain in place.
+    let stage = (mode == ScriptRun::Sandboxed)
+        .then(|| super::stage::Tools::create(stage_dir, tc))
+        .transpose()?;
+    let (tc, tree) = match &stage {
+        Some(s) => (&s.toolchain, tree),
+        None => (tc, tree),
+    };
     std::fs::create_dir_all(tree.join(".f2c-tmp"))?;
     let mut ran = Vec::new();
     for l in lifecycle(reviewed, found) {
-        let (program, args) = shell(&l.command);
+        let (mut program, args) = shell(&l.command);
+        if let Some(sh) = stage.as_ref().and_then(|s| s.shell.clone()) {
+            program = sh;
+        }
         let env = lifecycle_env(tc, tree, &l);
         let cwd = tree.join(&l.path);
         let label = format!("{}@{} {}", l.name, l.version, l.event);
-        let (status, tail) = if mode == ScriptRun::Sandboxed {
+        let (status, tail) = if let Some(stage) = &stage {
             let job = JobSpec {
                 program,
                 args,
                 cwd,
                 env,
-                read_only: [
-                    Some(tc.node_dir().to_path_buf()),
-                    tc.npm_root().map(Path::to_path_buf),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
+                read_only: stage.read_only.clone(),
                 work_dir: tree.to_path_buf(),
                 exports: vec![],
                 export_to: None,
