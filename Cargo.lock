@@ -299,6 +299,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "zip",
 ]
 
 [[package]]
