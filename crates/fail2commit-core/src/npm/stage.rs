@@ -105,3 +105,111 @@ fn copy_link(from: &Path, _to: &Path) -> Result<()> {
         from.display()
     )))
 }
+
+/// A job stage not touched for this long is a leftover of a killed run.
+const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// ER-005: remove `npm-*` and `run-*` stages under `root` (the
+/// `sandbox-stage` directory) that are older than an hour, holding the
+/// per-user sandbox lock so no job is mid-flight. Best effort: failures are
+/// ignored and other entries (such as backend state files) are never touched.
+pub fn sweep_stale(root: &Path) {
+    let Ok(paths) = crate::paths::TrustedPaths::resolve() else {
+        return;
+    };
+    let lock = paths.state_dir.join("sandbox-job");
+    let _ = crate::fsutil::with_lock(&lock, || {
+        sweep_older_than(root, STALE_AFTER);
+        Ok(())
+    });
+}
+
+fn sweep_older_than(root: &Path, age: std::time::Duration) {
+    let Ok(rd) = fs::read_dir(root) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("npm-") || name.starts_with("run-")) {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .ok()
+            .filter(|m| m.is_dir() && !is_link(m))
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|d| d >= age);
+        if stale {
+            remove_tree(&e.path());
+        }
+    }
+}
+
+/// Remove a stage, making read-only entries sandbox code left behind writable
+/// first when the plain removal fails.
+pub(crate) fn remove_tree(p: &Path) {
+    if fs::remove_dir_all(p).is_err() {
+        make_writable(p);
+        let _ = fs::remove_dir_all(p);
+    }
+}
+
+fn make_writable(p: &Path) {
+    let Ok(md) = fs::symlink_metadata(p) else {
+        return;
+    };
+    if md.is_dir() && !is_link(&md) {
+        let mut perm = md.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perm.set_mode(0o700);
+        }
+        #[cfg(not(unix))]
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        let _ = fs::set_permissions(p, perm);
+        if let Ok(rd) = fs::read_dir(p) {
+            for e in rd.flatten() {
+                make_writable(&e.path());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweeps_only_old_stage_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        for n in ["npm-old", "run-old", "keep-me", "npm-fresh"] {
+            fs::create_dir(root.path().join(n)).unwrap();
+            fs::write(root.path().join(n).join("f"), "x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for n in ["npm-old", "run-old", "keep-me"] {
+            let mut o = fs::OpenOptions::new();
+            o.write(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                o.custom_flags(0x0200_0000); // FILE_FLAG_BACKUP_SEMANTICS: open a directory
+            }
+            #[cfg(unix)]
+            o.read(true).write(false);
+            o.open(root.path().join(n))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        sweep_older_than(root.path(), STALE_AFTER);
+        assert!(!root.path().join("npm-old").exists());
+        assert!(!root.path().join("run-old").exists());
+        assert!(
+            root.path().join("npm-fresh").exists(),
+            "younger than an hour"
+        );
+        assert!(root.path().join("keep-me").exists(), "not a stage name");
+    }
+}

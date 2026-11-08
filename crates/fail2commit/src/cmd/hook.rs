@@ -33,15 +33,24 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
     match a.as_slice() {
         [name, remote, url] if name == "pre-push" => {
             let fail_closed = std::env::var_os(FAIL_CLOSED_ENV).is_some_and(|v| !v.is_empty());
+            // CR-010: take the relay capability, then remove it so no child of
+            // this process (git, the chained hooks) can inherit it.
+            let relay = std::env::var(approval::relay::ENV)
+                .ok()
+                .filter(|v| !v.is_empty());
+            std::env::remove_var(approval::relay::ENV);
             pre_push(ctx, remote, url, std::io::stdin().lock(), &|req| {
-                let mut a = ctx.approval();
                 if fail_closed {
+                    let mut a = ctx.approval();
                     a.choice = ApproverChoice::None;
-                } else if std::env::var_os(approval::relay::ENV).is_some_and(|v| !v.is_empty()) {
-                    // CR-008: started by `fail2commit git push` under `api`.
-                    a.choice = ApproverChoice::Stdio;
+                    return approval::approve(&a, req);
                 }
-                approval::approve(&a, req)
+                match &relay {
+                    // Started by `fail2commit git push` under `api`: the host
+                    // approves (password included) and returns a MAC'd decision.
+                    Some(target) => Ok(approval::relay::forward(req, target)),
+                    None => approval::approve(&ctx.approval(), req),
+                }
             })
         }
         _ => Err(Error::invalid("usage: hook pre-push <remote> <url>")),

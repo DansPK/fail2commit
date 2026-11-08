@@ -287,6 +287,8 @@ tmp=$(mktemp "${{TMPDIR:-/tmp}}/f2c-prepush.XXXXXX") || exit 1
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 cat > "$tmp" || exit 1
 "$F2C" hook pre-push "$@" < "$tmp" || exit $?
+# CR-010: the approval relay capability is for the hook above, never for the chain.
+unset FAIL2COMMIT_APPROVAL_RELAY
 # Chain what would have run without us: the repository's own hooksPath, else
 # the user's previous global hooksPath, else the repository's hooks directory.
 dir=$(git config --local --get core.hooksPath)

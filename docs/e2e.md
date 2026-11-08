@@ -6,7 +6,8 @@
 |---|---|
 | `e2e_npm_sandbox.rs` | `npm install` runs a lifecycle script in the real sandbox (AppContainer / bubblewrap) from a CR-007 job stage; the build artifact lands in `node_modules`; a hostile script cannot read a home canary, list the checkout, write outside, or reach a loopback listener; sandbox off: a required script (`node-gyp`) fails closed without an approver (exit 11, nothing changed), a cancelled host approval changes nothing, an approved one runs once; an optional script is skipped. Linux only: a C compile with the system `cc`. |
 | `e2e_npm_approval.rs` | An advisory finding asks on the `api` stdio channel; approve installs exactly the approved digest; cancel and a changed digest change nothing; `--approver none` exits 11. |
-| `e2e_push.rs` | `api` plus a forced push to a bare remote with a configured password: approve, wrong password, cancel, changed tuple, unattended (CR-009 relay). |
+| `review_e2e_relay.rs` | Regression tests for ER-001..ER-003: forged, replayed and unauthenticated relay requests, silent peers, attempt cap and close, a chained hook sees no relay variable, npm stdio ignores the variable. |
+| `e2e_push.rs` | `api` plus a forced push to a bare remote with a configured password: approve, wrong password, cancel, changed tuple, unattended (CR-009/CR-010 relay: the host approves, the hook gets a MAC'd decision). |
 | `e2e_setup.rs` | `setup` (twice) over a third-party global `core.hooksPath`; a push runs the installed hook and chains the prior hook; a secret push is blocked; `uninstall-integrations` restores git config, hook and profile byte for byte. |
 | `extensions/vscode/test/real-cli.test.ts` | `runApi` against the real CLI (`F2C_BIN`; skipped when absent): `status`, and one `approval_request` answered with cancel on a real forced push. |
 

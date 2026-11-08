@@ -171,22 +171,13 @@ impl Approver for Stdio {
     }
 
     fn ask(&self, req: &ApprovalRequest) -> crate::Result<ApprovalResponse> {
-        // CR-008: inside a Git hook the request goes through the relay that
-        // `fail2commit git push` hosts for the api client.
-        let answer = match std::env::var(super::relay::ENV)
-            .ok()
-            .filter(|v| !v.is_empty())
-        {
-            Some(target) => super::relay::ask(req, &target),
-            None => {
-                if !write_request(req) {
-                    return Err(crate::Error::approval_unavailable(
-                        "approval client is gone",
-                    ));
-                }
-                read_message(req)
-            }
-        };
+        // CR-010: never reads the relay variable; only the Git hook is a relay client.
+        if !write_request(req) {
+            return Err(crate::Error::approval_unavailable(
+                "approval client is gone",
+            ));
+        }
+        let answer = read_message(req);
         Ok(match answer {
             Some(ClientMessage::ApprovalResponse(r)) => r,
             // Cancel, EOF, timeout, malformed or oversized input.

@@ -38,6 +38,17 @@ A guarded command (git push, npm/pip install, host execution) that finds somethi
 
 The terminal prompt accepts only the exact keyword: `approve` for ApproveOnce, `run-on-host` for RunOnHostOnce. Anything else, including `y` or an empty line, cancels. All untrusted text (ref names, package names, evidence) passes through `console::sanitize`. Control and bidi characters are escaped so a ref name cannot repaint the prompt with terminal escapes, and URL credentials are stripped.
 
+
+## Git hook relay under `api` (CR-010)
+
+Git gives the pre-push hook its own stdin and moves its stdout, so the hook cannot speak the stdio protocol. When `fail2commit --approver stdio git push` runs (the `api` path), that process, the relay host, listens on `127.0.0.1:<ephemeral>` and puts `FAIL2COMMIT_APPROVAL_RELAY=127.0.0.1:<port>/<token>` in git's environment. The 128-bit token is the HMAC key and is never sent on the wire.
+
+- **Host approves, not the hook.** The hook sends its `ApprovalRequest` and an HMAC-SHA-256 of it. The host runs the whole `approval::approve` itself (`approve_relayed`): stdio round trip to the api client, reply validation, replay, rate limits and the password check against trusted state. The session id is the hook's, and only `Operation` requests are relayed. A typed password therefore never crosses the relay.
+- **The reply** is only `{request_id, nonce, digest, decision}` plus `HMAC-SHA-256(token, request_id || nonce || digest || decision)`. The hook compares with constant-time equality, requires the fields to equal its own request and the decision to be offered, and treats everything else (no relay, bad MAC, timeout, EOF) as Cancel. The host prints the reason for a refusal (wrong password, changed operation) on its stderr.
+- **Single use, bounded.** The relay accepts exactly one authenticated request, then stops listening. A connection gets 2 s to send an authenticated line; an unauthenticated or malformed one is dropped without using the slot. After 16 accepted connections the relay stops. It also stops when the push ends.
+- **Token scope.** Only `fail2commit hook pre-push` reads the variable and it removes it from its own environment at once. The installed hook script runs `unset FAIL2COMMIT_APPROVAL_RELAY` before it chains the prior hook, so the repository's or the user's earlier hook and any other child see nothing.
+- **Only the hook is a relay client.** The generic `stdio` approver used by `api` for npm, pip, sandbox and the rest ignores the variable.
+
 ## Force-push password
 
 `fail2commit password set|change|reset|disable|status|verify`
