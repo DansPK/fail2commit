@@ -10,6 +10,7 @@ use super::{apply, scripts, sha_hex, Deps};
 use crate::protocol::{Finding, FindingAction, FindingKind};
 use crate::scan::ScriptFile;
 use crate::{Error, Result};
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -22,6 +23,42 @@ const MAX_NESTED_MANIFEST: u64 = 64 * 1024;
 /// Files listed to expand a glob in a lifecycle command.
 const MAX_LISTED: usize = 100_000;
 const EXTS: [&str; 4] = [".js", ".cjs", ".mjs", ".json"];
+/// Extensions `cmd.exe` may run for a bare command (default PATHEXT and the
+/// scripting hosts); reviewed on Windows in addition to node's own.
+const WIN_EXTS: [&str; 12] = [
+    ".com", ".exe", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".msc", ".ps1",
+];
+/// Interpreters and core tools a package must not shadow through `.bin`.
+const SHADOWED: [&str; 28] = [
+    "node",
+    "nodejs",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "corepack",
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "python",
+    "python3",
+    "py",
+    "perl",
+    "ruby",
+    "git",
+    "gcc",
+    "cc",
+    "c++",
+    "g++",
+    "clang",
+    "make",
+    "cmake",
+    "node-gyp",
+];
 /// Non-install lifecycle entries npm may run for a dependency; inspected,
 /// never run by the guard.
 const EXTRA_LIFECYCLE: [&str; 4] = ["prepublish", "preprepare", "prepare", "postprepare"];
@@ -34,6 +71,8 @@ pub struct PkgReview {
     pub chained: Vec<(String, String)>,
     pub files: Vec<ScriptFile>,
     pub incomplete: Vec<String>,
+    /// Referenced files that are binary or otherwise cannot be read as text.
+    pub uninspectable: Vec<String>,
     /// `(path relative to the package, sha256)` of the manifest and every
     /// referenced file that was read.
     pub inputs: Vec<(String, String)>,
@@ -55,8 +94,53 @@ fn fold(rel: &str) -> String {
         .join("/")
 }
 
+/// Extensions tried for a path word: node's, plus PATHEXT's on Windows.
+fn candidate_exts(windows: bool, pathext: Option<&str>) -> Vec<String> {
+    let mut v: Vec<String> = EXTS.iter().map(|e| e.to_string()).collect();
+    if windows {
+        v.extend(WIN_EXTS.iter().map(|e| e.to_string()));
+        v.extend(
+            pathext
+                .unwrap_or("")
+                .split(';')
+                .filter(|e| e.len() > 1 && e.starts_with('.'))
+                .map(|e| e.to_ascii_lowercase()),
+        );
+        v.sort();
+        v.dedup();
+    }
+    v
+}
+
+/// Command name without case, trailing dots/spaces or an executable extension
+/// (`Node.CMD.` -> `node`).
+fn bin_stem(name: &str) -> String {
+    let l = name.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+    WIN_EXTS
+        .iter()
+        .find_map(|e| l.strip_suffix(e))
+        .unwrap_or(&l)
+        .to_string()
+}
+
+/// A candidate the review cannot read as a script: a PE/ELF/Mach-O image, or
+/// anything with NUL bytes.
+fn uninspectable(b: &[u8]) -> bool {
+    const MAGIC: [&[u8]; 7] = [
+        b"MZ",
+        b"\x7fELF",
+        &[0xfe, 0xed, 0xfa, 0xce],
+        &[0xfe, 0xed, 0xfa, 0xcf],
+        &[0xce, 0xfa, 0xed, 0xfe],
+        &[0xcf, 0xfa, 0xed, 0xfe],
+        &[0xca, 0xfe, 0xba, 0xbe],
+    ];
+    MAGIC.iter().any(|m| b.starts_with(m)) || b.contains(&0)
+}
+
 struct Cx<'a> {
     dir: &'a Path,
+    exts: Vec<String>,
     listing: Option<Vec<String>>,
     wanted: BTreeSet<String>,
     incomplete: Vec<String>,
@@ -93,12 +177,84 @@ impl Cx<'_> {
     fn add_tree(&mut self, t: &str) {
         if !t.is_empty() {
             self.wanted.insert(t.to_string());
-            self.wanted.extend(EXTS.iter().map(|e| format!("{t}{e}")));
+            self.wanted
+                .extend(self.exts.iter().map(|e| format!("{t}{e}")));
         }
-        for e in EXTS {
+        for e in self.exts.clone() {
             self.wanted.insert(join(t, &format!("index{e}")));
         }
         self.wanted.insert(join(t, "package.json"));
+    }
+
+    /// Files the command word `w` runs through a `.bin` directory on the
+    /// lifecycle PATH: the entry itself and the file the owning package
+    /// declares in `bin` (a Windows `.cmd` shim only points at it).
+    fn bin_command(&mut self, tree: &Path, w: &str) {
+        let key = bin_stem(w);
+        for (k, bd) in apply::bin_dirs(tree, self.dir).iter().enumerate() {
+            let Ok(rd) = std::fs::read_dir(bd) else {
+                continue;
+            };
+            let up = "../".repeat(k);
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if bin_stem(&n) == key {
+                    self.wanted.insert(format!("{up}node_modules/.bin/{n}"));
+                    if let Some(nm) = bd.parent() {
+                        self.declared_bin(nm, &format!("{up}node_modules"), &key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Files named by `bin` in the manifests of the packages directly in `nm`.
+    fn declared_bin(&mut self, nm: &Path, nm_rel: &str, key: &str) {
+        let Ok(rd) = std::fs::read_dir(nm) else {
+            return;
+        };
+        let mut kids: Vec<String> = Vec::new();
+        for e in rd.flatten().take(5000) {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with('@') {
+                if let Ok(sub) = std::fs::read_dir(e.path()) {
+                    kids.extend(
+                        sub.flatten()
+                            .map(|s| format!("{n}/{}", s.file_name().to_string_lossy())),
+                    );
+                }
+            } else {
+                kids.push(n);
+            }
+        }
+        for kid in kids {
+            let manifest = nm.join(&kid).join("package.json");
+            if std::fs::metadata(&manifest).map_or(true, |m| m.len() > MAX_NESTED_MANIFEST) {
+                continue;
+            }
+            let Some(pj) = std::fs::read(&manifest)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            else {
+                continue;
+            };
+            let declared: Vec<(String, String)> = match pj.get("bin") {
+                Some(serde_json::Value::String(f)) => {
+                    let n = pj.get("name").and_then(|n| n.as_str()).unwrap_or(&kid);
+                    vec![(n.rsplit('/').next().unwrap_or(n).to_string(), f.clone())]
+                }
+                Some(serde_json::Value::Object(m)) => m
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect(),
+                _ => vec![],
+            };
+            for (name, file) in declared {
+                if bin_stem(&name) == key && !file.starts_with('/') && !file.contains(':') {
+                    self.wanted.insert(format!("{nm_rel}/{kid}/{file}"));
+                }
+            }
+        }
     }
 
     /// Add every file `node` or the shell could open for the path `p`
@@ -178,7 +334,14 @@ impl Cx<'_> {
 }
 
 /// Review one installed package directory as npm wrote it.
+#[cfg(test)]
 pub fn review_pkg(dir: &Path) -> Result<PkgReview> {
+    review_pkg_in(dir, None, candidate_exts(false, None))
+}
+
+/// `tree` is the staging project root; with it, commands that resolve to a
+/// `.bin` entry on the lifecycle PATH are reviewed too.
+pub fn review_pkg_in(dir: &Path, tree: Option<&Path>, exts: Vec<String>) -> Result<PkgReview> {
     let manifest = crate::fsutil::read_bounded(&dir.join("package.json"), MAX_MANIFEST)?;
     let pj: serde_json::Value = serde_json::from_slice(&manifest)
         .map_err(|e| Error::invalid(format!("installed package.json is invalid: {e}")))?;
@@ -227,6 +390,7 @@ pub fn review_pkg(dir: &Path) -> Result<PkgReview> {
     // resolved on disk the way node and the shell would.
     let mut cx = Cx {
         dir,
+        exts,
         listing: None,
         wanted: BTreeSet::new(),
         incomplete: Vec::new(),
@@ -237,6 +401,11 @@ pub fn review_pkg(dir: &Path) -> Result<PkgReview> {
     for (_, cmd) in out.scripts.iter().chain(&out.chained) {
         for p in scripts::paths(cmd)? {
             cx.expand(&p)?;
+        }
+        if let Some(tree) = tree {
+            for w in scripts::first_words(cmd) {
+                cx.bin_command(tree, &w);
+            }
         }
     }
     // The filesystem answers exact lookups, but a case-insensitive or Unicode
@@ -275,6 +444,10 @@ pub fn review_pkg(dir: &Path) -> Result<PkgReview> {
         let bytes = crate::fsutil::read_bounded(&full, MAX_REF_FILE)?;
         total += bytes.len() as u64;
         out.inputs.push((rel.clone(), sha_hex(&bytes)));
+        if uninspectable(&bytes) {
+            out.uninspectable.push(rel);
+            continue;
+        }
         out.files.push(ScriptFile { path: rel, bytes });
     }
     Ok(out)
@@ -290,12 +463,14 @@ pub fn review(
     reviewed: &mut Reviewed,
 ) -> Result<BTreeSet<String>> {
     let found = apply::verify_tree(tree, &plan.pkgs)?;
+    reviewed.findings.extend(bin_findings(tree)?);
     for rp in reviewed.pkgs.iter_mut() {
         if rp.file.is_none() || !found.contains(&rp.plan.path) {
             continue;
         }
         let id = package_id(&rp.plan);
-        let r = review_pkg(&tree.join(&rp.plan.path)).map_err(|mut e| {
+        let exts = candidate_exts(cfg!(windows), std::env::var("PATHEXT").ok().as_deref());
+        let r = review_pkg_in(&tree.join(&rp.plan.path), Some(tree), exts).map_err(|mut e| {
             e.message = format!("{}: {}", id.display(), e.message);
             for f in &mut e.findings {
                 f.target = Some(id.display());
@@ -327,6 +502,20 @@ pub fn review(
                 .location(name.clone()),
             );
         }
+        for name in &r.uninspectable {
+            reviewed.findings.push(
+                Finding::new(
+                    FindingKind::IncompleteScan,
+                    FindingAction::Deny,
+                    "npm.archive",
+                    format!(
+                        "referenced file {name} is a binary or not text and cannot be inspected"
+                    ),
+                )
+                .target(id.display())
+                .location(name.clone()),
+            );
+        }
         if !r.scripts.is_empty() {
             let all = [r.scripts.clone(), r.chained.clone()].concat();
             reviewed
@@ -337,6 +526,189 @@ pub fn review(
         rp.inputs = r.inputs;
     }
     Ok(found)
+}
+
+/// Deny every `.bin` entry (any nested `node_modules/.bin`) that shadows an
+/// interpreter or core tool: lifecycle PATH puts `.bin` first (RN3-001).
+fn bin_findings(tree: &Path) -> Result<Vec<Finding>> {
+    fn walk(dir: &Path, rel: &str, budget: &mut usize, out: &mut Vec<Finding>) -> Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            *budget = budget
+                .checked_sub(1)
+                .ok_or_else(|| apply::mismatch("the installed tree has too many entries", None))?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let r = join(rel, &name);
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            if name == ".bin" && dir.file_name().is_some_and(|n| n == "node_modules") {
+                for b in std::fs::read_dir(e.path())? {
+                    let n = b?.file_name().to_string_lossy().into_owned();
+                    let stem = bin_stem(&n);
+                    if SHADOWED.contains(&stem.as_str()) || scripts::is_short_name(&n) {
+                        out.push(
+                            Finding::new(
+                                FindingKind::SuspiciousScript,
+                                FindingAction::Deny,
+                                "npm.bin",
+                                format!(
+                                    "`{r}/{n}` shadows the `{stem}` command on the lifecycle PATH"
+                                ),
+                            )
+                            .location(format!("{r}/{n}")),
+                        );
+                    }
+                }
+            } else {
+                walk(&e.path(), &r, budget, out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let nm = tree.join("node_modules");
+    if nm.is_dir() {
+        walk(&nm, "node_modules", &mut 2_000_000, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// `(path relative to the tree, size, sha256)` of everything below
+/// `node_modules`: files, directories (`path/`), links and special entries.
+pub type Snapshot = Vec<(String, u64, String)>;
+
+fn is_link(e: &std::fs::DirEntry, ft: &std::fs::FileType) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Symlinks, junctions and any other reparse point.
+        ft.is_symlink() || e.metadata().is_ok_and(|m| m.file_attributes() & 0x400 != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = e;
+        ft.is_symlink()
+    }
+}
+
+pub fn snapshot(tree: &Path) -> Result<Snapshot> {
+    fn walk(dir: &Path, rel: &str, budget: &mut usize, out: &mut Snapshot) -> Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            *budget = budget
+                .checked_sub(1)
+                .ok_or_else(|| apply::mismatch("the installed tree has too many entries", None))?;
+            let r = join(rel, &e.file_name().to_string_lossy());
+            let ft = e.file_type()?;
+            if is_link(&e, &ft) {
+                let to = std::fs::read_link(e.path())
+                    .map(|t| t.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.push((r, 0, format!("link:{to}")));
+            } else if ft.is_dir() {
+                out.push((format!("{r}/"), 0, "dir".into()));
+                walk(&e.path(), &r, budget, out)?;
+            } else if ft.is_file() {
+                use std::io::Read;
+                let mut f = std::fs::File::open(e.path())?;
+                let (mut h, mut n, mut buf) = (Sha256::new(), 0u64, vec![0u8; 64 * 1024]);
+                loop {
+                    let k = f.read(&mut buf)?;
+                    if k == 0 {
+                        break;
+                    }
+                    h.update(&buf[..k]);
+                    n += k as u64;
+                }
+                out.push((r, n, hex::encode(h.finalize())));
+            } else {
+                out.push((r, 0, "special".into()));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let nm = tree.join("node_modules");
+    if nm.is_dir() {
+        walk(&nm, "node_modules", &mut 2_000_000, &mut out)?;
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Entries that differ from `before`: `(path, existed before, now)`; `now`
+/// is `None` when the entry is gone.
+fn changes(tree: &Path, before: &Snapshot) -> Result<Vec<(String, bool, Option<String>)>> {
+    let key = |s: &Snapshot| -> BTreeMap<String, (u64, String)> {
+        s.iter()
+            .map(|(p, n, h)| (p.clone(), (*n, h.clone())))
+            .collect()
+    };
+    let (old, new) = (key(before), key(&snapshot(tree)?));
+    let mut out = Vec::new();
+    for (p, v) in &new {
+        if old.get(p) != Some(v) {
+            out.push((p.clone(), old.contains_key(p), Some(v.1.clone())));
+        }
+    }
+    out.extend(
+        old.keys()
+            .filter(|p| !new.contains_key(*p))
+            .map(|p| (p.clone(), true, None)),
+    );
+    Ok(out)
+}
+
+/// Re-hash the whole tree: nothing may differ from what was reviewed.
+pub fn verify_unchanged(tree: &Path, before: &Snapshot) -> Result<()> {
+    let c = changes(tree, before)?;
+    match c.first() {
+        None => Ok(()),
+        Some((p, _, _)) => Err(apply::mismatch(
+            format!(
+                "`{p}` changed after it was reviewed ({} path(s) differ)",
+                c.len()
+            ),
+            None,
+        )),
+    }
+}
+
+/// After lifecycle scripts ran (RN3-004): the tree must still be the planned
+/// packages, with no links or package/reviewed-file changes; only new or
+/// changed files inside a package's own directory (build output) are allowed.
+/// Returns those files.
+pub fn verify_after_scripts(
+    tree: &Path,
+    plan: &Plan,
+    found: &BTreeSet<String>,
+    before: &Snapshot,
+    reviewed: &Reviewed,
+) -> Result<Vec<String>> {
+    apply::verify_tree(tree, &plan.pkgs)?;
+    recheck(tree, reviewed)?;
+    let roots: Vec<String> = found.iter().map(|p| format!("{p}/")).collect();
+    let mut output = Vec::new();
+    for (p, existed, now) in changes(tree, before)? {
+        let bad = |why: &str| apply::mismatch(format!("`{p}` {why}"), None);
+        if now
+            .as_deref()
+            .is_some_and(|h| h.starts_with("link:") || h == "special")
+        {
+            return Err(bad("is a link or special file created by a script"));
+        }
+        if !roots.iter().any(|r| p.starts_with(r.as_str())) {
+            return Err(bad("was changed outside the package directories"));
+        }
+        if existed && p.ends_with("/package.json") {
+            return Err(bad("is a package.json that a script changed"));
+        }
+        if !p.ends_with('/') && now.is_some() {
+            output.push(p);
+        }
+    }
+    Ok(output)
 }
 
 /// Hash `inputs` again just before anything runs: the tree must still be the
@@ -531,6 +903,123 @@ mod tests {
                 .unwrap();
             assert!(apply::verify_tree(d.path(), &[plan_pkg("node_modules/a")]).is_ok());
         }
+    }
+
+    #[test]
+    fn pathext_candidates_and_bin_names() {
+        let e = candidate_exts(true, Some(".COM;.EXE;.XYZ;bad"));
+        for x in [
+            ".bat", ".cmd", ".exe", ".com", ".ps1", ".vbs", ".wsf", ".xyz", ".js",
+        ] {
+            assert!(e.contains(&x.to_string()), "{x}");
+        }
+        assert!(!candidate_exts(false, Some(".XYZ")).contains(&".bat".to_string()));
+        for n in ["node", "NODE.EXE", "node.cmd.", "Node.PS1"] {
+            assert_eq!(bin_stem(n), "node", "{n}");
+        }
+        let d = pkg(&[
+            ("package.json", &pj(r".\setup")),
+            ("setup.bat", b"@echo off"),
+        ]);
+        let r = review_pkg_in(d.path(), None, candidate_exts(true, None)).unwrap();
+        assert!(r.files.iter().any(|f| f.path == "setup.bat"));
+        let d = pkg(&[("package.json", &pj("setup")), ("setup.exe", b"MZ\x90\0")]);
+        let r = review_pkg_in(d.path(), None, candidate_exts(true, None)).unwrap();
+        assert_eq!(r.uninspectable, vec!["setup.exe".to_string()]);
+    }
+
+    #[test]
+    fn bin_shadows_denied_and_other_bin_targets_read() {
+        let d = pkg(&[
+            ("node_modules/a/package.json", &pj("tool go")),
+            ("node_modules/a/node_modules/.bin/tool.cmd", b"@echo hi"),
+            ("node_modules/.bin/Make.CMD", b"@echo hi"),
+            ("node_modules/.bin/fine", b"x"),
+        ]);
+        let f = bin_findings(d.path()).unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].action, FindingAction::Deny);
+        let r = review_pkg_in(
+            &d.path().join("node_modules/a"),
+            Some(d.path()),
+            candidate_exts(false, None),
+        )
+        .unwrap();
+        assert!(r
+            .files
+            .iter()
+            .any(|f| f.path == "node_modules/.bin/tool.cmd"));
+    }
+
+    #[test]
+    fn declared_bin_file_is_read_through_a_shim() {
+        let d = pkg(&[
+            ("node_modules/a/package.json", &pj("tool go")),
+            ("node_modules/.bin/tool.cmd", br"@node ..\tool\cli.js"),
+            (
+                "node_modules/tool/package.json",
+                br#"{"name":"tool","version":"1.0.0","bin":{"tool":"cli.js"}}"#,
+            ),
+            ("node_modules/tool/cli.js", b"console.log(1)"),
+        ]);
+        let r = review_pkg_in(
+            &d.path().join("node_modules/a"),
+            Some(d.path()),
+            candidate_exts(false, None),
+        )
+        .unwrap();
+        assert!(
+            r.files
+                .iter()
+                .any(|f| f.path == "../../node_modules/tool/cli.js"),
+            "{:?}",
+            r.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn snapshot_detects_changes_and_script_output_rules() {
+        let d = pkg(&[
+            ("node_modules/a/package.json", &pj("true")),
+            ("node_modules/a/x.js", b"1"),
+        ]);
+        let plan = Plan {
+            pkgs: vec![plan_pkg("node_modules/a")],
+        };
+        let found: BTreeSet<String> = ["node_modules/a".to_string()].into();
+        let reviewed = Reviewed {
+            pkgs: vec![],
+            findings: vec![],
+        };
+        let snap = snapshot(d.path()).unwrap();
+        assert!(verify_unchanged(d.path(), &snap).is_ok());
+        // Build output in the package dir is returned.
+        std::fs::write(d.path().join("node_modules/a/x.js"), b"2").unwrap();
+        std::fs::write(d.path().join("node_modules/a/out.bin"), b"2").unwrap();
+        assert!(verify_unchanged(d.path(), &snap).is_err());
+        let out = verify_after_scripts(d.path(), &plan, &found, &snap, &reviewed).unwrap();
+        assert_eq!(out, vec!["node_modules/a/out.bin", "node_modules/a/x.js"]);
+        // A changed package.json, or a file outside the package dir, fails.
+        std::fs::write(d.path().join("node_modules/a/package.json"), b"{}").unwrap();
+        assert!(verify_after_scripts(d.path(), &plan, &found, &snap, &reviewed).is_err());
+        let snap2 = snapshot(d.path()).unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.bin")).unwrap();
+        std::fs::write(d.path().join("node_modules/.bin/x"), b"1").unwrap();
+        assert!(verify_after_scripts(d.path(), &plan, &found, &snap2, &reviewed).is_err());
+        std::fs::remove_dir_all(d.path().join("node_modules/.bin")).unwrap();
+        // A link made by a script fails even inside the package dir.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", d.path().join("node_modules/a/lnk")).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(d.path().join("node_modules").join("a").join("lnk"))
+            .arg(d.path())
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(verify_after_scripts(d.path(), &plan, &found, &snap2, &reviewed).is_err());
     }
 
     #[test]

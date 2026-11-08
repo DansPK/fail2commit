@@ -131,3 +131,24 @@ The `rereview2_npm` harness checks, inside the inspector (while the staging tree
 | `cargo test -p fail2commit-core --lib` | 123 passed | 125 passed |
 
 Linux: `docker run --rm -v <wt>:/src -v f2c-fixnpm3-target:/target -e CARGO_TARGET_DIR=/target -w /src f2c-linux-test:1 sh -c "cargo test -j 2 --no-fail-fast -p fail2commit --test ... ; cargo test -j 2 -p fail2commit-core --lib"` (all exit 0). Not verified: 8.3 alias resolution on a volume with short names (the tests rely on the `deny`), a case-insensitive Linux mount. Tested SHA: the commit that adds this section.
+
+## 2026-11-09: re-review 3 fixes RN3-001..RN3-004 (FR-004, FR-006)
+
+| Finding | Status | Evidence |
+|---|---|---|
+| RN3-001 `.bin` shadowing | Fixed | `tree::bin_findings` denies shadowing names (28 tools, case/extension-insensitive) in any nested `.bin`; other first-word `.bin` commands and their declared `bin` file are read. `rn3_001_*`, `d1_*`, `tree::tests::bin_shadows_denied_and_other_bin_targets_read`, `declared_bin_file_is_read_through_a_shim` |
+| RN3-002 PATHEXT | Fixed | Windows candidates add PATHEXT extensions; binary/NUL candidates are `incomplete_scan` deny. `rn3_002_*`, `d2_*`, `tree::tests::pathext_candidates_and_bin_names` |
+| RN3-003 whole-tree digest | Fixed | `tree::snapshot` (path, size, SHA-256) is in the approval digest and re-hashed before commit/scripts (`IntegrityFailure`). `rn3_003_*`, `d3_*` |
+| RN3-004 post-script tree | Fixed | `tree::verify_after_scripts` plus `recheck` before every script; build output listed as `build_output`. `rn3_004_*`, `d4_*`, `tree::tests::snapshot_detects_changes_and_script_output_rules` |
+
+Judgement calls: a *new* nested `package.json` inside a package dir counts as build output (only existing ones are protected); files created by a script at a command candidate that did not exist at review time are not re-reviewed.
+
+| Command (empty stdin, `-j 2`) | Windows | Linux `f2c-linux-test:1` (node 20.19.2, npm 9.2.0) |
+|---|---|---|
+| `cargo fmt --all -- --check` / `cargo clippy -j 2 --workspace --all-targets -- -D warnings` | exit 0 / exit 0 | - |
+| `--test npm_cli` / `npm_flow` / `npm_scripts` | 3 / 21 / 7 passed | 3 / 21 / 7 passed |
+| `--test rereview_npmscan` / `rereview2_npm` / `scan_scripts` | 24 / 19 / 8 passed | 24 / 19 / 8 passed |
+| `--test rereview3_npm` | 18 passed | 15 passed (Windows-only tests excluded) |
+| `cargo test -p fail2commit-core --lib npm::` | 32 passed | 32 passed |
+
+Tested SHA: the commit that adds this section. Linux ran from a container-local copy with `GIT_CEILING_DIRECTORIES=/`.

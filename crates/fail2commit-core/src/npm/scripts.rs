@@ -211,6 +211,22 @@ pub fn paths(cmd: &str) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 
+/// The command word (no path separator) of every segment of `cmd`, after
+/// leading `VAR=value` words. Looked up on PATH, so `.bin` dirs can answer.
+pub fn first_words(cmd: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for escapes in [true, false] {
+        for seg in all_segments(cmd, escapes, 0) {
+            if let Some(w) = seg.iter().find(|w| !w.contains('=')) {
+                if !w.contains(['/', '$', '*', '?']) {
+                    out.insert(w.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `*` and `?` glob over one path, neither crossing `/`.
 pub fn glob_match(pat: &[u8], name: &[u8]) -> bool {
     match (pat.first(), name.first()) {

@@ -135,6 +135,8 @@ struct PlanDigest<'a> {
     package_json: String,
     lockfile: String,
     artifacts: Vec<ArtifactDigest<'a>>,
+    /// `(path, size, sha256)` of every entry of the reviewed staging tree.
+    tree_files: &'a tree::Snapshot,
     findings: Vec<FindingDigest<'a>>,
 }
 
@@ -269,6 +271,8 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     let mut reviewed = review::review(deps, &plan, &sd.join("tarballs"))?;
     apply::seed_cache(deps, &tc, &st, &reviewed)?;
     apply::npm_step(deps, &tc, &st, &proj_stage, &["ci"], &["--offline".into()])?;
+    // Hashed before the review reads anything: a later difference is a change.
+    let snap = tree::snapshot(&proj_stage)?;
     let found = tree::review(deps, &proj_stage, &plan, &mut reviewed)?;
     let ids: Vec<PackageId> = {
         let mut v: Vec<_> = plan.pkgs.iter().map(review::package_id).collect();
@@ -339,6 +343,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
                     tree: &p.inputs,
                 })
                 .collect(),
+            tree_files: &snap,
             findings: findings
                 .iter()
                 .map(|f| {
@@ -462,19 +467,27 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     commit::begin(paths, &req.project, &apply_dir)?;
     std::fs::create_dir(&apply_dir)
         .inspect_err(|_| commit::abandon(paths, &req.project, &apply_dir))?;
-    let built = (|| -> Result<Vec<String>> {
+    let built = (|| -> Result<(Vec<String>, Vec<String>)> {
         std::fs::write(apply_dir.join("package.json"), &final_pj)?;
         std::fs::write(apply_dir.join("package-lock.json"), &final_lock)?;
         tree::recheck(&proj_stage, &reviewed)?;
-        let ran = apply::run_scripts(deps, &tc, &proj_stage, &reviewed, &found, mode)?;
+        tree::verify_unchanged(&proj_stage, &snap)?;
+        let ran = apply::run_scripts(deps, &tc, &proj_stage, &reviewed, &found, mode, &|| {
+            tree::recheck(&proj_stage, &reviewed)
+        })?;
+        let output = if ran.is_empty() {
+            Vec::new()
+        } else {
+            tree::verify_after_scripts(&proj_stage, &plan, &found, &snap, &reviewed)?
+        };
         let _ = std::fs::remove_dir_all(proj_stage.join(".f2c-tmp"));
         apply::move_tree(
             &proj_stage.join("node_modules"),
             &apply_dir.join("node_modules"),
         )?;
-        Ok(ran)
+        Ok((ran, output))
     })();
-    let ran = match built {
+    let (ran, build_output) = match built {
         Ok(r) => r,
         Err(e) => {
             commit::abandon(paths, &req.project, &apply_dir);
@@ -511,6 +524,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
             "packages": plan.pkgs.len(),
             "scripts": format!("{mode:?}"),
             "scripts_run": ran,
+            "build_output": build_output,
             "recovered": recovered,
         }),
     })
