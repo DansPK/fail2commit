@@ -63,7 +63,11 @@ fn pax(path: &str) -> Vec<u8> {
         len = rec.len() + len.to_string().len();
     }
     let body = format!("{len}{rec}");
-    [header("PaxHeader/x", body.len() as u64, b'x'), pad(body.into_bytes())].concat()
+    [
+        header("PaxHeader/x", body.len() as u64, b'x'),
+        pad(body.into_bytes()),
+    ]
+    .concat()
 }
 
 fn gnu_long(name: &str) -> Vec<u8> {
@@ -91,9 +95,30 @@ fn sri(b: &[u8]) -> String {
 
 // ---------------------------------------------------------------- harness
 
+/// What the inspector was shown for one package: lifecycle scripts and the
+/// referenced files (path, bytes).
+type Seen = Vec<(Vec<(String, String)>, Vec<(String, Vec<u8>)>)>;
+
+/// `<rel>` of `name` in the staging tree npm extracted. The tree exists while
+/// the review runs, which is when the inspector calls this.
+fn staged(cache: &std::path::Path, name: &str, rel: &str) -> Vec<u8> {
+    for d in std::fs::read_dir(cache.join("npm-staging"))
+        .unwrap()
+        .flatten()
+    {
+        let p = d.path().join("proj/node_modules").join(name).join(rel);
+        if p.is_file() {
+            return std::fs::read(p).unwrap();
+        }
+    }
+    panic!("`{name}/{rel}` is not in the staged tree");
+}
+
 /// Run `npm ci` for a one-package lockfile whose registry serves exactly
 /// `bytes`, with the real script inspector. `Ok` means the install proceeded.
-fn run_bytes(pkg: Pkg, bytes: Vec<u8>) -> Result<(), String> {
+/// Whatever the inspector is shown is checked against the bytes npm wrote to
+/// the staging tree (CR-008): reviewed == extracted.
+fn run_seen(pkg: Pkg, bytes: Vec<u8>) -> (Result<(), String>, Seen) {
     require_node();
     let reg = Registry::start();
     let url = reg.url.clone();
@@ -109,8 +134,37 @@ fn run_bytes(pkg: Pkg, bytes: Vec<u8>) -> Result<(), String> {
     std::fs::write(env.project.join("package-lock.json"), lock).unwrap();
     let backend = FakeBackend::new(true, false);
     let run = Run::new(&env, &backend);
+    let seen: std::sync::Arc<std::sync::Mutex<Seen>> = Default::default();
+    let (log, cache, name) = (seen.clone(), env.paths.cache_dir.clone(), pkg.name.clone());
     let b = Behavior {
-        inspect: Box::new(inspect_scripts),
+        inspect: Box::new(move |id, scripts, files| {
+            let on_disk: serde_json::Value =
+                serde_json::from_slice(&staged(&cache, &name, "package.json")).unwrap();
+            for (event, cmd) in scripts.iter().filter(|(e, _)| e.ends_with("install")) {
+                if event != "install" || cmd != "node-gyp rebuild" {
+                    assert_eq!(
+                        on_disk["scripts"][event], *cmd,
+                        "reviewed {event} != extracted"
+                    );
+                }
+            }
+            for f in files.iter().filter(|f| f.path != "binding.gyp") {
+                assert_eq!(
+                    staged(&cache, &name, &f.path),
+                    f.bytes,
+                    "reviewed {} != extracted",
+                    f.path
+                );
+            }
+            log.lock().unwrap().push((
+                scripts.to_vec(),
+                files
+                    .iter()
+                    .map(|f| (f.path.clone(), f.bytes.clone()))
+                    .collect(),
+            ));
+            inspect_scripts(id, scripts, files)
+        }),
         ..Default::default()
     };
     let result = match npm::execute(&run.deps(b), &env.request(&["ci"])) {
@@ -120,7 +174,24 @@ fn run_bytes(pkg: Pkg, bytes: Vec<u8>) -> Result<(), String> {
             Err(format!("{} {}", e.message, f.join(" ")))
         }
     };
-    result
+    let seen = seen.lock().unwrap().clone();
+    (result, seen)
+}
+
+fn run_bytes(pkg: Pkg, bytes: Vec<u8>) -> Result<(), String> {
+    run_seen(pkg, bytes).0
+}
+
+/// The inspector was shown the hostile manifest's script, i.e. the manifest
+/// npm extracted and not the benign one a different reader would have seen.
+#[track_caller]
+fn assert_saw_hostile_script(seen: &Seen) {
+    let hostile: serde_json::Value = serde_json::from_slice(&hostile_pj()).unwrap();
+    let cmd = hostile["scripts"]["postinstall"].as_str().unwrap();
+    assert!(
+        seen.iter().any(|(s, _)| s.iter().any(|(_, c)| c == cmd)),
+        "the reviewed manifest is not the one npm extracted: {seen:?}"
+    );
 }
 
 fn run_pkg(pkg: Pkg) -> Result<(), String> {
@@ -210,7 +281,7 @@ fn control_pax_and_gnu_long_names_are_resolved_like_npm() {
 
 #[test]
 fn control_link_entries_are_rejected() {
-    for ty in [b'1', b'2'] {
+    for ty in *b"12" {
         let v = with_benign(&[raw("package/l", 0, ty, b"")]);
         assert_blocked(run_bytes(scripty(), v), "link entry");
     }
@@ -229,7 +300,10 @@ fn control_ntfs_case_pairs_collide() {
         ("a.js ", "a.js"),
         ("\u{3a3}.js", "\u{3c3}.js"),
     ] {
-        let v = with_benign(&[ent(&format!("package/{a}"), b"1"), ent(&format!("package/{b}"), b"2")]);
+        let v = with_benign(&[
+            ent(&format!("package/{a}"), b"1"),
+            ent(&format!("package/{b}"), b"2"),
+        ]);
         assert_blocked(run_bytes(scripty(), v), a);
     }
 }
@@ -250,9 +324,13 @@ fn control_collision_is_reported_before_a_missing_manifest() {
 }
 
 #[test]
-fn control_gitignore_token_is_read_when_named() {
-    let p = scripty().script("postinstall", "sh ./.gitignore").file(".gitignore", HOSTILE);
-    assert_blocked(run_pkg(p), "named .gitignore");
+fn control_gitignore_token_names_nothing_npm_extracted() {
+    let p = scripty()
+        .script("postinstall", "sh ./.gitignore")
+        .file(".gitignore", HOSTILE);
+    // npm extracted no `.gitignore` (it is `.npmignore` on disk), so the script
+    // opens nothing that exists; the extracted tree is what is reviewed (CR-008).
+    assert_eq!(run_pkg(p), Ok(()));
 }
 
 // ---------------------------------------------------------------- RN2 repros
@@ -265,7 +343,37 @@ fn rn2_001_second_gzip_member_is_not_hidden() {
     let first = ent("package/package.json", &pj("")); // no end marker: stream continues
     let second = [ent("package/package.json", &hostile_pj()), eof()].concat();
     let v = [gz(&first), gz(&second)].concat();
-    assert_blocked(run_bytes(scripty(), v), "second gzip member never reviewed");
+    // The archive pre-check reads every member and sees the duplicate manifest
+    // before npm runs; if it ever did not, the review would see the hostile one.
+    let (r, seen) = run_seen(scripty(), v);
+    if !seen.is_empty() {
+        assert_saw_hostile_script(&seen);
+    }
+    let e = r.expect_err("second gzip member never reviewed");
+    assert!(
+        seen.is_empty() && e.contains("collide") || !seen.is_empty(),
+        "{e}"
+    );
+}
+
+/// RN2-001b: a file that only the second gzip member carries is still
+/// extracted by npm, so it is reviewed from the extracted tree.
+#[test]
+fn rn2_001b_file_in_second_gzip_member_is_reviewed_from_disk() {
+    let first = ent(
+        "package/package.json",
+        &pj(r#","scripts":{"postinstall":"sh ./setup.sh"}"#),
+    );
+    let second = [ent("package/setup.sh", HOSTILE.as_bytes()), eof()].concat();
+    let v = [gz(&first), gz(&second)].concat();
+    let (r, seen) = run_seen(scripty(), v);
+    assert!(
+        seen.iter().any(|(_, f)| f
+            .iter()
+            .any(|(n, b)| n == "setup.sh" && b == HOSTILE.as_bytes())),
+        "{seen:?}"
+    );
+    assert_blocked(r, "script from the second gzip member");
 }
 
 /// RN2-002: `tar-rs` ends at the first all-zero block; npm's `tar` needs two
@@ -279,7 +387,9 @@ fn rn2_002_single_zero_block_does_not_end_the_archive() {
         eof(),
     ]
     .concat());
-    assert_blocked(run_bytes(scripty(), v), "entries after a lone zero block");
+    let (r, seen) = run_seen(scripty(), v);
+    assert_saw_hostile_script(&seen);
+    assert_blocked(r, "entries after a lone zero block");
 }
 
 /// RN2-003: npm's `tar` turns a type-`0` entry whose name ends in `/` into a
@@ -289,7 +399,9 @@ fn rn2_002_single_zero_block_does_not_end_the_archive() {
 fn rn2_003_trailing_slash_file_body_is_parsed_by_npm() {
     let inner = ent("package/package.json", &hostile_pj());
     let v = with_benign(&[raw("package/x/", inner.len() as u64, b'0', &inner)]);
-    assert_blocked(run_bytes(scripty(), v), "smuggled entry in a `x/` body");
+    let (r, seen) = run_seen(scripty(), v);
+    assert_saw_hostile_script(&seen);
+    assert_blocked(r, "smuggled entry in a `x/` body");
 }
 
 /// RN2-003b: same for a real directory entry (type `5`) with a non-zero size.
@@ -297,7 +409,9 @@ fn rn2_003_trailing_slash_file_body_is_parsed_by_npm() {
 fn rn2_003b_directory_with_size_body_is_parsed_by_npm() {
     let inner = ent("package/package.json", &hostile_pj());
     let v = with_benign(&[raw("package/d", inner.len() as u64, b'5', &inner)]);
-    assert_blocked(run_bytes(scripty(), v), "smuggled entry in a directory body");
+    let (r, seen) = run_seen(scripty(), v);
+    assert_saw_hostile_script(&seen);
+    assert_blocked(r, "smuggled entry in a directory body");
 }
 
 /// RN2-004: pacote renames every `.gitignore` to `.npmignore` (unless a
@@ -308,7 +422,15 @@ fn rn2_004_gitignore_is_extracted_as_npmignore() {
     let p = scripty()
         .script("postinstall", "sh ./.npmignore")
         .file(".gitignore", HOSTILE);
-    assert_blocked(run_pkg(p), "`.npmignore` token resolves to `.gitignore` bytes");
+    let bytes = p.tarball();
+    let (r, seen) = run_seen(p, bytes);
+    assert!(
+        seen.iter().any(|(_, f)| f
+            .iter()
+            .any(|(n, b)| n == ".npmignore" && b == HOSTILE.as_bytes())),
+        "the renamed file was not reviewed: {seen:?}"
+    );
+    assert_blocked(r, "`.npmignore` token resolves to `.gitignore` bytes");
 }
 
 /// Control: on NTFS `file::$DATA` opens the default stream of `file`

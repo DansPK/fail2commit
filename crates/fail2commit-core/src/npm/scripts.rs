@@ -41,6 +41,8 @@ fn incomplete(why: String) -> Error {
 
 /// True for names Windows can also reach by an 8.3 alias (`BUILDH~1.JS`).
 pub fn is_short_name(component: &str) -> bool {
+    // Win32 drops trailing dots and spaces, so `BUILDH~1.JS.` is the alias too.
+    let component = component.trim_end_matches(['.', ' ']);
     let stem = component.rsplit_once('.').map_or(component, |(s, _)| s);
     stem.rsplit_once('~')
         .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))

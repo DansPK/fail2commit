@@ -105,3 +105,29 @@ chains with depth bound and cycle detection (RN-004).
 
 Linux: `docker run --rm -v <wt>:/src -v f2c-fixnpm2-target:/target -e CARGO_TARGET_DIR=/target -w /src f2c-linux-test:1 sh linux.sh` (exit 0). Tested SHA: the commit that adds this section.
 Known limits are listed in docs/npm.md (no `require()` following, no `npm-run-all`, no brace expansion).
+
+## 2026-11-09 (round 3): review what npm extracts (CR-008; FR-004, FR-006)
+
+Closes RN2-001..RN2-007 of `REREVIEW2-2026-11-09-npm.md`. Instead of matching a Rust tar reader to npm's `tar`, the guard lets npm extract the verified tarballs (`npm ci --offline --ignore-scripts`, in the staging tree, after the guard's own SRI check and the archive pre-checks) and makes every content decision from `node_modules/**` on disk (`npm/tree.rs`). Approval binds the digests of the reviewed on-disk manifests and referenced files; the same tree runs the approved scripts (re-hashed first) and is then moved into the commit scratch directory, so nothing is extracted twice. Symlinks/junctions below `node_modules` (except npm's `.bin`), directories or files not in the lockfile, and name/version differences are `deny`.
+
+| Finding | Status | Evidence |
+|---|---|---|
+| RN2-001 second gzip member | Fixed | `rn2_001_*` (pre-check reads all members and sees the duplicate manifest), `rn2_001b_*` (a script only the 2nd member carries is reviewed from disk) |
+| RN2-002 lone zero block | Fixed | `rn2_002_*`: the inspector is shown the hostile manifest npm extracted (asserted equal to the staged file) |
+| RN2-003 / 003b body of a directory-like entry | Fixed | `rn2_003_*`, `rn2_003b_*`: same assertion |
+| RN2-004 `.gitignore` -> `.npmignore` | Fixed | `rn2_004_*` (the `.npmignore` bytes are reviewed); `control_gitignore_token_names_nothing_npm_extracted` |
+| RN2-006 `main` 8.3 alias | Fixed | `rn2_006_*`; `tree::tests::short_name_main_and_trailing_dot_tokens_are_denied` |
+| RN2-007 trailing dot after 8.3 alias | Fixed | `rn2_007_*`; `scripts::is_short_name` trims trailing dots/spaces |
+
+The `rereview2_npm` harness checks, inside the inspector (while the staging tree exists), that every reviewed install script equals the one in the staged `package.json` and every reviewed file equals the staged file's bytes. `control_*` tests were not weakened except `control_gitignore_token_*`: a `sh ./.gitignore` token now names no extracted file. `npm_scripts::sandboxed_script_keeps_the_npm_lifecycle_context` now expects the sandbox work dir under the private cache instead of the project. Core unit tests moved from archive-content to tree-content (`npm::tree`).
+
+| Command (empty stdin, `-j 2`) | Windows | Linux `f2c-linux-test:1` |
+|---|---|---|
+| `cargo fmt --all -- --check` | exit 0 | - |
+| `cargo clippy -j 2 --workspace --all-targets -- -D warnings` | exit 0 | - |
+| `cargo test -p fail2commit --test npm_cli` / `npm_flow` / `npm_scripts` | 3 / 21 / 7 passed | 3 / 21 / 7 passed |
+| `... --test rereview_npmscan` / `rereview2_npm` | 24 / 19 passed | 24 / 19 passed |
+| `... --test scan_advisories` / `scan_cli` / `scan_scripts` | 15 (+1 ignored) / 12 / 8 passed | same |
+| `cargo test -p fail2commit-core --lib` | 123 passed | 125 passed |
+
+Linux: `docker run --rm -v <wt>:/src -v f2c-fixnpm3-target:/target -e CARGO_TARGET_DIR=/target -w /src f2c-linux-test:1 sh -c "cargo test -j 2 --no-fail-fast -p fail2commit --test ... ; cargo test -j 2 -p fail2commit-core --lib"` (all exit 0). Not verified: 8.3 alias resolution on a volume with short names (the tests rely on the `deny`), a case-insensitive Linux mount. Tested SHA: the commit that adds this section.

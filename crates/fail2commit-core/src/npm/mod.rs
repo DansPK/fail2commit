@@ -2,13 +2,14 @@
 //!
 //! Frozen API: [`integration`]. Everything else is the worker's choice.
 //!
-//! Flow of a guarded `npm ci | install | i [pkg...]` (see docs/npm.md):
+//! Flow of a guarded `npm ci | install | i [pkg...]` (see docs/npm.md, CR-008):
 //! stage (project files + pinned config) -> resolve with scripts disabled ->
-//! review the exact lockfile graph (download, verify integrity, inspect
-//! archives and scripts, advisories) -> one approval over a digest of the
-//! reviewed plan -> build from the reviewed tarballs only, offline -> verify
-//! the tree against the plan -> run approved lifecycle scripts through the
-//! sandbox -> journaled commit into the project.
+//! download and verify every tarball of the lockfile graph, seed the private
+//! cache -> `npm ci --offline --ignore-scripts` into the staging tree -> review
+//! that extracted tree on disk (manifests, scripts, referenced files,
+//! advisories) -> one approval over a digest of the reviewed tree -> run
+//! approved lifecycle scripts through the sandbox in the same tree -> journaled
+//! commit of that tree into the project. Nothing is extracted twice.
 
 mod apply;
 mod archive;
@@ -20,6 +21,7 @@ mod review;
 mod runner;
 mod scripts;
 mod shim;
+mod tree;
 
 use crate::approval::ApprovalCtx;
 use crate::approver::new_request;
@@ -112,6 +114,8 @@ struct ArtifactDigest<'a> {
     integrity: &'a str,
     skipped: bool,
     scripts: &'a [(String, String)],
+    /// Digests of the reviewed on-disk manifest and referenced files.
+    tree: &'a [(String, String)],
 }
 
 type FindingDigest<'a> = (String, String, Option<&'a str>, Option<&'a str>, &'a str);
@@ -259,9 +263,13 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         .map_err(|e| Error::invalid(format!("resolved package.json is invalid: {e}")))?;
     unsupported_manifest(&final_manifest)?;
 
-    // 3. Review the exact graph.
+    // 3. Review the exact graph: verified tarballs, extracted by npm itself
+    //    (scripts off) into the staging tree, reviewed from disk.
     let plan = lockfile::parse(&final_lock, &registry, deps.settings.limits.graph_max_nodes)?;
-    let reviewed = review::review(deps, &plan, &sd.join("tarballs"))?;
+    let mut reviewed = review::review(deps, &plan, &sd.join("tarballs"))?;
+    apply::seed_cache(deps, &tc, &st, &reviewed)?;
+    apply::npm_step(deps, &tc, &st, &proj_stage, &["ci"], &["--offline".into()])?;
+    let found = tree::review(deps, &proj_stage, &plan, &mut reviewed)?;
     let ids: Vec<PackageId> = {
         let mut v: Vec<_> = plan.pkgs.iter().map(review::package_id).collect();
         v.sort();
@@ -328,6 +336,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
                     integrity: &p.plan.integrity,
                     skipped: p.plan.skip_platform,
                     scripts: &p.scripts,
+                    tree: &p.inputs,
                 })
                 .collect(),
             findings: findings
@@ -456,10 +465,14 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     let built = (|| -> Result<Vec<String>> {
         std::fs::write(apply_dir.join("package.json"), &final_pj)?;
         std::fs::write(apply_dir.join("package-lock.json"), &final_lock)?;
-        apply::seed_cache(deps, &tc, &st, &reviewed)?;
-        apply::npm_step(deps, &tc, &st, &apply_dir, &["ci"], &["--offline".into()])?;
-        let found = apply::verify_tree(&apply_dir, &plan.pkgs)?;
-        apply::run_scripts(deps, &tc, &apply_dir, &reviewed, &found, mode)
+        tree::recheck(&proj_stage, &reviewed)?;
+        let ran = apply::run_scripts(deps, &tc, &proj_stage, &reviewed, &found, mode)?;
+        let _ = std::fs::remove_dir_all(proj_stage.join(".f2c-tmp"));
+        apply::move_tree(
+            &proj_stage.join("node_modules"),
+            &apply_dir.join("node_modules"),
+        )?;
+        Ok(ran)
     })();
     let ran = match built {
         Ok(r) => r,
@@ -468,7 +481,6 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
             return Err(e);
         }
     };
-    let _ = std::fs::remove_dir_all(apply_dir.join(".f2c-tmp"));
     commit::commit(
         paths,
         &commit::Commit {
@@ -495,6 +507,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         findings,
         data: serde_json::json!({
             "digest": plan_digest.as_hex(),
+            "tree_digest": tree::digest(&reviewed),
             "packages": plan.pkgs.len(),
             "scripts": format!("{mode:?}"),
             "scripts_run": ran,

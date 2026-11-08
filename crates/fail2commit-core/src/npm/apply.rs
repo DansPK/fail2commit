@@ -121,7 +121,7 @@ pub fn seed_cache(
     flush(&mut chunk)
 }
 
-fn mismatch(msg: impl Into<String>, target: Option<&str>) -> Error {
+pub(super) fn mismatch(msg: impl Into<String>, target: Option<&str>) -> Error {
     let msg = msg.into();
     let mut f = Finding::new(
         FindingKind::IntegrityMismatch,
@@ -138,6 +138,30 @@ fn mismatch(msg: impl Into<String>, target: Option<&str>) -> Error {
     .with_findings(vec![f])
 }
 
+/// Reject links anywhere below `dir` (a symlink or junction would let a
+/// package point outside the reviewed tree). npm's own `node_modules/.bin`
+/// links are the one exception; they are not followed by the review.
+fn deny_links(dir: &Path, budget: &mut usize) -> Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        *budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| mismatch("the installed tree has too many entries to review", None))?;
+        let ft = e.file_type()?;
+        if ft.is_symlink() {
+            return Err(mismatch(
+                format!("unexpected link `{}`", e.path().display()),
+                None,
+            ));
+        }
+        let in_nm = dir.file_name().is_some_and(|n| n == "node_modules");
+        if ft.is_dir() && !(in_nm && e.file_name() == ".bin") {
+            deny_links(&e.path(), budget)?;
+        }
+    }
+    Ok(())
+}
+
 fn installed(nm: &Path, prefix: &str, out: &mut BTreeSet<String>) -> Result<()> {
     let Ok(rd) = std::fs::read_dir(nm) else {
         return Ok(());
@@ -145,12 +169,12 @@ fn installed(nm: &Path, prefix: &str, out: &mut BTreeSet<String>) -> Result<()> 
     for e in rd {
         let e = e?;
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        let ft = e.file_type()?;
+        if name == ".bin" || name == ".package-lock.json" {
             continue;
         }
-        let ft = e.file_type()?;
-        if ft.is_symlink() {
-            return Err(mismatch(format!("unexpected link `{prefix}{name}`"), None));
+        if !ft.is_dir() {
+            return Err(mismatch(format!("unexpected entry `{prefix}{name}`"), None));
         }
         let dirs: Vec<(String, PathBuf)> = if name.starts_with('@') {
             std::fs::read_dir(e.path())?
@@ -166,15 +190,19 @@ fn installed(nm: &Path, prefix: &str, out: &mut BTreeSet<String>) -> Result<()> 
             vec![(name, e.path())]
         };
         for (n, p) in dirs {
-            if p.join("package.json").is_file() {
-                let key = format!("{prefix}{n}");
-                installed(
-                    &p.join("node_modules"),
-                    &format!("{key}/node_modules/"),
-                    out,
-                )?;
-                out.insert(key);
+            if !p.join("package.json").is_file() {
+                return Err(mismatch(
+                    format!("`{prefix}{n}` is not a package directory"),
+                    None,
+                ));
             }
+            let key = format!("{prefix}{n}");
+            installed(
+                &p.join("node_modules"),
+                &format!("{key}/node_modules/"),
+                out,
+            )?;
+            out.insert(key);
         }
     }
     Ok(())
@@ -184,29 +212,14 @@ fn installed(nm: &Path, prefix: &str, out: &mut BTreeSet<String>) -> Result<()> 
 /// and every non-skipped plan package must be installed.
 pub fn verify_tree(tree: &Path, plan: &[PlanPkg]) -> Result<BTreeSet<String>> {
     let mut found = BTreeSet::new();
+    if tree.join("node_modules").is_dir() {
+        deny_links(&tree.join("node_modules"), &mut 2_000_000)?;
+    }
     installed(&tree.join("node_modules"), "node_modules/", &mut found)?;
     let by_path: BTreeMap<&str, &PlanPkg> = plan.iter().map(|p| (p.path.as_str(), p)).collect();
     for key in &found {
-        let Some(p) = by_path.get(key.as_str()) else {
+        if !by_path.contains_key(key.as_str()) {
             return Err(mismatch(format!("`{key}` is not part of the plan"), None));
-        };
-        let dir = tree.join(key);
-        let manifest: serde_json::Value = std::fs::read(dir.join("package.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .ok_or_else(|| mismatch(format!("`{key}` has no readable package.json"), None))?;
-        let s = |k: &str| manifest.get(k).and_then(|v| v.as_str()).unwrap_or("");
-        if s("name") != p.name || s("version") != p.version {
-            return Err(mismatch(
-                format!(
-                    "`{key}` is {}@{}, plan says {}@{}",
-                    s("name"),
-                    s("version"),
-                    p.name,
-                    p.version
-                ),
-                Some(key),
-            ));
         }
     }
     for p in plan.iter().filter(|p| !p.skip_platform) {
@@ -236,6 +249,40 @@ pub fn verify_tree(tree: &Path, plan: &[PlanPkg]) -> Result<BTreeSet<String>> {
         }
     }
     Ok(found)
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let to = dst.join(e.file_name());
+        let ft = e.file_type()?;
+        if ft.is_dir() {
+            copy_tree(&e.path(), &to)?;
+        } else if ft.is_symlink() {
+            // Only npm's own `.bin` links survive the review.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(e.path())?, &to)?;
+            #[cfg(not(unix))]
+            return Err(mismatch("unexpected link in the staged tree", None));
+        } else {
+            std::fs::copy(e.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Move the reviewed `node_modules` out of the staging tree into the project
+/// scratch directory: a rename, or a copy across filesystems.
+pub fn move_tree(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    if std::fs::rename(src, dst).is_err() {
+        copy_tree(src, dst)?;
+        let _ = std::fs::remove_dir_all(src);
+    }
+    Ok(())
 }
 
 struct Lifecycle {
