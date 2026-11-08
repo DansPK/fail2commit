@@ -128,3 +128,9 @@ CR-003/CR-004 implemented in `scan`: uninspected referenced content (binary, pas
 ids set `complete = false` with a finding stating how many were dropped (`MAL-` ids are
 kept first); known malware is `deny`. Commands and results are in the commit that adds
 this section; see the npm report addendum for the shared full-workspace run.
+
+## Addendum 2026-11-09: re-review fixes RN-001, RN-008 (FR-006)
+
+RN-001: a NUL anywhere in the inspected prefix makes a referenced script undecodable (`incomplete_scan` `deny` naming the file). RN-008: ids sort `MAL-` first case-insensitively and every id up to 512 is classified before any ordinary advisory is dropped; more than 512 is an `incomplete_scan` `deny`.
+
+Results (empty stdin, `-j 2`): `scan_advisories` 15 passed/1 ignored, `scan_cli` 12, `scan_scripts` 8, `review_wave2_scan` 3, `rereview_npmscan` 24, core lib 122 (Windows) / 124 (Linux), all exit 0 on both platforms. Full command table: see the npm report addendum.

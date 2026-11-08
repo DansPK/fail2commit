@@ -58,7 +58,8 @@ completeness flag is surfaced through the `code` (`incomplete_scan`) and the
 | `malware` | `deny` | `npm:name@ver` | OSV `MAL-` id or an OpenSSF malicious-packages record (CR-003). |
 | `suspicious_script` | `deny` | `npm:name@ver` | `location` is `<script>:<line>` or `<file>:<line>`. |
 | `stale_data` | `approve` | `npm:name@ver` | Cached answer past its TTL was used. |
-| `incomplete_scan` | `approve` | `npm:name@ver` | No usable answer, or more than 128 advisory ids (the count dropped is in `evidence`; `MAL-` ids are kept first); treat the version as unreviewed. |
+| `incomplete_scan` | `approve` | `npm:name@ver` | No usable answer, or more than 128 advisory ids (the count of ordinary advisories dropped is in `evidence`). Every id up to 512 still has its record classified, so a malware record is never dropped, whatever its id case or prefix; treat the version as unreviewed. |
+| `incomplete_scan` | `deny` | `npm:name@ver` | More than 512 advisory ids: malware cannot be ruled out. |
 | `incomplete_scan` | `deny` | `npm:name@ver` | Referenced script content was not fully inspected: binary content, longer than the 1 MiB prefix, or dropped by the npm archive caps (CR-004). `location` and `evidence` name the file. |
 
 Malware is deliberately a separate kind, and a hard denial: an operator may
@@ -137,7 +138,7 @@ Details that make the rules usable on real scripts:
   first physical line number.
 * Lines are bounded to 4096 characters, files to 1 MiB, findings per package to
   256 (an `incomplete_scan` marker with `deny` follows), and a binary file (a NUL
-  in the first 8 KiB) or a file past the 1 MiB prefix yields an `incomplete_scan`
+  anywhere in the inspected prefix; `sh` skips NULs, so one past the first block still splits tokens) or a file past the 1 MiB prefix yields an `incomplete_scan`
   `deny` naming the file; a clean result is never reported for content that was
   not read.
 * Every finding carries `<script>:<line>` or `<file>:<line>` as `location` and

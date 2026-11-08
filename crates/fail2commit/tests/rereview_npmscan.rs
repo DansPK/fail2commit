@@ -1,11 +1,12 @@
-//! Independent re-review reproductions for the npm and scanner fixes
-//! (W2-003/004/005/007/008, CR-003/CR-004). Offline fixtures only.
+//! Regression tests for the re-review findings RN-001..RN-008 on the npm and
+//! scanner fixes (W2-003/004/005/007/008, CR-003/CR-004). Offline fixtures only.
 //!
-//! Every test asserts the *safe* behaviour, so a failing test is a confirmed
-//! bypass. Passing tests marked "control" document what the fix does hold.
-//! See docs/verify/REREVIEW-2026-11-09-npmscan.md.
+//! Every test asserts the *safe* behaviour. They began as the reviewer's
+//! failing reproductions and now guard the fixes; tests marked "control"
+//! document what already held. See docs/verify/REREVIEW-2026-11-09-npmscan.md.
 
 mod npm_support;
+#[allow(dead_code)]
 mod scan_support;
 
 use fail2commit_core::npm;
@@ -20,6 +21,11 @@ const HOSTILE: &str = "#!/bin/sh\ngit push --force origin main\n";
 /// Run `npm ci` for a one-package lockfile with the *real* script inspector.
 /// Returns true when the install was blocked by a Deny finding.
 fn denied(pkg: Pkg) -> bool {
+    outcome(pkg).iter().any(|f| f.action == FindingAction::Deny)
+}
+
+/// Findings that blocked the install; empty when it proceeded.
+fn outcome(pkg: Pkg) -> Vec<fail2commit_core::protocol::Finding> {
     require_node();
     let reg = Registry::start();
     reg.publish(&pkg);
@@ -36,20 +42,26 @@ fn denied(pkg: Pkg) -> bool {
     let backend = FakeBackend::new(true, false);
     let run = Run::new(&env, &backend);
     let b = Behavior {
-        inspect: Box::new(|p, s, f| inspect_scripts(p, s, f)),
+        inspect: Box::new(inspect_scripts),
         ..Default::default()
     };
     let result = npm::execute(&run.deps(b), &env.request(&["ci"]));
     match result {
         Ok(_) => {
             eprintln!("OUTCOME: install proceeded");
-            false
+            vec![]
         }
         Err(e) => {
             eprintln!("OUTCOME: blocked: {} {:?}", e.message, e.findings);
-            e.findings.iter().any(|f| f.action == FindingAction::Deny)
+            e.findings
         }
     }
+}
+
+fn has(pkg: Pkg, kind: FindingKind) -> bool {
+    outcome(pkg)
+        .iter()
+        .any(|f| f.kind == kind && f.action == FindingAction::Deny)
 }
 
 fn scripted(cmd: &str) -> Pkg {
@@ -92,7 +104,11 @@ fn control_utf16_script_is_denied_as_undecodable() {
         path: "x.ps1".into(),
         bytes: b,
     };
-    let out = inspect_scripts(&pkg(), &[("postinstall".into(), "pwsh ./x.ps1".into())], &[f]);
+    let out = inspect_scripts(
+        &pkg(),
+        &[("postinstall".into(), "pwsh ./x.ps1".into())],
+        &[f],
+    );
     assert!(out
         .iter()
         .any(|f| f.kind == FindingKind::IncompleteScan && f.action == FindingAction::Deny));
@@ -131,7 +147,9 @@ fn node_extension_resolution_is_a_candidate() {
 /// RN-003: a quoted path containing a space is split at the space.
 #[test]
 fn quoted_path_with_a_space_is_a_candidate() {
-    assert!(denied(scripted("sh \"./my script\"").file("my script", HOSTILE)));
+    assert!(denied(
+        scripted("sh \"./my script\"").file("my script", HOSTILE)
+    ));
 }
 
 /// RN-003: `.//run` and `./a/../run` are only trimmed lexically at the front.
@@ -188,7 +206,8 @@ fn non_ascii_case_variant_is_a_candidate() {
 fn dot_slash_package_json_is_not_skipped() {
     let mut p = Pkg::new("scripty", "1.0.0");
     let hostile = br#"{"name":"scripty","version":"1.0.0","scripts":{"postinstall":"git push --force origin main"}}"#;
-    p.raw_entries.push(("./package.json".into(), hostile.to_vec()));
+    p.raw_entries
+        .push(("./package.json".into(), hostile.to_vec()));
     assert!(denied(p));
 }
 
@@ -201,6 +220,137 @@ fn short_name_alias_is_a_candidate() {
     ));
 }
 
+/// RN-006 against npm's own extractor: the `./package.json` entry really
+/// replaces the root manifest under `strip: 1`, and the guard denies it.
+#[test]
+fn dot_slash_package_json_overlay_matches_npm_tar_and_is_denied() {
+    require_node();
+    let hostile = br#"{"name":"scripty","version":"1.0.0","scripts":{"postinstall":"git push --force origin main"}}"#;
+    let benign = br#"{"name":"scripty","version":"1.0.0"}"#;
+    let archive = tgz(&[
+        ("package/package.json", benign),
+        ("./package.json", hostile),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.tgz");
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(&file, &archive).unwrap();
+    let probe = dir.path().join("probe.js");
+    std::fs::write(
+        &probe,
+        r#"const path = require('path');
+const roots = [
+  path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'node_modules'),
+  '/usr/share/nodejs', '/usr/lib/node_modules/npm/node_modules',
+  '/usr/local/lib/node_modules/npm/node_modules',
+];
+let tar;
+for (const r of roots) { try { tar = require(path.join(r, 'tar')); break; } catch (e) {} }
+if (!tar) { console.error('npm tar module not found'); process.exit(3); }
+tar.x({ file: process.argv[2], cwd: process.argv[3], strip: 1, sync: true });
+"#,
+    )
+    .unwrap();
+    let run = std::process::Command::new("node")
+        .arg(&probe)
+        .arg(&file)
+        .arg(&out)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out.join("package.json")).unwrap(),
+        hostile.to_vec(),
+        "npm tar lets ./package.json win"
+    );
+
+    let mut p = Pkg::new("scripty", "1.0.0");
+    p.raw_entries
+        .push(("./package.json".into(), hostile.to_vec()));
+    assert!(has(p, FindingKind::IntegrityMismatch));
+}
+
+/// RN-006: `package//x/./run` collapses like npm's tar, so it collides.
+#[test]
+fn entries_that_normalize_alike_collide() {
+    let mut p = scripted("sh ./x/run").file("x/run", "echo ok\n");
+    p.raw_entries
+        .push(("package//x/./run".into(), HOSTILE.into()));
+    assert!(has(p, FindingKind::IntegrityMismatch));
+}
+
+/// RN-007: an entry whose own name has an 8.3 shape is refused outright.
+#[test]
+fn short_name_shaped_entry_is_denied() {
+    let mut p = scripted("sh ./run").file("run", "echo ok\n");
+    p.raw_entries
+        .push(("package/BUILD~1.JS".into(), HOSTILE.into()));
+    assert!(has(p, FindingKind::UnsupportedInput));
+}
+
+/// RN-002: a directory resolves through its `package.json` `main`.
+#[test]
+fn node_directory_main_is_a_candidate() {
+    let p = scripted("node ./lib")
+        .file("lib/package.json", r#"{"main":"entry"}"#)
+        .file("lib/entry.js", HOSTILE);
+    assert!(denied(p));
+    assert!(denied(scripted("node ./lib").file("lib/index.js", HOSTILE)));
+    assert!(denied(scripted("node .").file("index.js", HOSTILE)));
+}
+
+/// RN-003: a path that leaves the package is refused, not guessed at.
+#[test]
+fn path_escaping_the_package_is_unsupported() {
+    assert!(has(
+        scripted("sh ../outside"),
+        FindingKind::UnsupportedInput
+    ));
+    assert!(has(
+        scripted("sh $PWD/../outside"),
+        FindingKind::UnsupportedInput
+    ));
+}
+
+/// RN-004: a chain that cannot be followed, or that nests past the bound.
+#[test]
+fn unfollowable_run_chain_is_incomplete() {
+    assert!(has(
+        scripted("npm run -w other build").script("build", "echo ok"),
+        FindingKind::IncompleteScan
+    ));
+    let mut p = scripted("npm run s0");
+    for i in 0..12 {
+        p = p.script(&format!("s{i}"), &format!("npm run s{}", i + 1));
+    }
+    assert!(has(p.script("s12", "echo ok"), FindingKind::IncompleteScan));
+}
+
+/// RN-004: a chain through `yarn`/`pnpm` reaches `pre`/`post` hooks too.
+#[test]
+fn chain_hooks_are_inspected() {
+    let p = scripted("yarn build")
+        .script("build", "echo ok")
+        .script("postbuild", "git push --force origin main");
+    assert!(denied(p));
+}
+
+/// Control: benign chains and extension resolution stay installable.
+#[test]
+fn control_benign_chain_and_resolution_proceed() {
+    let p = scripted("npm run build && node ./setup")
+        .script("build", "node ./b.js")
+        .file("setup.js", "console.log(1)\n")
+        .file("b.js", "console.log(2)\n");
+    assert!(outcome(p).is_empty());
+}
+
 // ---------------------------------------------------------------- W2-007/8
 
 fn home() -> (tempfile::TempDir, TrustedPaths) {
@@ -211,16 +361,15 @@ fn home() -> (tempfile::TempDir, TrustedPaths) {
 }
 
 fn report_for(ids: Vec<String>, openssf: Option<&'static str>) -> scan::AdvisoryReport {
-    let vulns: Vec<serde_json::Value> = ids.iter().map(|i| serde_json::json!({ "id": i })).collect();
+    let vulns: Vec<serde_json::Value> =
+        ids.iter().map(|i| serde_json::json!({ "id": i })).collect();
     let body = serde_json::json!({ "results": [{ "vulns": vulns }] }).to_string();
-    let server = TestServer::start(move |request| {
-        match (request.path.as_str(), openssf) {
-            ("/v1/querybatch", _) => Response::json(body.clone()),
-            (p, Some(id)) if p == format!("/v1/vulns/{id}") => {
-                Response::json(fixture("osv/vuln-openssf.json"))
-            }
-            _ => Response::with_status(404, "{}"),
+    let server = TestServer::start(move |request| match (request.path.as_str(), openssf) {
+        ("/v1/querybatch", _) => Response::json(body.clone()),
+        (p, Some(id)) if p == format!("/v1/vulns/{id}") => {
+            Response::json(fixture("osv/vuln-openssf.json"))
         }
+        _ => Response::with_status(404, "{}"),
     });
     let (_dir, paths) = home();
     let settings = advisory_settings(server.url());

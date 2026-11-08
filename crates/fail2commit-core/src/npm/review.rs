@@ -78,6 +78,7 @@ fn unique(plan: &Plan) -> Vec<(usize, Vec<usize>)> {
 struct Fetched {
     file: PathBuf,
     scripts: Vec<(String, String)>,
+    chained: Vec<(String, String)>,
     scan_files: Vec<crate::scan::ScriptFile>,
     findings: Vec<Finding>,
 }
@@ -143,6 +144,7 @@ fn fetch_one(
     Ok(Fetched {
         file,
         scripts: info.scripts,
+        chained: info.chained,
         scan_files: info.files,
         findings,
     })
@@ -194,7 +196,8 @@ pub fn review(deps: &Deps<'_>, plan: &Plan, dir: &Path) -> Result<Reviewed> {
         for &u in users {
             let p = &plan.pkgs[u];
             if !f.scripts.is_empty() {
-                findings.extend((deps.inspect)(&package_id(p), &f.scripts, &f.scan_files));
+                let all = [f.scripts.clone(), f.chained.clone()].concat();
+                findings.extend((deps.inspect)(&package_id(p), &all, &f.scan_files));
             }
             slots[u] = Some(ReviewedPkg {
                 plan: p.clone(),

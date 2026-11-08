@@ -82,3 +82,26 @@ collide under ASCII case or Windows trailing-dot/space folding (`integrity_misma
 file dropped by the size, total or count cap becomes an `incomplete_scan` `deny`.
 Covered by unit tests in `npm/archive.rs` (`extensionless_referenced_script_is_read`,
 `referenced_files_dropped_by_caps_are_reported`, `folding_collisions_are_rejected`).
+
+## Addendum 2026-11-09: re-review fixes RN-002..RN-007 (FR-004)
+
+Base `12c2f39`. `npm::archive` normalizes names as npm's tar (`strip: 1`) does and reviews only
+normalized names (RN-006, verified against npm's own `tar` in
+`dot_slash_package_json_overlay_matches_npm_tar_and_is_denied`); folds with Unicode case plus
+trailing dot/space (RN-005); denies 8.3-shaped entries and tokens (RN-007). New `npm::scripts`
+tokenizes lifecycle commands as shell words, normalizes `.//`, `./a/../`, `$PWD`/`$INIT_CWD`/`%cd%`
+(RN-003), resolves node-style candidates incl. `main` (RN-002) and follows `npm run`/`yarn`/`pnpm`
+chains with depth bound and cycle detection (RN-004).
+
+| Command (empty stdin, `-j 2`) | Windows | Linux `f2c-linux-test:1` |
+|---|---|---|
+| `cargo fmt --all -- --check` | exit 0 | - |
+| `cargo clippy -j 2 --workspace --all-targets -- -D warnings` | exit 0 | - |
+| `cargo test -p fail2commit --test npm_cli` | 3 passed | 3 passed |
+| `... --test npm_flow` | 21 passed | 21 passed |
+| `... --test npm_scripts` | 7 passed | 7 passed |
+| `... --test rereview_npmscan` | 24 passed | 24 passed |
+| `cargo test -p fail2commit-core --lib` | 122 passed | 124 passed |
+
+Linux: `docker run --rm -v <wt>:/src -v f2c-fixnpm2-target:/target -e CARGO_TARGET_DIR=/target -w /src f2c-linux-test:1 sh linux.sh` (exit 0). Tested SHA: the commit that adds this section.
+Known limits are listed in docs/npm.md (no `require()` following, no `npm-run-all`, no brace expansion).

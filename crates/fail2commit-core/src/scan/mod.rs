@@ -32,6 +32,10 @@ mod rules;
 /// Most advisory ids reported for one package. A longer list is truncated and
 /// the report says so.
 const MAX_IDS_PER_PACKAGE: usize = 128;
+/// Most ids whose records are classified for malware. Ids past the report
+/// limit still get a detail lookup so a malware record is never dropped; more
+/// than this is a hard denial.
+const MAX_IDS_CLASSIFIED: usize = 512;
 /// Most script findings returned for one package.
 const MAX_SCRIPT_FINDINGS: usize = 256;
 /// Bytes of one referenced script file inspected.
@@ -234,24 +238,27 @@ fn collect_package_findings(
     let mut stale = lookup.stale;
     let mut unseen_details = 0usize;
     let mut ids = lookup.ids.clone();
-    // Known-malware ids sort first so truncation can never drop them.
-    ids.sort_by_key(|id| !id.starts_with("MAL-"));
-    let dropped = ids.len().saturating_sub(MAX_IDS_PER_PACKAGE);
-    ids.truncate(MAX_IDS_PER_PACKAGE);
-    if dropped > 0 {
+    // Malware-looking ids first, so the bound below can only cut ordinary ones.
+    ids.sort_by_key(|id| !id.to_ascii_uppercase().starts_with("MAL-"));
+    if ids.len() > MAX_IDS_CLASSIFIED {
         findings.push(
             Finding::new(
                 FindingKind::IncompleteScan,
-                FindingAction::Approve,
+                FindingAction::Deny,
                 "osv",
-                format!("{dropped} advisory id(s) for {target} were dropped past the {MAX_IDS_PER_PACKAGE}-id limit"),
+                format!(
+                    "{} advisory ids for {target} exceed the {MAX_IDS_CLASSIFIED}-id classification limit; malware cannot be ruled out",
+                    ids.len()
+                ),
             )
             .target(target.clone()),
         );
         complete = false;
+        ids.truncate(MAX_IDS_CLASSIFIED);
     }
+    let mut dropped = 0usize;
 
-    for id in ids {
+    for (position, id) in ids.into_iter().enumerate() {
         let path = cache::path_for(root, &vuln_key(&id));
         let cached = cache::read::<serde_json::Value>(&path);
         let mut detail: Option<serde_json::Value> = None;
@@ -286,11 +293,27 @@ fn collect_package_findings(
         } else {
             (FindingKind::Advisory, FindingAction::Approve)
         };
+        if kind == FindingKind::Advisory && position >= MAX_IDS_PER_PACKAGE {
+            dropped += 1;
+            continue;
+        }
         findings.push(
             Finding::new(kind, action, "osv", summarize(&id, detail.as_ref()))
                 .target(target.clone())
                 .advisory(id),
         );
+    }
+    if dropped > 0 {
+        findings.push(
+            Finding::new(
+                FindingKind::IncompleteScan,
+                FindingAction::Approve,
+                "osv",
+                format!("{dropped} advisory id(s) for {target} were dropped past the {MAX_IDS_PER_PACKAGE}-id limit"),
+            )
+            .target(target.clone()),
+        );
+        complete = false;
     }
 
     if unseen_details > 0 {
@@ -440,7 +463,8 @@ pub fn inspect_scripts(
 fn script_text(file: &ScriptFile) -> (String, Option<&'static str>) {
     let len = file.bytes.len().min(MAX_SCRIPT_BYTES);
     let bytes = &file.bytes[..len];
-    if bytes.iter().take(8192).any(|&byte| byte == 0) {
+    // `sh` skips NUL bytes anywhere, so one past the first block still splits tokens.
+    if bytes.contains(&0) {
         return (String::new(), Some("binary content cannot be read as text"));
     }
     let gap = (file.bytes.len() > MAX_SCRIPT_BYTES).then_some("longer than the inspected prefix");
