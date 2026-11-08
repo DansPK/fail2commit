@@ -1,0 +1,6 @@
+#!/bin/sh
+# Commit message must cite a requirement/task ID (FR-001, BUG-002, CHORE-003...).
+ROOT=$(git rev-parse --show-toplevel)
+# The same guard scripts live in .claude/hooks and .codex/hooks; use whichever this project kept.
+HOOKS="$ROOT/.claude/hooks"; [ -d "$HOOKS" ] || HOOKS="$ROOT/.codex/hooks"
+sh "$HOOKS/run.sh" requirement_gate.py --commit-msg "$1"

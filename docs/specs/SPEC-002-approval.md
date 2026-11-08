@@ -1,0 +1,5 @@
+# SPEC-002 — Approval and password
+
+FR-002 · TC-002 · Owner paths: approval policy, secure state, terminal prompt, IPC message contracts.
+
+Cancel is default. Support exact one-time approval for force requests, rewrites, outgoing secret findings and install advisories. Respect independent hard denials. When enabled, require force-push password on force requests and actual rewrites. Use a salted Argon2id hash, private user-owned state, rate limits and hidden input. Prefer a vetted cryptographic library. Reset with a high-entropy recovery code displayed once and stored only as a verifier. Rotate code and invalidate pending approvals on reset. Verify current password for change/disable. Use atomic state writes and locking. Password/recovery input must never enter CLI args, project settings, logs or environment. Fail closed for unattended operations that need approval. Bind requests to operation digest, expiry, nonce and originating session. UI responses cannot override a new or changed operation.

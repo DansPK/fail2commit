@@ -1,0 +1,77 @@
+{
+  "_help": "mode per guard: block | warn | off. In Claude Code, warn = ask the user to confirm; in git hooks, warn = print and continue. Regexes are case-insensitive; globs are matched against the repo-relative path and the file name.",
+  "dangerous_cmd": {
+    "mode": "block",
+    "patterns": [
+      "\\brm\\s+-[a-z]*[rf][a-z]*\\s+(/|~|\\*|\\.)(\\s|$)",
+      "\\bgit\\s+push\\b.*(--force(?!-with-lease)|\\s-f\\b)",
+      "\\bgit\\s+reset\\s+--hard\\b",
+      "\\bgit\\s+clean\\s+-[a-z]*f",
+      "--no-verify\\b",
+      "(curl|wget)\\b[^|]*\\|\\s*(sudo\\s+)?(sh|bash|zsh|python3?)\\b",
+      "\\b(drop\\s+(table|database|schema)|truncate\\s+table)\\b",
+      "\\bmkfs(\\.|\\s)|\\bdd\\s+if=",
+      "\\bchmod\\s+-r\\s+777\\b",
+      ">\\s*(nul|/dev/null)\\b"
+    ]
+  },
+  "protected_paths": {
+    "mode": "warn",
+    "allow": [
+      ".env.example",
+      ".env.sample"
+    ],
+    "globs": [
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key",
+      "*secret*",
+      "package-lock.json",
+      "yarn.lock",
+      "pnpm-lock.yaml",
+      "poetry.lock",
+      "Cargo.lock",
+      "go.sum",
+      "migrations/*",
+      "*/migrations/*",
+      "docs/requirements/*",
+      ".claude/hooks/*",
+      ".codex/hooks/*",
+      ".githooks/*",
+      ".claude/settings.json",
+      ".codex/hooks.json"
+    ]
+  },
+  "requirement_gate": {
+    "mode": "warn",
+    "commit_exempt_prefixes": [
+      "Merge ",
+      "Revert ",
+      "fixup!",
+      "squash!",
+      "Initial commit"
+    ],
+    "require_known_id": true,
+    "id_sources": [
+      "docs",
+      "TODO.md"
+    ],
+    "todo_file": "TODO.md",
+    "code_globs": [
+      "src/*",
+      "lib/*",
+      "app/*",
+      "pkg/*",
+      "cmd/*",
+      "tests/*",
+      "test/*",
+      "crates/*",
+      "extensions/*",
+      "packaging/*"
+    ]
+  },
+  "trace_check": {
+    "mode": "block"
+  }
+}

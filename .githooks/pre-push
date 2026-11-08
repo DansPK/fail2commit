@@ -1,0 +1,6 @@
+#!/bin/sh
+# Traceability matrix must be consistent before pushing.
+ROOT=$(git rev-parse --show-toplevel)
+# The same guard scripts live in .claude/hooks and .codex/hooks; use whichever this project kept.
+HOOKS="$ROOT/.claude/hooks"; [ -d "$HOOKS" ] || HOOKS="$ROOT/.codex/hooks"
+sh "$HOOKS/run.sh" trace_check.py
