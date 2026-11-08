@@ -46,7 +46,15 @@ fn setup_push_through_installed_hook_and_exact_uninstall() {
         prior_log.to_string_lossy().replace('\\', "/")
     );
     write_hook(&prior.join("pre-push"), &prior_body);
-    g.git(&g.root, &["config", "--global", "core.hooksPath", prior.to_str().unwrap()]);
+    g.git(
+        &g.root,
+        &[
+            "config",
+            "--global",
+            "core.hooksPath",
+            prior.to_str().unwrap(),
+        ],
+    );
     std::fs::write(&g.path_target, "export KEEP=1\n").unwrap();
 
     let (work, remote) = g.repo_with_remote("round");
@@ -59,7 +67,9 @@ fn setup_push_through_installed_hook_and_exact_uninstall() {
     let installed = hooks_path(&w).unwrap();
     assert!(installed.ends_with("/hooks"), "{installed}");
     assert!(Path::new(&installed).join("pre-push").is_file());
-    assert!(std::fs::read_to_string(&g.path_target).unwrap().contains("fail2commit"));
+    assert!(std::fs::read_to_string(&g.path_target)
+        .unwrap()
+        .contains("fail2commit"));
 
     // A clean push runs through the installed hook and the chained prior hook.
     let c = g.commit(&work, "a.txt", "1\n", "clean change");
@@ -67,7 +77,9 @@ fn setup_push_through_installed_hook_and_exact_uninstall() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(g.head_of(&remote, "main"), c);
     assert!(
-        std::fs::read_to_string(&prior_log).unwrap().contains("refs/heads/main"),
+        std::fs::read_to_string(&prior_log)
+            .unwrap()
+            .contains("refs/heads/main"),
         "the third-party hook was chained"
     );
 
@@ -77,17 +89,28 @@ fn setup_push_through_installed_hook_and_exact_uninstall() {
     assert!(!o.status.success());
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("Secret"), "{err}");
-    assert!(!err.contains(&aws_key()), "the secret value must never be printed");
+    assert!(
+        !err.contains(&aws_key()),
+        "the secret value must never be printed"
+    );
     assert_eq!(g.head_of(&remote, "main"), c);
 
     let r = w.run(&g.root, &["uninstall-integrations"]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(hooks_path(&w).as_deref(), prior.to_str());
-    assert_eq!(std::fs::read(&g.gitcfg).unwrap(), cfg_before, "global git config restored byte for byte");
+    assert_eq!(
+        std::fs::read(&g.gitcfg).unwrap(),
+        cfg_before,
+        "global git config restored byte for byte"
+    );
     assert_eq!(std::fs::read(prior.join("pre-push")).unwrap(), hook_before);
     assert_eq!(std::fs::read(&g.path_target).unwrap(), profile_before);
     assert!(!Path::new(&installed).join("pre-push").exists());
-    assert!(!w.paths.bin_dir.join(if cfg!(windows) { "git.exe" } else { "git" }).exists());
+    assert!(!w
+        .paths
+        .bin_dir
+        .join(if cfg!(windows) { "git.exe" } else { "git" })
+        .exists());
     // With integrations gone the prior hook still guards pushes on its own.
     let c2 = g.commit(&work, "b.txt", "2\n", "after uninstall");
     let o = g.push(&work, &["origin", "main"]);

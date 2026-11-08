@@ -26,7 +26,7 @@ structured arguments (on Linux it follows the real `npm` launcher or standard in
 1. **Lock and recover.** One lock per project (`<state>/npm/<sha256(project path)>.lock`). An
    interrupted earlier apply is rolled back (or finished) first and reported.
 2. **Stage.** Copies `package.json`, `package-lock.json` and the allowlisted project `.npmrc`
-   settings into `<cache>/npm-staging/`. npm runs with a cleared environment, a staged
+   settings into `<cache>/sandbox-stage/`. npm runs with a cleared environment, a staged
    `--userconfig`/`--globalconfig`, a private `--cache`, and `ignore-scripts=true`.
 3. **Pin configuration.** The registry is `registry=` from `<config>/npmrc` (or the user's
    `~/.npmrc`, unless `FAIL2COMMIT_HOME` relocates trusted state), else

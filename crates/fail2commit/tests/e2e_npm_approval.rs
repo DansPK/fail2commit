@@ -37,7 +37,10 @@ fn approve_installs_exactly_the_approved_plan() {
     assert_eq!(resp.code, ResultCode::Ok, "{out}");
     assert_eq!(exit, 0);
     assert!(n.project.join("node_modules/advised/index.js").is_file());
-    assert_eq!(resp.data["digest"], req.digest, "the applied plan is the approved plan");
+    assert_eq!(
+        resp.data["digest"], req.digest,
+        "the applied plan is the approved plan"
+    );
     assert_no_scratch(&n.project);
 }
 
@@ -72,7 +75,11 @@ fn changed_plan_digest_is_rejected() {
     api.send(&ClientMessage::ApprovalResponse(r));
     let (resp, exit, _) = api.finish();
     assert_eq!(resp.code, ResultCode::Rejected);
-    assert!(resp.message.contains("operation changed"), "{}", resp.message);
+    assert!(
+        resp.message.contains("operation changed"),
+        "{}",
+        resp.message
+    );
     assert_eq!(exit, 10);
     assert_eq!(snapshot(&n.project), before);
 }
@@ -82,7 +89,10 @@ fn unattended_fails_closed_with_exit_11() {
     require_node();
     let n = world();
     let before = snapshot(&n.project);
-    let r = n.w.run(&n.project, &["--json", "--approver", "none", "npm", "install", "advised"]);
+    let r = n.w.run(
+        &n.project,
+        &["--json", "--approver", "none", "npm", "install", "advised"],
+    );
     assert_eq!(r.code, 11, "{}\n{}", r.stdout, r.stderr);
     assert_eq!(r.json["code"], "approval_unavailable");
     assert_eq!(snapshot(&n.project), before);

@@ -88,7 +88,9 @@ fn serve(conn: TcpStream, token: &str) {
         return;
     }
     // A reply of nothing means Cancel on the hook side.
-    let Some(reply) = write_request(&fwd.request).then(|| read_message(&fwd.request)).flatten()
+    let Some(reply) = write_request(&fwd.request)
+        .then(|| read_message(&fwd.request))
+        .flatten()
     else {
         return;
     };
@@ -107,7 +109,8 @@ pub(crate) fn ask(req: &ApprovalRequest, target: &str) -> Option<ClientMessage> 
     }
     let mut conn = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
     let left = req.expires_at.saturating_sub(crate::approver::now_secs()) + 5;
-    conn.set_read_timeout(Some(Duration::from_secs(left))).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(left)))
+        .ok()?;
     let msg = serde_json::json!({ "token": token, "request": req });
     writeln!(conn, "{msg}").ok()?;
     let mut line = Vec::new();

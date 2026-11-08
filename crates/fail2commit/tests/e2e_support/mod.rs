@@ -62,7 +62,11 @@ impl World {
     pub fn private_exe(&mut self) {
         let dir = self.env.root.join("installed");
         std::fs::create_dir_all(&dir).unwrap();
-        let name = if cfg!(windows) { "fail2commit.exe" } else { "fail2commit" };
+        let name = if cfg!(windows) {
+            "fail2commit.exe"
+        } else {
+            "fail2commit"
+        };
         let dst = dir.join(name);
         if std::fs::hard_link(exe(), &dst).is_err() {
             std::fs::copy(exe(), &dst).unwrap();

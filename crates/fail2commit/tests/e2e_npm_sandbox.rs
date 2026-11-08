@@ -10,9 +10,9 @@
 
 mod e2e_support;
 
+use e2e_support::approval::answer;
 use e2e_support::npm::{require_node, snapshot, Pkg};
 use e2e_support::npm_world::NpmWorld;
-use e2e_support::approval::answer;
 use fail2commit_core::protocol::{ApprovalKind, Decision, ResultCode};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,7 +29,12 @@ fn js(s: &std::path::Path) -> String {
     serde_json::to_string(&s.to_string_lossy()).unwrap()
 }
 
-fn hostile_js(canary: &std::path::Path, checkout: &std::path::Path, outside: &std::path::Path, port: u16) -> String {
+fn hostile_js(
+    canary: &std::path::Path,
+    checkout: &std::path::Path,
+    outside: &std::path::Path,
+    port: u16,
+) -> String {
     format!(
         r#"
 const fs = require('fs'), net = require('net');
@@ -68,7 +73,17 @@ fn native_build_runs_in_the_real_sandbox_and_its_artifact_is_installed() {
             .script("install", "node build.js")
             .file("build.js", BUILD_JS),
     );
-    let r = n.w.run(&n.project, &["--json", "--approver", "none", "npm", "install", "native-build"]);
+    let r = n.w.run(
+        &n.project,
+        &[
+            "--json",
+            "--approver",
+            "none",
+            "npm",
+            "install",
+            "native-build",
+        ],
+    );
     assert_eq!(r.code, 0, "{}\n{}\n{}", r.stdout, r.stderr, r.json);
     let pkg = n.project.join("node_modules/native-build");
     assert_eq!(
@@ -114,23 +129,35 @@ fn hostile_script_cannot_reach_network_home_or_checkout() {
     n.reg.publish(
         &Pkg::new("hostile", "1.0.0")
             .script("install", "node hostile.js")
-            .file("hostile.js", &hostile_js(&canary, &n.project, &outside, port)),
+            .file(
+                "hostile.js",
+                &hostile_js(&canary, &n.project, &outside, port),
+            ),
     );
     let before_checkout = std::fs::read(&checkout_file).unwrap();
-    let r = n.w.run(&n.project, &["--json", "--approver", "none", "npm", "install", "hostile"]);
+    let r = n.w.run(
+        &n.project,
+        &["--json", "--approver", "none", "npm", "install", "hostile"],
+    );
     assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
     let report: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(n.project.join("node_modules/hostile/build/report.json")).unwrap(),
     )
     .unwrap();
-    for k in ["read_home_canary", "list_checkout", "write_outside"] {
+    // `write_outside` may succeed inside bubblewrap's private /tmp; the host
+    // check below is what proves nothing escaped.
+    for k in ["read_home_canary", "list_checkout"] {
         let v = report[k].as_str().unwrap();
         assert!(v.starts_with("blocked:"), "{k} reached the host: {v}");
     }
     let net = report["net"].as_str().unwrap();
     assert!(net.starts_with("blocked:"), "network reachable: {net}");
     assert!(report["cwd"].as_str().unwrap().contains("sandbox-stage"));
-    assert_eq!(conns.load(Ordering::SeqCst), 0, "the loopback listener saw a connection");
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        0,
+        "the loopback listener saw a connection"
+    );
     assert!(!outside.exists(), "package wrote outside its stage");
     assert_eq!(std::fs::read(&checkout_file).unwrap(), before_checkout);
     assert!(n.stage_leftovers().is_empty(), "{:?}", n.stage_leftovers());
@@ -145,7 +172,9 @@ fn linux_native_c_build_through_the_sandbox() {
             std::env::var_os("F2C_REQUIRE_NATIVE_BUILD").is_none(),
             "F2C_REQUIRE_NATIVE_BUILD set but /usr/bin/cc is missing"
         );
-        eprintln!("SKIPPED linux_native_c_build_through_the_sandbox: no /usr/bin/cc (pending evidence)");
+        eprintln!(
+            "SKIPPED linux_native_c_build_through_the_sandbox: no /usr/bin/cc (pending evidence)"
+        );
         return;
     }
     let n = NpmWorld::new(&[], true);
@@ -160,10 +189,14 @@ fn linux_native_c_build_through_the_sandbox() {
                 "#include <stdio.h>\nint main(void){printf(\"native-c:%d\\n\", 6*7);return 0;}\n",
             ),
     );
-    let r = n.w.run(&n.project, &["--json", "--approver", "none", "npm", "install", "native-c"]);
+    let r = n.w.run(
+        &n.project,
+        &["--json", "--approver", "none", "npm", "install", "native-c"],
+    );
     assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
     assert_eq!(
-        std::fs::read_to_string(n.project.join("node_modules/native-c/build/artifact.txt")).unwrap(),
+        std::fs::read_to_string(n.project.join("node_modules/native-c/build/artifact.txt"))
+            .unwrap(),
         "native-c:42\n"
     );
 }
@@ -175,7 +208,8 @@ fn host_script_pkg(n: &NpmWorld, marker: &std::path::Path) {
         "node -e \"require('fs').writeFileSync({}, 'ran-on-host')\" && echo node-gyp",
         js(marker).replace('"', "'")
     );
-    n.reg.publish(&Pkg::new("needs-host", "1.0.0").script("install", &script));
+    n.reg
+        .publish(&Pkg::new("needs-host", "1.0.0").script("install", &script));
 }
 
 #[test]
@@ -185,7 +219,17 @@ fn sandbox_off_required_script_fails_closed_without_an_approver() {
     let marker = n.w.env.root.join("host-ran.txt");
     host_script_pkg(&n, &marker);
     let before = snapshot(&n.project);
-    let r = n.w.run(&n.project, &["--json", "--approver", "none", "npm", "install", "needs-host"]);
+    let r = n.w.run(
+        &n.project,
+        &[
+            "--json",
+            "--approver",
+            "none",
+            "npm",
+            "install",
+            "needs-host",
+        ],
+    );
     assert_eq!(r.code, 11, "{}\n{}", r.stdout, r.stderr);
     assert_eq!(r.json["code"], "approval_unavailable");
     assert!(!marker.exists());
@@ -212,7 +256,11 @@ fn sandbox_off_declined_host_run_changes_nothing_and_approval_runs_it_once() {
     assert_eq!(resp.code, ResultCode::Rejected, "{out}");
     assert_eq!(exit, 10);
     assert!(!marker.exists(), "a declined host run must not execute");
-    assert_eq!(snapshot(&n.project), before, "a declined host run changes nothing");
+    assert_eq!(
+        snapshot(&n.project),
+        before,
+        "a declined host run changes nothing"
+    );
     no_scratch(&n.project);
 
     // The same plan approved for host execution runs the script exactly once.
@@ -238,7 +286,17 @@ fn sandbox_off_optional_script_is_skipped_without_asking() {
             js(&marker).replace('"', "'")
         ),
     ));
-    let r = n.w.run(&n.project, &["--json", "--approver", "none", "npm", "install", "optional-script"]);
+    let r = n.w.run(
+        &n.project,
+        &[
+            "--json",
+            "--approver",
+            "none",
+            "npm",
+            "install",
+            "optional-script",
+        ],
+    );
     assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
     assert_eq!(r.json["data"]["scripts"], "Skipped");
     assert!(!marker.exists());

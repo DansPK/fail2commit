@@ -15,17 +15,24 @@ use std::path::PathBuf;
 fn rewritten() -> (World, PathBuf, PathBuf, String, String) {
     let w = World::new();
     let (work, remote) = w.env.repo_with_remote("repo");
-    w.env.setup();
+    w.setup();
     w.set_password("push");
     let old = w.env.head_of(&work, "HEAD");
-    w.env.git(&work, &["commit", "-q", "--amend", "-m", "rewritten"]);
+    w.env
+        .git(&work, &["commit", "-q", "--amend", "-m", "rewritten"]);
     let new = w.env.head_of(&work, "HEAD");
     assert_ne!(old, new);
     (w, work, remote, old, new)
 }
 
 /// Start the guarded force push and return its approval request.
-fn start(w: &World, work: &std::path::Path) -> (e2e_support::ApiClient, fail2commit_core::protocol::ApprovalRequest) {
+fn start(
+    w: &World,
+    work: &std::path::Path,
+) -> (
+    e2e_support::ApiClient,
+    fail2commit_core::protocol::ApprovalRequest,
+) {
     let mut api = w.api(work, &["git", "push", "--force", "origin", "main"]);
     let req = api.approval_request();
     assert!(req.password_required, "a force push asks for the password");
@@ -40,12 +47,20 @@ fn approve_with_the_password_pushes() {
     let (mut api, req) = start(&w, &work);
     api.send(&answer(&req, Decision::ApproveOnce, Some(&pw("push"))));
     let (resp, exit, out) = api.finish();
-    assert_eq!(resp.code, ResultCode::Ok, "{}
-{out}", resp.message);
+    assert_eq!(
+        resp.code,
+        ResultCode::Ok,
+        "{}
+{out}",
+        resp.message
+    );
     assert_eq!((exit, resp.tool_exit), (0, Some(0)));
     assert_eq!(w.env.head_of(&remote, "refs/heads/main"), new);
     assert_ne!(old, new);
-    assert!(!out.contains(&pw("push")), "the password must not appear in any output");
+    assert!(
+        !out.contains(&pw("push")),
+        "the password must not appear in any output"
+    );
 }
 
 #[test]
@@ -84,7 +99,9 @@ fn an_answer_for_a_changed_tuple_is_refused() {
     .unwrap()
     .to_string();
     assert_ne!(other, req.digest);
-    let ClientMessage::ApprovalResponse(mut r) = answer(&req, Decision::ApproveOnce, Some(&pw("push"))) else {
+    let ClientMessage::ApprovalResponse(mut r) =
+        answer(&req, Decision::ApproveOnce, Some(&pw("push")))
+    else {
         unreachable!()
     };
     r.digest = other;
@@ -98,7 +115,19 @@ fn an_answer_for_a_changed_tuple_is_refused() {
 #[test]
 fn unattended_force_push_fails_closed() {
     let (w, work, remote, old, _) = rewritten();
-    let r = w.run(&work, &["--json", "--approver", "none", "git", "push", "--force", "origin", "main"]);
+    let r = w.run(
+        &work,
+        &[
+            "--json",
+            "--approver",
+            "none",
+            "git",
+            "push",
+            "--force",
+            "origin",
+            "main",
+        ],
+    );
     // `fail2commit git` returns git's own status; the hook says why it stopped.
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stderr.contains("running unattended"), "{}", r.stderr);
