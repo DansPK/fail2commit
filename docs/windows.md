@@ -1,0 +1,61 @@
+# fail2commit on Windows
+
+Scope: FR-009 / SPEC-009. Supported target: Windows 11 x64 with PowerShell and Git for Windows. Other editions are not measured; see "Caveats".
+
+## What is installed
+
+The per-user installer (`fail2commit-<version>-setup.exe`, NSIS) needs no administrator rights. It writes only to:
+
+| Location | Content |
+|---|---|
+| `%LOCALAPPDATA%\Programs\fail2commit` | `fail2commit.exe`, `fail2commit-tray.exe`, `LICENSE`, notices, `docs\windows.md`, `uninstall.exe` |
+| `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\fail2commit` | Apps & features entry |
+| Start Menu, `fail2commit\fail2commit tray.lnk` | Tray shortcut |
+| `HKCU\...\CurrentVersion\Run`, value `fail2commit-tray` | Only if you choose "Start the tray at sign-in" |
+
+The installer offers two optional steps, both visible on the components page:
+
+- **Set up guards** runs `fail2commit setup`. Every change it makes is recorded in `setup.json` under `%LOCALAPPDATA%\fail2commit\state`.
+- **Start the tray at sign-in** adds the Run value. You can toggle it later from the tray menu.
+
+## Uninstall
+
+Apps & features (or `uninstall.exe`) does this, in order: asks a running tray to exit, runs `fail2commit uninstall-integrations` (restores exactly the recorded changes, including the previous value of the Run entry), removes the Run value if it points into this install, deletes the files listed above, and removes the shortcut and the uninstall key. Third-party hooks, an existing `core.hooksPath`, PATH entries and other Run values are not touched.
+
+Kept on purpose: `%LOCALAPPDATA%\fail2commit` and `%APPDATA%\fail2commit` (settings, password verifier, caches). Delete both folders to remove all fail2commit data.
+
+## The tray
+
+`fail2commit-tray.exe` is a native Win32 per-user program with a notification-area icon. It uses no timers or polling for approvals: a pipe thread blocks until a request arrives and wakes the UI thread with a window message.
+
+- **Approval request**: a dialog shows the summary, detail lines and redacted findings, with a notification balloon. Buttons: **Cancel** (default; Enter and Esc also cancel), **Approve once**, and **Run on host once** when the request offers it. A password box (hidden input) appears only when the request requires the force-push password. A request that is not answered by its expiry is cancelled.
+- **Menu**: pending approvals, "Run build scripts in sandbox" (the same trusted setting as `fail2commit sandbox on/off`), set / change / reset password (opens a console running `fail2commit password ...`, so secrets are typed on hidden console input and never pass through the tray), "Start at sign-in", Exit.
+- **One tray per user.** A second start exits immediately because the approval pipe already exists.
+
+### Closing the tray
+
+Guards stay active. With no tray listening, `fail2commit` falls back to the terminal prompt when it has an interactive console, and otherwise rejects with `approval_unavailable` (exit 11). Approval is never assumed.
+
+## Approval pipe
+
+Name: `\\.\pipe\fail2commit-approval-<your user SID>`. Protections:
+
+- `PIPE_REJECT_REMOTE_CLIENTS`; `FILE_FLAG_FIRST_PIPE_INSTANCE` so another process cannot squat the name.
+- DACL, in this order: deny `S-1-15-2-1` (ALL APPLICATION PACKAGES), deny `S-1-15-2-2` (ALL RESTRICTED APPLICATION PACKAGES), allow only your user SID. No Administrators or SYSTEM entry.
+- The tray checks each client's process token: it must be your SID and not an AppContainer (LowBox) token. The CLI checks that the server process runs as your SID and not in an AppContainer, and opens the pipe with anonymous impersonation.
+- Messages are single JSON lines, at most 256 KiB, in the frozen protocol. The tray validates field sizes, request id / nonce / digest format, the session id, the allowed decisions and the expiry window before showing anything. The CLI validates the reply (request id, nonce, digest, decision offered, password present, not expired) before acting.
+
+## Building the installer
+
+```powershell
+powershell -File packaging\windows\build.ps1 -Version 0.1.0
+```
+
+`build.ps1` builds the release binaries, stages them under `target\dist\stage`, and runs `makensis`. It uses `-Makensis <path>`, else a portable NSIS under `target\nsis\nsis-*`, else `makensis` on PATH. A portable NSIS can be unpacked from the official SourceForge zip without installing anything; the hash used for the recorded build is in `docs/verify/VERIFY-2026-11-08-windows-tray.md`.
+
+## Caveats
+
+- Measured only on Windows 11 Pro (build 26200) x64. Windows 10, Windows Server, ARM64 and Home/Education/Enterprise differences are not tested.
+- The binaries are unsigned, so SmartScreen may warn on first run.
+- Notification balloons can be hidden by Focus Assist; the dialog is shown at the same time and the tray icon tooltip shows the pending count.
+- Clean-machine install / uninstall is checked by the release task (T-011), not by the worker tests.
