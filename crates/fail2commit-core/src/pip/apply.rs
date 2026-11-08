@@ -1,0 +1,298 @@
+//! Offline apply from the reviewed wheel set, with a recovery journal.
+//!
+//! The reviewed directory holds exactly the planned wheels. Each is installed
+//! with `--no-index --no-deps --require-hashes`, so pip cannot re-resolve,
+//! reach an index, or accept different bytes. Progress is journaled; an
+//! interrupted apply is rolled forward (never silently dropped) by the next
+//! run against the same interpreter.
+
+use super::interp::{Cancel, Interpreter, RunLimits};
+use super::plan::PlanWheel;
+use crate::paths::TrustedPaths;
+use crate::Error;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Journal {
+    pub version: u32,
+    pub python: String,
+    pub digest: String,
+    pub reviewed: PathBuf,
+    pub wheels: Vec<PlanWheel>,
+    /// Wheels already installed, in plan order.
+    pub done: usize,
+}
+
+pub type BeforeWheel = Box<dyn Fn(usize, &PlanWheel) -> crate::Result<()>>;
+
+/// Test seam: runs before each wheel is installed; an error simulates a
+/// crash at that point (the journal is left behind, as after a real one).
+#[derive(Default)]
+pub struct ApplyHooks {
+    pub before_wheel: Option<BeforeWheel>,
+}
+
+pub fn journal_path(paths: &TrustedPaths, python: &str) -> PathBuf {
+    let id = hex::encode(&Sha256::digest(python.as_bytes())[..8]);
+    paths
+        .state_dir
+        .join("pip")
+        .join(format!("journal-{id}.json"))
+}
+
+pub fn read_journal(paths: &TrustedPaths, python: &str) -> crate::Result<Option<Journal>> {
+    let p = journal_path(paths, python);
+    if !p.exists() {
+        return Ok(None);
+    }
+    let bytes = crate::fsutil::read_bounded(&p, 4 * 1024 * 1024)?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| Error::integrity(format!("pip journal {} is invalid: {e}", p.display())))
+}
+
+fn write_journal(paths: &TrustedPaths, j: &Journal) -> crate::Result<()> {
+    let bytes = serde_json::to_vec(j).map_err(|e| Error::internal(e.to_string()))?;
+    crate::fsutil::atomic_write(&journal_path(paths, &j.python), &bytes)
+}
+
+fn sha256_file(p: &Path) -> crate::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(p)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hex::encode(h.finalize()));
+        }
+        h.update(&buf[..n]);
+    }
+}
+
+/// Copy the staged wheels into a fresh directory, re-hashing as we go.
+pub fn materialize(
+    paths: &TrustedPaths,
+    wheels: &[(PlanWheel, PathBuf)],
+) -> crate::Result<PathBuf> {
+    let root = paths.cache_dir.join("pip").join("reviewed");
+    crate::fsutil::ensure_private_dir(&root)?;
+    let dir = root.join(&crate::digest::random_hex32()?[..16]);
+    crate::fsutil::ensure_private_dir(&dir)?;
+    for (w, src) in wheels {
+        let dest = dir.join(&w.filename);
+        std::fs::copy(src, &dest)?;
+        if sha256_file(&dest)? != w.sha256 {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(Error::integrity(format!(
+                "{} changed while staging",
+                w.filename
+            )));
+        }
+    }
+    Ok(dir)
+}
+
+/// The directory must hold exactly the reviewed files with the reviewed
+/// bytes: a substituted, added or modified wheel invalidates the plan.
+pub fn verify_reviewed(dir: &Path, wheels: &[PlanWheel]) -> crate::Result<()> {
+    let mut found: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| Error::integrity(format!("reviewed set unreadable: {e}")))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    let mut want: Vec<String> = wheels.iter().map(|w| w.filename.clone()).collect();
+    want.sort();
+    if found != want {
+        return Err(Error::integrity(
+            "the reviewed wheel set changed (files added or removed); plan invalidated",
+        ));
+    }
+    for w in wheels {
+        let p = dir.join(&w.filename);
+        let meta = std::fs::symlink_metadata(&p)?;
+        if !meta.is_file() || meta.len() != w.size || sha256_file(&p)? != w.sha256 {
+            return Err(Error::integrity(format!(
+                "{} no longer matches the reviewed hash; plan invalidated",
+                w.filename
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Arguments after `-m pip` for one offline install. No index, no
+/// dependency resolution, hashes required.
+pub fn apply_args(reviewed: &Path, hashes_file: &Path) -> Vec<OsString> {
+    let mut a: Vec<OsString> = [
+        "install",
+        "--no-index",
+        "--no-deps",
+        "--require-hashes",
+        "--only-binary=:all:",
+        "--no-cache-dir",
+        "--find-links",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    a.push(reviewed.into());
+    a.push("-r".into());
+    a.push(hashes_file.into());
+    a
+}
+
+pub struct ApplyCtx<'a> {
+    pub paths: &'a TrustedPaths,
+    pub interp: &'a Interpreter,
+    pub limits: &'a RunLimits,
+    pub cancel: &'a Cancel,
+    pub hooks: &'a ApplyHooks,
+}
+
+/// Journal, install every wheel in order, verify, then clear the journal.
+pub fn apply(
+    cx: &ApplyCtx<'_>,
+    digest: &str,
+    reviewed: &Path,
+    wheels: &[PlanWheel],
+) -> crate::Result<()> {
+    let journal = Journal {
+        version: 1,
+        python: cx.interp.executable.clone(),
+        digest: digest.to_string(),
+        reviewed: reviewed.to_path_buf(),
+        wheels: wheels.to_vec(),
+        done: 0,
+    };
+    let jp = journal_path(cx.paths, &journal.python);
+    crate::fsutil::with_lock(&jp, || {
+        write_journal(cx.paths, &journal)?;
+        run_journal(cx, journal)
+    })
+}
+
+/// Roll a pending journal forward: the reviewed set is re-verified byte for
+/// byte first, so recovery installs only what was approved.
+pub fn recover(cx: &ApplyCtx<'_>) -> crate::Result<Option<usize>> {
+    let jp = journal_path(cx.paths, &cx.interp.executable);
+    crate::fsutil::with_lock(&jp, || {
+        let Some(j) = read_journal(cx.paths, &cx.interp.executable)? else {
+            return Ok(None);
+        };
+        let n = j.wheels.len();
+        run_journal(cx, j)?;
+        Ok(Some(n))
+    })
+}
+
+fn run_journal(cx: &ApplyCtx<'_>, mut j: Journal) -> crate::Result<()> {
+    verify_reviewed(&j.reviewed, &j.wheels).map_err(|e| {
+        Error::integrity(format!(
+            "{} (journal: {})",
+            e.message,
+            journal_path(cx.paths, &j.python).display()
+        ))
+    })?;
+    let hashes_dir = cx.paths.state_dir.join("pip");
+    crate::fsutil::ensure_private_dir(&hashes_dir)?;
+    for i in j.done..j.wheels.len() {
+        if cx.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::rejected(
+                "canceled during apply; run again to finish the reviewed install",
+            ));
+        }
+        let w = &j.wheels[i];
+        if let Some(h) = &cx.hooks.before_wheel {
+            h(i, w)?;
+        }
+        let hf = hashes_dir.join(format!("hashes-{}.txt", &j.digest[..16]));
+        std::fs::write(&hf, w.hash_line())?;
+        let mut cmd = cx.interp.pip();
+        cmd.args(apply_args(&j.reviewed, &hf));
+        let out = super::interp::run(&mut cmd, cx.limits, cx.cancel);
+        let _ = std::fs::remove_file(&hf);
+        let out = out?;
+        if out.status != Some(0) {
+            return Err(Error::internal(format!(
+                "offline install of {} failed: {}",
+                w.filename,
+                super::interp::tail(&out.stderr)
+            )));
+        }
+        j.done = i + 1;
+        write_journal(cx.paths, &j)?;
+    }
+    verify_installed(cx, &j.wheels)?;
+    let _ = std::fs::remove_file(journal_path(cx.paths, &j.python));
+    let _ = std::fs::remove_dir_all(&j.reviewed);
+    Ok(())
+}
+
+/// The environment must now contain exactly the planned versions.
+pub fn verify_installed(cx: &ApplyCtx<'_>, wheels: &[PlanWheel]) -> crate::Result<()> {
+    let installed = cx.interp.installed(cx.limits, cx.cancel)?;
+    for w in wheels {
+        let ok = installed
+            .iter()
+            .any(|(n, v)| *n == w.name && v.eq_ignore_ascii_case(&w.version));
+        if !ok {
+            return Err(Error::integrity(format!(
+                "{}=={} is not installed as planned (substitution or failed install)",
+                w.name, w.version
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_uses_no_index_and_no_resolution() {
+        let a: Vec<String> = apply_args(Path::new("/r"), Path::new("/h.txt"))
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        for must in [
+            "--no-index",
+            "--no-deps",
+            "--require-hashes",
+            "--find-links",
+        ] {
+            assert!(a.iter().any(|x| x == must), "{must}");
+        }
+        assert!(!a
+            .iter()
+            .any(|x| x.contains("index-url") || x == "--upgrade"));
+        let fl = a.iter().position(|x| x == "--find-links").unwrap();
+        assert_eq!(a[fl + 1], "/r");
+    }
+
+    #[test]
+    fn reviewed_set_detects_changes() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = b"wheel bytes";
+        let w = PlanWheel {
+            name: "a".into(),
+            version: "1".into(),
+            filename: "a-1-py3-none-any.whl".into(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+        };
+        std::fs::write(d.path().join(&w.filename), bytes).unwrap();
+        verify_reviewed(d.path(), std::slice::from_ref(&w)).unwrap();
+        std::fs::write(d.path().join("extra-1-py3-none-any.whl"), b"x").unwrap();
+        assert!(verify_reviewed(d.path(), std::slice::from_ref(&w)).is_err());
+        std::fs::remove_file(d.path().join("extra-1-py3-none-any.whl")).unwrap();
+        std::fs::write(d.path().join(&w.filename), b"tampered!!!").unwrap();
+        let e = verify_reviewed(d.path(), std::slice::from_ref(&w)).unwrap_err();
+        assert_eq!(e.code, crate::ResultCode::IntegrityFailure);
+    }
+}

@@ -1,15 +1,83 @@
-//! T-005 (FR-005) owns this file: define `Args` and `run` freely.
+//! Guarded pip (FR-005, T-005).
+//!
+//! `fail2commit pip [--python <interpreter>] install <names | -r file>` is
+//! also what the `pip`/`pip3` shims run. It is the guarded replacement for
+//! `python -m pip` / `py -m pip`: a shim cannot intercept arbitrary
+//! interpreter invocations. Anything other than `install` and a few
+//! read-only commands is refused instead of reaching an unguarded pip.
 
-use super::{CmdResult, Ctx};
+use super::{CmdResult, Ctx, Outcome};
+use fail2commit_core::pip;
 use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
-    /// Placeholder until T-005 defines real arguments.
+    /// Interpreter whose environment is resolved for and installed into.
+    /// Defaults to the Python next to the real `pip` on PATH.
+    #[arg(long, value_name = "INTERPRETER")]
+    pub python: Option<PathBuf>,
+    /// `install <requirements | -r file>` or a read-only pip command.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<OsString>,
 }
 
-pub fn run(_ctx: &Ctx, _args: Args) -> CmdResult {
-    Err(fail2commit_core::Error::not_implemented("guarded pip"))
+pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
+    let python = match args.python {
+        Some(p) => std::path::absolute(&p)
+            .map_err(|e| fail2commit_core::Error::invalid(format!("--python: {e}")))?,
+        None => pip::default_python(&ctx.paths)?,
+    };
+    let mut rest = args.args.into_iter();
+    let Some(sub) = rest.next() else {
+        return Err(fail2commit_core::Error::invalid(
+            "usage: fail2commit pip [--python <interpreter>] install <requirements>",
+        ));
+    };
+    let rest: Vec<OsString> = rest.collect();
+    if sub != "install" {
+        let all: Vec<OsString> = std::iter::once(sub).chain(rest).collect();
+        let (code, out) = pip::passthrough(&python, &all, ctx.json)?;
+        return Ok(Outcome {
+            tool_exit: Some(code),
+            data: serde_json::json!({ "stdout": String::from_utf8_lossy(&out) }),
+            ..Default::default()
+        });
+    }
+    let cwd = std::env::current_dir()?;
+    let actx = ctx.approval();
+    let seams = pip::Seams::production(&actx, Arc::new(AtomicBool::new(false)));
+    let r = pip::install(&actx, &python, &rest, &cwd, &seams)?;
+    let message = if r.packages.is_empty() {
+        "nothing to install; requirements already satisfied".to_string()
+    } else {
+        format!(
+            "installed {} wheel(s) into {}: {}",
+            r.packages.len(),
+            r.interpreter,
+            r.packages
+                .iter()
+                .map(|w| format!("{}=={}", w.name, w.version))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let data = serde_json::json!({
+        "interpreter": r.interpreter,
+        "index": r.index,
+        "digest": r.digest,
+        "approved": r.approved,
+        "recovered": r.recovered,
+        "packages": r.packages.iter().map(|w| serde_json::json!({
+            "name": w.name, "version": w.version, "filename": w.filename, "sha256": w.sha256,
+        })).collect::<Vec<_>>(),
+    });
+    Ok(Outcome {
+        message,
+        findings: r.findings,
+        tool_exit: Some(0),
+        data,
+    })
 }
