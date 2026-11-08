@@ -59,6 +59,21 @@ real `pip::install` against the offline loopback index with a wheel carrying
 package is installed, and the marker file that only the `.pth` can create
 exists.
 
+**Why High under the SPEC-005 threat model.** SPEC-005 requires apply to run
+offline from the reviewed wheel set "with no dependency re-resolution, and
+reject substitutions", and SPEC-007 requires that any untrusted code that must
+execute runs only after policy approval under a verified sandbox. A `*.pth` is
+not a substitution — the bytes are exactly the reviewed ones — but it is
+package-controlled code, and it runs unsandboxed inside the guarded command with
+no approval, so the only premise holding the boundary up is FR-005's claim that
+"wheels execute no code at install time" (`docs/pip.md:103-105`); that claim is
+what makes the guard pass `has_scripts: false` instead of asking. The threat is
+the one this guard exists for: one compromised or malicious *transitive* wheel
+(supply-chain compromise, typo-squat) is approved as an opaque hash, and the
+advisory scan is then the only remaining barrier — which is exactly the case
+where no advisory exists yet. Not Critical only because it needs that one
+approved wheel; not lower because nothing else in the command notices.
+
 **Suggested fix:** treat import-bearing `*.pth`, `sitecustomize.py` and
 `usercustomize.py` in the reviewed wheel set as package-controlled code: deny by
 default, or pass `has_scripts: true` to `exec::authorize_scripts` and run the
