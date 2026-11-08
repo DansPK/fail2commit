@@ -1,0 +1,8 @@
+{
+  "results": [
+    {
+      "vulns": [{ "id": "GHSA-aaaa-bbbb-cccc" }],
+      "next_page_token": "page-2"
+    }
+  ]
+}
