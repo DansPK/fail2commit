@@ -1,5 +1,6 @@
 //! Re-review of the CR-010 approval relay (docs/verify/REREVIEW-2026-11-09-relay.md).
-//! Each test PASSES while the weakness is present; a fix should invert it.
+//! RR-001..RR-003 are regression tests for the fixes (the reproductions were
+//! inverted); RR-004 stays a reproduction of accepted residual risk (CR-011).
 //! Synthetic values only.
 
 mod e2e_support;
@@ -7,6 +8,7 @@ mod e2e_support;
 use e2e_support::approval::{answer, pw};
 use e2e_support::World;
 use fail2commit_core::approval::relay;
+use fail2commit_core::approval::relay::Expected;
 use fail2commit_core::approver::new_request;
 use fail2commit_core::digest::Digest;
 use fail2commit_core::protocol::{ApprovalKind, ApprovalRequest, Decision, ResultCode};
@@ -14,7 +16,20 @@ use sha2::{Digest as _, Sha256};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+fn expected() -> Expected {
+    Expected {
+        remote: "origin".into(),
+        url: "file:///r".into(),
+        ttl_secs: 300,
+    }
+}
+
+/// A summary that names the push the host runs.
+fn ours(tag: &str) -> String {
+    format!("git push to origin (file:///r): {tag}")
+}
 
 fn req(tag: &str, summary: &str, password: bool, allowed: Vec<Decision>) -> ApprovalRequest {
     new_request(
@@ -67,17 +82,14 @@ fn send_authenticated(addr: &str, token: &str, r: &ApprovalRequest) -> Option<St
     (!line.is_empty()).then_some(line)
 }
 
-/// RR-001 (CONFIRMED): once the single slot is used, the relay drops its
-/// listener. A token holder frees the port that way, binds it, and answers the
-/// real hook with a valid MAC: no host approval and no password check ran.
+/// RR-001 (fixed): burning the slot with a valid, bound request leaves the
+/// listener bound, so the port cannot be rebound and the real hook gets Cancel.
 #[test]
-fn rr001_token_holder_burns_the_slot_then_impersonates_the_host() {
+fn rr001_burned_slot_keeps_the_port_and_the_hook_gets_cancel() {
     let host_ran = Arc::new(Mutex::new(0u32));
     let h = host_ran.clone();
-    let r = relay::start(move |_| {
+    let r = relay::start(expected(), move |_| {
         *h.lock().unwrap() += 1;
-        // The real host would end the forged request just as fast: a request
-        // with no non-cancel decision returns Cancel before any prompt.
         Ok(Decision::Cancel)
     })
     .unwrap();
@@ -85,98 +97,90 @@ fn rr001_token_holder_burns_the_slot_then_impersonates_the_host() {
     let (addr, token) = target.split_once('/').unwrap();
     let (addr, token) = (addr.to_string(), token.to_string());
 
-    // Attacker (a git sibling that inherited the variable): burn the slot.
-    let burn = req("burn", "burn", false, vec![]);
+    // Token holder burns the slot with a request for this push.
+    let burn = req("burn", &ours("burn"), false, vec![Decision::ApproveOnce]);
     assert!(send_authenticated(&addr, &token, &burn).is_some());
-    // Wait for the listener to go away, then take the port.
-    let t0 = Instant::now();
-    let impostor = loop {
-        if let Ok(l) = TcpListener::bind(&addr) {
-            break l;
-        }
-        assert!(
-            t0.elapsed() < Duration::from_secs(10),
-            "could not rebind the relay port"
-        );
+    assert_eq!(*host_ran.lock().unwrap(), 1);
+    // The port stays taken for as long as the Relay lives.
+    for _ in 0..25 {
+        assert!(TcpListener::bind(&addr).is_err(), "the port was rebound");
         std::thread::sleep(Duration::from_millis(20));
-    };
+    }
+    // Used slot: connections are accepted and closed without a reply.
+    assert!(send_authenticated(&addr, &token, &burn).is_none());
 
-    // The real hook: a password-gated force push. It reaches the impostor.
-    let real = req("real", "git push --force origin main", true, vec![Decision::ApproveOnce]);
-    let (real2, target2) = (real.clone(), target.clone());
-    let hook = std::thread::spawn(move || relay::forward(&real2, &target2));
-    let (c, _) = impostor.accept().unwrap();
-    let mut out = c.try_clone().unwrap();
-    let mut line = String::new();
-    BufReader::new(c).read_line(&mut line).unwrap();
-    let id = &real.request_id;
-    let mac = hmac(
-        token.as_bytes(),
-        &[
-            id.as_bytes(),
-            real.nonce.as_bytes(),
-            real.digest.as_bytes(),
-            b"ApproveOnce",
-        ],
-    );
-    let reply = serde_json::json!({
-        "request_id": real.request_id, "nonce": real.nonce, "digest": real.digest,
-        "decision": "approve_once", "mac": mac,
-    });
-    writeln!(out, "{reply}").unwrap();
-    assert_eq!(
-        hook.join().unwrap(),
-        Decision::ApproveOnce,
-        "the hook accepted an approval from a process that is not the host"
-    );
-    assert_eq!(*host_ran.lock().unwrap(), 1, "only the burn reached the host");
+    let real = req("real", &ours("real"), true, vec![Decision::ApproveOnce]);
+    assert_eq!(relay::forward(&real, &target), Decision::Cancel);
+    assert_eq!(*host_ran.lock().unwrap(), 1, "the host served twice");
     drop(r);
 }
 
-/// RR-002 (CONFIRMED): sixteen token-less connections end the relay, so the real
-/// hook finds nothing listening (fail closed, but a denial of service for any
-/// local process that can find the ephemeral port).
+/// RR-002 (fixed): token-less connections no longer end the relay (even 300 of
+/// them), and the real hook is still answered afterwards.
 #[test]
-fn rr002_sixteen_tokenless_connections_kill_the_relay() {
-    let r = relay::start(|_| Ok(Decision::ApproveOnce)).unwrap();
+fn rr002_tokenless_connections_do_not_kill_the_relay() {
+    let r = relay::start(expected(), |_| Ok(Decision::ApproveOnce)).unwrap();
     let addr = r.env_value().split_once('/').unwrap().0.to_string();
-    let _junk: Vec<TcpStream> = (0..16).filter_map(|_| TcpStream::connect(&addr).ok()).collect();
-    let t0 = Instant::now();
-    while TcpStream::connect(&addr).is_ok() {
-        assert!(t0.elapsed() < Duration::from_secs(10), "still listening");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let real = req("real", "push", false, vec![Decision::ApproveOnce]);
-    assert_eq!(relay::forward(&real, r.env_value()), Decision::Cancel);
+    let _junk: Vec<TcpStream> = (0..300)
+        .filter_map(|_| TcpStream::connect(&addr).ok())
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        TcpStream::connect(&addr).is_ok(),
+        "the relay stopped listening"
+    );
+    drop(_junk);
+    std::thread::sleep(Duration::from_millis(2500)); // pre-auth deadline frees them
+    let real = req("real", &ours("real"), false, vec![Decision::ApproveOnce]);
+    assert_eq!(relay::forward(&real, r.env_value()), Decision::ApproveOnce);
 }
 
-/// RR-003 (CONFIRMED): the host binds nothing about the request to its push. An
-/// authenticated request with any summary, details, kind-Operation digest,
-/// `password_required` and a far-future expiry reaches the host's decision
-/// function unchanged (the real function then prompts the user's client).
+/// RR-003 (fixed): a request for another remote or URL, another kind of
+/// summary or extra decisions is dropped without using the slot; a matching one
+/// is served with `expires_at` clamped to now plus the host's TTL.
 #[test]
-fn rr003_relay_forwards_any_operation_text_and_expiry_to_the_host() {
+fn rr003_relay_binds_requests_to_the_host_push() {
     let seen: Arc<Mutex<Vec<ApprovalRequest>>> = Default::default();
     let s = seen.clone();
-    let r = relay::start(move |q| {
+    let r = relay::start(expected(), move |q| {
         s.lock().unwrap().push(q.clone());
-        Ok(Decision::Cancel)
+        Ok(Decision::ApproveOnce)
     })
     .unwrap();
     let (addr, token) = r.env_value().split_once('/').unwrap();
-    let mut forged = req(
+    let forged = [
+        "Session expired: re-enter your force-push password".to_string(),
+        "git push to evil (file:///r): x".to_string(),
+        "git push to origin (https://evil.test/r): x".to_string(),
+    ];
+    for f in &forged {
+        let q = req("x", f, true, vec![Decision::ApproveOnce]);
+        assert!(send_authenticated(addr, token, &q).is_none(), "{f}");
+    }
+    let wide = req(
         "x",
-        "Session expired: re-enter your force-push password",
-        true,
-        vec![Decision::ApproveOnce],
+        &ours("x"),
+        false,
+        vec![Decision::ApproveOnce, Decision::RunOnHostOnce],
     );
-    forged.expires_at = u64::MAX / 2;
-    let _ = send_authenticated(addr, token, &forged);
+    assert!(send_authenticated(addr, token, &wide).is_none());
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a forged request reached the host"
+    );
+
+    // Control: the matching request is served, and its expiry is clamped.
+    let mut ok = req("ok", &ours("ok"), false, vec![Decision::ApproveOnce]);
+    ok.expires_at = u64::MAX / 2;
+    assert!(send_authenticated(addr, token, &ok).is_some());
     let got = seen.lock().unwrap();
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0].summary, forged.summary);
-    assert!(got[0].password_required);
-    assert_eq!(got[0].expires_at, forged.expires_at);
+    let now = fail2commit_core::approver::now_secs();
+    assert!(
+        got[0].expires_at <= now + 300 && got[0].expires_at > now,
+        "{}",
+        got[0].expires_at
+    );
 }
 
 /// RR-004 (CONFIRMED): git children other than the fail2commit hook inherit the
@@ -207,7 +211,8 @@ fn rr004_receive_pack_child_inherits_the_relay_token() {
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let rp = format!("sh '{}'", fwd(&wrapper));
-    w.env.git(&work, &["config", "remote.origin.receivepack", &rp]);
+    w.env
+        .git(&work, &["config", "remote.origin.receivepack", &rp]);
 
     let mut api = w.api(&work, &["git", "push", "--force", "origin", "main"]);
     let real = api.approval_request();

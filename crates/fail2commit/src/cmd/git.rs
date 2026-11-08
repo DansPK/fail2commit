@@ -71,7 +71,13 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
                         // hook-side check used to; the host verifies the password.
                         let _ = approval::password_required(&ctx.paths);
                         let (paths, settings) = (ctx.paths.clone(), ctx.settings.clone());
-                        let r = relay::start(move |req| {
+                        let expected = expected_push(
+                            &real,
+                            &lossy[..i],
+                            &strs,
+                            ctx.settings.approval.request_ttl_secs,
+                        );
+                        let r = relay::start(expected, move |req| {
                             approval::approve_relayed(
                                 &approval::ApprovalCtx {
                                     paths: &paths,
@@ -141,9 +147,13 @@ fn push_arguments(
 }
 
 fn git_config(real: &Path, globals: &[String], args: &[&str]) -> Option<String> {
+    git_out(real, globals, "config", args)
+}
+
+fn git_out(real: &Path, globals: &[String], sub: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(real)
         .args(globals)
-        .arg("config")
+        .arg(sub)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -153,6 +163,37 @@ fn git_config(real: &Path, globals: &[String], args: &[&str]) -> Option<String> 
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// RR-003: the remote name and (credential-free) push URL this host's own argv
+/// and config select, which is what Git hands the hook. Unresolvable input
+/// yields an expectation nothing matches, so the relay fails closed.
+fn expected_push(
+    real: &Path,
+    globals: &[String],
+    push_args: &[String],
+    ttl_secs: u64,
+) -> relay::Expected {
+    let remote = push_intent(push_args).repository.or_else(|| {
+        let branch = git_out(real, globals, "symbolic-ref", &["--short", "-q", "HEAD"]);
+        let key = |k: &str| {
+            branch
+                .as_ref()
+                .and_then(|b| git_config(real, globals, &["--get", &format!("branch.{b}.{k}")]))
+        };
+        key("pushRemote")
+            .or_else(|| git_config(real, globals, &["--get", "remote.pushDefault"]))
+            .or_else(|| key("remote"))
+            .or_else(|| Some("origin".to_string()))
+    });
+    let url = remote.as_ref().map(|r| {
+        git_out(real, globals, "remote", &["get-url", "--push", r]).unwrap_or_else(|| r.clone())
+    });
+    relay::Expected {
+        remote: remote.unwrap_or_default(),
+        url: fail2commit_core::redact::redact_url_credentials(&url.unwrap_or_default()),
+        ttl_secs,
+    }
 }
 
 /// Command-line force flags plus forced configured push refspecs.

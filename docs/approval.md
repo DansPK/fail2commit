@@ -41,13 +41,24 @@ The terminal prompt accepts only the exact keyword: `approve` for ApproveOnce, `
 
 ## Git hook relay under `api` (CR-010)
 
-Git gives the pre-push hook its own stdin and moves its stdout, so the hook cannot speak the stdio protocol. When `fail2commit --approver stdio git push` runs (the `api` path), that process, the relay host, listens on `127.0.0.1:<ephemeral>` and puts `FAIL2COMMIT_APPROVAL_RELAY=127.0.0.1:<port>/<token>` in git's environment. The 128-bit token is the HMAC key and is never sent on the wire.
+Git gives the pre-push hook its own stdin and moves its stdout, so the hook cannot speak the stdio protocol. When `fail2commit --approver stdio git push` runs (the `api` path), that process, the relay host, listens on `127.0.0.1:<ephemeral>` and puts `FAIL2COMMIT_APPROVAL_RELAY=127.0.0.1:<port>/<token>` in git's environment. The 256-bit token (32 random bytes, hex) is the HMAC key and is never sent on the wire.
 
 - **Host approves, not the hook.** The hook sends its `ApprovalRequest` and an HMAC-SHA-256 of it. The host runs the whole `approval::approve` itself (`approve_relayed`): stdio round trip to the api client, reply validation, replay, rate limits and the password check against trusted state. The session id is the hook's, and only `Operation` requests are relayed. A typed password therefore never crosses the relay.
 - **The reply** is only `{request_id, nonce, digest, decision}` plus `HMAC-SHA-256(token, request_id || nonce || digest || decision)`. The hook compares with constant-time equality, requires the fields to equal its own request and the decision to be offered, and treats everything else (no relay, bad MAC, timeout, EOF) as Cancel. The host prints the reason for a refusal (wrong password, changed operation) on its stderr.
-- **Single use, bounded.** The relay accepts exactly one authenticated request, then stops listening. A connection gets 2 s to send an authenticated line; an unauthenticated or malformed one is dropped without using the slot. After 16 accepted connections the relay stops. It also stops when the push ends.
+- **Single use, bound to the push.** The host knows the push it runs (remote name from its own argv or config, push URL from `git remote get-url --push`, credentials redacted). A relayed request is served only if it is an `Operation` whose summary names that remote and URL (`git push to <remote> (<url>): ...`) and whose `allowed` is exactly `[ApproveOnce]`; anything else is dropped without using the slot. `expires_at` is clamped to now plus the host's own `approval.request_ttl_secs`. Only an authenticated, matching request uses the single slot (RR-002, RR-003).
+- **The listener never goes away early.** It stays bound until the push process ends, even after the slot is used; later connections are accepted and closed at once. No other process can take the port during the push, so a token holder cannot impersonate the host (RR-001). A connection gets 2 s to send an authenticated line and is dropped individually otherwise. At most 256 connections are handled at once; extras are closed, so a flood fails closed (Cancel) but never uses the slot. On Windows `std` sets no `SO_EXCLUSIVEADDRUSE`; a process that explicitly sets `SO_REUSEADDR` could still co-bind. This is untested residual risk until the flag is set (needs a `windows-sys` WinSock feature).
 - **Token scope.** Only `fail2commit hook pre-push` reads the variable and it removes it from its own environment at once. The installed hook script runs `unset FAIL2COMMIT_APPROVAL_RELAY` before it chains the prior hook, so the repository's or the user's earlier hook and any other child see nothing.
 - **Only the hook is a relay client.** The generic `stdio` approver used by `api` for npm, pip, sandbox and the rest ignores the variable.
+
+### Threat model: token reach (RR-004, accepted residual risk, CR-011)
+
+Git forwards the environment to its children, so a process spawned by git before the hook (credential helper, `core.sshCommand`, `remote.<n>.receivepack`, remote helper) can read the token. Repository config is untrusted, so such a process can be attacker-chosen. The token is accepted as a bearer capability because its power is limited:
+
+- It cannot approve anything: the host, not the token holder, answers, and the user still sees and answers the real prompt and the password.
+- It cannot impersonate the host: the listener stays bound (RR-001).
+- It cannot ask about another operation, another remote or a longer lifetime (RR-003).
+- It can at most burn the single slot with a request that matches the push, so the real hook gets Cancel: a denial of service that fails closed.
+- Same-user environment reads (`/proc/<pid>/environ`) are out of scope.
 
 ## Force-push password
 
