@@ -211,6 +211,78 @@ pub fn paths(cmd: &str) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 
+/// The command word (no path separator) of every segment of `cmd`, after
+/// leading `VAR=value` words. Looked up on PATH, so `.bin` dirs can answer.
+pub fn first_words(cmd: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for escapes in [true, false] {
+        for seg in all_segments(cmd, escapes, 0) {
+            if let Some(w) = seg.iter().find(|w| !w.contains('=')) {
+                if !w.contains(['/', '$', '*', '?']) {
+                    out.insert(w.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Interpreters whose first plain argument is a script they will open.
+const INTERPRETERS: [&str; 12] = [
+    "node",
+    "nodejs",
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "python",
+    "python3",
+    "perl",
+    "ruby",
+    "pwsh",
+    "powershell",
+];
+
+/// Package-local paths a command runs as a program: a command word with a
+/// path separator, or the script argument of an interpreter. Each must exist
+/// at review time (a missing one could be created by an earlier script).
+pub fn local_paths(cmd: &str) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for escapes in [true, false] {
+        for seg in all_segments(cmd, escapes, 0) {
+            let words: Vec<&String> = seg.iter().skip_while(|w| w.contains('=')).collect();
+            let Some(first) = words.first() else { continue };
+            let mut cands: Vec<&str> = Vec::new();
+            if first.contains('/') {
+                cands.push(first);
+            }
+            let lower = first.to_ascii_lowercase();
+            let base = lower.rsplit('/').next().unwrap_or("");
+            let base = base.strip_suffix(".exe").unwrap_or(base);
+            let code_flag = words.iter().any(|w| {
+                matches!(
+                    w.as_str(),
+                    "-e" | "-c" | "-p" | "--eval" | "--print" | "-command"
+                )
+            });
+            if INTERPRETERS.contains(&base) && !code_flag {
+                if let Some(a) = words.iter().skip(1).find(|w| !w.starts_with('-')) {
+                    cands.push(a);
+                }
+            }
+            for c in cands {
+                if c.contains(['*', '?', '=']) {
+                    continue;
+                }
+                if let Some(p) = to_rel(c)?.filter(|p| !p.is_empty()) {
+                    out.insert(p);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// `*` and `?` glob over one path, neither crossing `/`.
 pub fn glob_match(pat: &[u8], name: &[u8]) -> bool {
     match (pat.first(), name.first()) {
@@ -371,6 +443,17 @@ mod tests {
         let e = paths("sh ./BUILDH~1.JS").unwrap_err();
         assert_eq!(e.findings[0].kind, FindingKind::UnsupportedInput);
         assert!(paths("echo hi > /dev/null; sh /usr/bin/x").is_ok());
+    }
+
+    #[test]
+    fn local_command_paths() {
+        let l = |c: &str| -> Vec<String> { local_paths(c).unwrap().into_iter().collect() };
+        assert_eq!(l("sh ./later.sh && echo a/b"), vec!["later.sh"]);
+        assert_eq!(l("./run.sh --x"), vec!["run.sh"]);
+        assert_eq!(l("node later.js"), vec!["later.js"]);
+        assert_eq!(l(r".\setup"), vec!["setup"]);
+        assert!(l("echo hi; mkdir build/out; node -e \"x\"; node .").is_empty());
+        assert!(l("sh /usr/bin/x").is_empty());
     }
 
     #[test]

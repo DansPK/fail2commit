@@ -352,20 +352,27 @@ fn shell(script: &str) -> (PathBuf, Vec<OsString>) {
     }
 }
 
-/// npm's lifecycle environment: `npm_*` context, `.bin` dirs on PATH,
-/// cwd = the package directory. Nothing is inherited.
-fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, OsString)> {
-    let pkg_dir = tree.join(&l.path);
-    let tmp = tree.join(".f2c-tmp");
-    let mut path: Vec<PathBuf> = Vec::new();
-    let mut d = Some(pkg_dir.as_path());
+/// The `.bin` directories a lifecycle script of `pkg_dir` finds on PATH,
+/// nearest first; the k-th is `pkg_dir.ancestors().nth(k)/node_modules/.bin`.
+pub(super) fn bin_dirs(tree: &Path, pkg_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut d = Some(pkg_dir);
     while let Some(dir) = d {
-        path.push(dir.join("node_modules").join(".bin"));
+        out.push(dir.join("node_modules").join(".bin"));
         if dir == tree {
             break;
         }
         d = dir.parent();
     }
+    out
+}
+
+/// npm's lifecycle environment: `npm_*` context, `.bin` dirs on PATH,
+/// cwd = the package directory. Nothing is inherited.
+fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, OsString)> {
+    let pkg_dir = tree.join(&l.path);
+    let tmp = tree.join(".f2c-tmp");
+    let mut path = bin_dirs(tree, &pkg_dir);
     if let Some(root) = tc.npm_root() {
         path.push(root.join("bin").join("node-gyp-bin"));
     }
@@ -429,6 +436,7 @@ pub fn run_scripts(
     reviewed: &Reviewed,
     found: &BTreeSet<String>,
     mode: ScriptRun,
+    before_each: &dyn Fn() -> Result<()>,
 ) -> Result<Vec<String>> {
     if !matches!(mode, ScriptRun::Sandboxed | ScriptRun::Host) {
         return Ok(vec![]);
@@ -445,6 +453,8 @@ pub fn run_scripts(
     std::fs::create_dir_all(tree.join(".f2c-tmp"))?;
     let mut ran = Vec::new();
     for l in lifecycle(reviewed, found) {
+        // An earlier script must not have rewritten what this one runs.
+        before_each()?;
         let (mut program, args) = shell(&l.command);
         if let Some(sh) = stage.as_ref().and_then(|s| s.shell.clone()) {
             program = sh;

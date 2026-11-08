@@ -80,7 +80,8 @@ structured arguments (on Linux it follows the real `npm` launcher or standard in
    command, specs, save options, project, pinned registry, project settings, npm version, sandbox
    setting, final `package.json` and lockfile hashes, the ordered artifacts with integrity,
    scripts and the digests of the reviewed on-disk manifest and referenced files, and the
-   findings. Any change produces a different digest. Cancel applies nothing.
+   findings, and the path, size and SHA-256 of every file in the reviewed staging `node_modules`
+   tree (RN3-003). Any change produces a different digest. Cancel applies nothing.
 8. **Scripts.** `exec::authorize_scripts` applies the FR-008 table (sandbox on: run in the
    sandbox; off: skip; off and a `node-gyp` script: separate host-once approval). Failure to
    isolate launches nothing.
@@ -90,7 +91,13 @@ structured arguments (on Linux it follows the real `npm` launcher or standard in
    lifecycle scripts run through `sandbox::run_job` in that same staging tree, with npm's context:
    `npm_lifecycle_event`, `npm_lifecycle_script`, `npm_package_name`, `npm_package_version`,
    `npm_node_execpath`, `npm_execpath`, `INIT_CWD`, `.bin` directories on `PATH`, cwd = the
-   package directory. Nothing is extracted a second time. The tree's `node_modules` is then moved
+   package directory. Immediately before the scripts the whole tree is hashed again and must equal
+   the reviewed one (any difference is `IntegrityFailure`, nothing is committed); the reviewed
+   manifest and referenced files are re-checked before every script. After the scripts the tree is
+   validated again: no links, junctions or reparse points, no new package directory, no change to
+   any existing `package.json` or reviewed file, and no change outside a planned package's own
+   directory; new or changed files inside a package directory are build output, listed in the
+   outcome data as `build_output`. Any violation fails the install. Nothing is extracted a second time. The tree's `node_modules` is then moved
    (renamed, or copied across volumes) into a scratch directory inside the project directory.
 10. **Commit with a journal.** Original `package.json`/lockfile copies and a journal go under
     `<state>/npm/<key>/`. `node_modules` is renamed aside, the new tree renamed in, `package.json`
@@ -112,3 +119,8 @@ structured arguments (on Linux it follows the real `npm` launcher or standard in
 
 - Only files named by a lifecycle command (or a followed `npm run` chain) are read. A file those scripts `require()` or `import` is not followed, and run helpers other than `npm`/`yarn`/`pnpm` (for example `npm-run-all`) are not understood; the scan rules are evidence, not a boundary (see docs/scan.md).
 - Brace and bracket expansion, indirect `$VAR` script names and computed command strings are not resolved.
+
+- `.bin` (RN3-001): a package that installs a `node_modules/.bin` entry (any nested `.bin`) named like an interpreter or core tool (`node`, `npm`, `sh`, `bash`, `cmd`, `powershell`, `python`, `git`, `gcc`, `make`, `node-gyp`, ... case-insensitive, with or without a Windows extension) is a `suspicious_script` `deny`. For any other `.bin` command a lifecycle script invokes as the first word, the entry and the file its package declares in `bin` are reviewed like a referenced script.
+- Windows (RN3-002): bare and relative command paths also try the PATHEXT extensions (`.com .exe .bat .cmd .vbs .vbe .js .jse .wsf .wsh .msc .ps1` plus the host PATHEXT); every candidate that exists is read. A candidate that is a PE/ELF/Mach-O image or contains NUL is an `incomplete_scan` `deny`.
+- Local command paths (FR-004, FR-006): a command word with a path separator (`./later.sh`, `.\x`), or the script argument of an interpreter (`node later.js`, `sh ./x`), must have at least one existing candidate on disk at review time; otherwise it is an `incomplete_scan` `deny` naming the path, so a file created by an earlier script can never run unreviewed. Bare PATH commands (`node`, `sh`, `echo`) and other arguments are unaffected. Candidates of such paths that are absent at review (for example `./setup` ahead of an existing `setup.js`) are re-checked before every script; one that has appeared fails the install and nothing is committed.
+- Not covered: a new nested `package.json` inside a package directory counts as build output.
