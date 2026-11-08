@@ -290,10 +290,16 @@ dependencies = [
 name = "fail2commit"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "fail2commit-core",
+ "flate2",
+ "hex",
  "serde_json",
+ "sha2",
+ "tar",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

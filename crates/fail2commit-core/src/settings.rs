@@ -83,7 +83,8 @@ impl Default for AdvisorySettings {
             osv_url: "https://api.osv.dev".to_string(),
             offline: false,
             ttl_secs: 6 * 3600,
-            cache_max_bytes: 64 * 1024 * 1024,
+            // T-012: ~34 B per clean entry; 16 MiB holds far more than any project needs.
+            cache_max_bytes: 16 * 1024 * 1024,
             timeout_secs: 15,
         }
     }

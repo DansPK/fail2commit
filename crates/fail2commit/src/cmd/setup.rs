@@ -145,6 +145,14 @@ pub fn status(ctx: &Ctx) -> CmdResult {
     o.data = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "integrations": integrations,
+        // SPEC-012: report the configured bounds in effect.
+        "limits": ctx.settings.limits,
+        "advisories": {
+            "offline": ctx.settings.advisories.offline,
+            "ttl_secs": ctx.settings.advisories.ttl_secs,
+            "cache_max_bytes": ctx.settings.advisories.cache_max_bytes,
+            "timeout_secs": ctx.settings.advisories.timeout_secs,
+        },
         "sandbox": {
             "enabled": ctx.settings.sandbox.enabled,
             "backend": probe.backend,
