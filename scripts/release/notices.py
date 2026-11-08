@@ -33,7 +33,8 @@ def license_files(crate_dir: Path) -> list[Path]:
 def read_license(path: Path) -> str:
     if path.stat().st_size > MAX_LICENSE_BYTES:
         raise ValueError(f"license file exceeds {MAX_LICENSE_BYTES} bytes: {path}")
-    return path.read_text(encoding="utf-8", errors="replace").rstrip()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return "\n".join(line.rstrip() for line in text.splitlines()).rstrip()
 
 
 def generate(repo: Path) -> tuple[str, list[str]]:

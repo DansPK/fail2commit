@@ -1149,7 +1149,7 @@ _No license file was present in the resolved crate source._
 - License expression: `Zlib`
 - Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
 
-- License file `LICENSE`: text `1a7d409d5142`
+- License file `LICENSE`: text `6ddf0fba55d4`
 
 ## zmij 1.0.23
 
@@ -6962,12 +6962,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## Text `1a7d409d5142`
+## Text `6ddf0fba55d4`
 
 Source filenames: `LICENSE`
 
 ```text
-(C) 2024 Trifecta Tech Foundation 
+(C) 2024 Trifecta Tech Foundation
 
 This software is provided 'as-is', without any express or implied
 warranty. In no event will the authors be held liable for any damages
