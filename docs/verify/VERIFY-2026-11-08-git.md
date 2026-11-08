@@ -94,3 +94,18 @@ Source: `docs/verify/REVIEW-2026-11-09-wave1.md`. Branch `DansPK/f2c-fix-wave1-g
 
 The earlier "blobs over 4 MiB are scanned by their first 4 MiB" limit in section 4 no longer applies.
 Real approval channels still need a console or tray run (Pending, see section 2).
+
+---
+
+## Update 2026-11-09 (2): re-review fixes R1-001, R1-002, R1-003, R1-005 (FR-001, FR-003)
+
+Source: `docs/verify/REREVIEW-2026-11-09-wave1.md`. Branch `DansPK/f2c-fix-rereview-git`, based on `d40f6f2`.
+
+| Finding | Fix | Evidence (`rereview_wave1`) |
+|---|---|---|
+| R1-001 | `gitcmd::command` sets `GIT_NO_REPLACE_OBJECTS`, `core.commitGraph=false`, `core.fsmonitor=false`, `GIT_NO_LAZY_FETCH`; server `is_ancestor` uses it | `r1_001_replace_ref_must_not_hide_secret_blob`, `r1_001_server_replace_ref_must_not_defeat_secret_policy` (both fail without the env var) |
+| R1-002 | Tips are peeled; blob and tree tips are scanned; unresolvable tips give `IncompleteScan` | `r1_002_tag_to_blob_or_tree_must_not_be_unscanned`, `r1_002_annotated_and_nested_tags_are_peeled`, `r1_002_unresolvable_tip_is_incomplete` |
+| R1-003 | `secret-scan` scans all of `HEAD` by default and says local-only; `--remote` uses `git ls-remote` | `r1_003_secret_scan_command_must_not_trust_remote_tracking_ref` |
+| R1-005 | UTF-16 (BOM or NUL parity) is decoded and scanned; UTF-32 BOM and bad UTF-16 give `IncompleteScan` | `r1_005_utf16_secret_is_found`, `r1_005_utf32_is_incomplete_not_clean` |
+
+Not tested: `info/grafts` (documented from Git behavior only). Commands and results: see the final report.

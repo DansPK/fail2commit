@@ -38,29 +38,6 @@ pub fn scan(
     _remote: Option<&str>,
     limits: &Limits,
 ) -> crate::Result<Vec<Finding>> {
-    let mut tips: Vec<&str> = Vec::new();
-    let mut excludes: Vec<String> = Vec::new();
-    for u in updates {
-        check_oid(&u.old)?;
-        check_oid(&u.new)?;
-        if !RefUpdate::is_zero(&u.new) && !tips.contains(&u.new.as_str()) {
-            tips.push(&u.new);
-        }
-        // The remote itself reported `old`, so everything it reaches is
-        // already published, provided we have the object to walk from.
-        if !RefUpdate::is_zero(&u.old)
-            && matches!(
-                gitcmd::object_type(git, repo, &u.old)?.as_deref(),
-                Some("commit" | "tag")
-            )
-            && !excludes.contains(&u.old)
-        {
-            excludes.push(u.old.clone());
-        }
-    }
-    if tips.is_empty() {
-        return Ok(vec![]);
-    }
     let target = updates
         .iter()
         .find(|u| !RefUpdate::is_zero(&u.new))
@@ -75,14 +52,60 @@ pub fn scan(
         }
     };
 
-    let mut rev_args: Vec<String> = tips.iter().map(|s| s.to_string()).collect();
-    if !excludes.is_empty() {
-        rev_args.push("--not".into());
-        rev_args.extend(excludes);
+    let mut tips: Vec<String> = Vec::new(); // peeled commits
+    let mut direct: Vec<(String, String)> = Vec::new(); // peeled (blob|tree oid, ref)
+    let mut excludes: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for u in updates {
+        check_oid(&u.old)?;
+        check_oid(&u.new)?;
+        if !RefUpdate::is_zero(&u.new) {
+            // Peel annotated tags (recursively) to the object a push really
+            // carries; a tip whose type cannot be established fails closed.
+            match peel(git, repo, &u.new)? {
+                Some((oid, t)) if t == "commit" => {
+                    if !tips.contains(&oid) {
+                        tips.push(oid);
+                    }
+                }
+                Some((oid, t)) if t == "blob" || t == "tree" => {
+                    if !direct.iter().any(|(o, _)| *o == oid) {
+                        direct.push((oid, u.refname.clone()));
+                    }
+                }
+                _ => out.push(mk(
+                    FindingKind::IncompleteScan,
+                    format!(
+                        "the type of {} could not be established; its contents were not scanned",
+                        u.refname
+                    ),
+                )),
+            }
+        }
+        // The remote itself reported `old`, so everything it reaches is
+        // already published, provided we have a commit to walk from.
+        if !RefUpdate::is_zero(&u.old) {
+            if let Some((oid, t)) = peel(git, repo, &u.old)? {
+                if t == "commit" && !excludes.contains(&oid) {
+                    excludes.push(oid);
+                }
+            }
+        }
     }
 
-    let changes = collect_changes(git, repo, &rev_args, limits)?;
-    let mut out = Vec::new();
+    let mut changes = if tips.is_empty() {
+        Changes::new()
+    } else {
+        let mut rev_args = tips;
+        if !excludes.is_empty() {
+            rev_args.push("--not".into());
+            rev_args.extend(excludes);
+        }
+        collect_changes(git, repo, &rev_args, limits)?
+    };
+    for (oid, refname) in &direct {
+        walk_direct(git, repo, oid, refname, limits, &mut changes)?;
+    }
     if changes.node_limit_hit || changes.entry_limit_hit {
         out.push(mk(
             FindingKind::IncompleteScan,
@@ -131,6 +154,100 @@ pub fn scan(
     Ok(out)
 }
 
+impl Changes {
+    fn new() -> Self {
+        Changes {
+            added: HashMap::new(),
+            env_added: vec![],
+            env_deleted: vec![],
+            commits: 0,
+            entries: 0,
+            node_limit_hit: false,
+            entry_limit_hit: false,
+        }
+    }
+}
+
+/// Peel `oid` through annotated tags to `(final oid, type)`. `None` when Git
+/// cannot resolve it (missing object, broken tag chain).
+fn peel(git: &Path, repo: &Path, oid: &str) -> crate::Result<Option<(String, String)>> {
+    let r = gitcmd::run(
+        git,
+        repo,
+        &["rev-parse", "--verify", "-q", &format!("{oid}^{{}}")],
+    )?;
+    let peeled = r.text();
+    if !r.ok() || !gitcmd::valid_oid(&peeled) {
+        return Ok(None);
+    }
+    Ok(gitcmd::object_type(git, repo, &peeled)?.map(|t| (peeled, t)))
+}
+
+/// A tip that is a blob or a tree (for example a tag to one): queue its blobs
+/// within the same entry bound as the commit walk.
+fn walk_direct(
+    git: &Path,
+    repo: &Path,
+    oid: &str,
+    refname: &str,
+    limits: &Limits,
+    c: &mut Changes,
+) -> crate::Result<()> {
+    let max_entries = limits.graph_max_nodes.saturating_mul(ENTRIES_PER_NODE);
+    if gitcmd::object_type(git, repo, oid)?.as_deref() == Some("blob") {
+        c.added
+            .entry(oid.to_string())
+            .or_insert_with(|| refname.as_bytes().to_vec());
+        return Ok(());
+    }
+    let mut cmd = gitcmd::command(git, repo);
+    cmd.args(["ls-tree", "-r", "-z", "--full-tree", oid])
+        .stdout(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| crate::Error::internal(format!("cannot run git: {e}")))?;
+    let mut rd = BufReader::new(child.stdout.take().expect("piped"));
+    let mut tok = Vec::new();
+    loop {
+        tok.clear();
+        if rd.read_until(0, &mut tok)? == 0 {
+            break;
+        }
+        if tok.last() == Some(&0) {
+            tok.pop();
+        }
+        c.entries += 1;
+        if c.entries > max_entries {
+            c.entry_limit_hit = true;
+            break;
+        }
+        // "<mode> SP <type> SP <oid> TAB <path>"; submodules ("commit") are skipped.
+        let Some(tab) = tok.iter().position(|b| *b == b'\t') else {
+            return Err(crate::Error::internal("unexpected git ls-tree output"));
+        };
+        let head = String::from_utf8_lossy(&tok[..tab]).into_owned();
+        let f: Vec<&str> = head.split(' ').collect();
+        if f.len() != 3 || !gitcmd::valid_oid(f[2]) {
+            return Err(crate::Error::internal("unexpected git ls-tree output"));
+        }
+        if f[1] == "blob" {
+            c.added
+                .entry(f[2].to_string())
+                .or_insert_with(|| tok[tab + 1..].to_vec());
+        }
+    }
+    if c.entry_limit_hit {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    if !status.success() && !c.entry_limit_hit {
+        return Err(crate::Error::incomplete(
+            "git could not enumerate a tagged tree",
+        ));
+    }
+    Ok(())
+}
+
 fn collect_changes(
     git: &Path,
     repo: &Path,
@@ -158,15 +275,7 @@ fn collect_changes(
         .spawn()
         .map_err(|e| crate::Error::internal(format!("cannot run git: {e}")))?;
     let mut rd = BufReader::new(child.stdout.take().expect("piped"));
-    let mut c = Changes {
-        added: HashMap::new(),
-        env_added: vec![],
-        env_deleted: vec![],
-        commits: 0,
-        entries: 0,
-        node_limit_hit: false,
-        entry_limit_hit: false,
-    };
+    let mut c = Changes::new();
     let mut tok = Vec::new();
     // pending: (status letter, new oid) waiting for its path token
     let mut pending: Option<(u8, String)> = None;
@@ -316,6 +425,7 @@ fn scan_blobs(
     // as well, so nothing is skipped by a heuristic.
     let mut hits = Vec::new();
     let mut short = false;
+    let mut undecoded = 0usize;
     batch(git, repo, "--batch", &request(&chosen), |rd| {
         let mut line = String::new();
         for oid in &chosen {
@@ -344,14 +454,86 @@ fn scan_blobs(
             for h in scan_text(&String::from_utf8_lossy(&buf)) {
                 hits.push((path.clone(), h));
             }
+            match utf16_view(&buf) {
+                Utf16::No => {}
+                Utf16::Text(t) => hits.extend(scan_text(&t).into_iter().map(|h| (path.clone(), h))),
+                Utf16::Broken(t) => {
+                    undecoded += 1;
+                    hits.extend(scan_text(&t).into_iter().map(|h| (path.clone(), h)));
+                }
+            }
         }
         Ok(())
     })?;
+    if undecoded > 0 {
+        notes.push(format!(
+            "{undecoded} outgoing blob(s) look like UTF-16/UTF-32 text that could not be decoded cleanly; they were only partly scanned"
+        ));
+    }
     if short {
         notes
             .push("some outgoing blobs could not be read completely; they were not scanned".into());
     }
     Ok((hits, notes))
+}
+
+enum Utf16 {
+    No,
+    /// Cleanly decoded copy.
+    Text(String),
+    /// Decoded lossily (or an encoding we cannot decode): reported incomplete.
+    Broken(String),
+}
+
+/// Detect UTF-16 by BOM, or by NULs concentrated in one byte parity (ASCII
+/// text in UTF-16 has a NUL in every other byte). UTF-32 BOMs are reported,
+/// not decoded. Bounded: one pass over a blob that is already in memory.
+fn utf16_view(b: &[u8]) -> Utf16 {
+    if b.starts_with(&[0xFF, 0xFE, 0, 0]) || b.starts_with(&[0, 0, 0xFE, 0xFF]) {
+        return Utf16::Broken(String::new());
+    }
+    let le = if b.starts_with(&[0xFF, 0xFE]) {
+        Some(true)
+    } else if b.starts_with(&[0xFE, 0xFF]) {
+        Some(false)
+    } else if b.len() >= 4 {
+        let (mut even, mut odd) = (0usize, 0usize);
+        for (i, x) in b.iter().enumerate() {
+            if *x == 0 {
+                if i % 2 == 0 {
+                    even += 1;
+                } else {
+                    odd += 1;
+                }
+            }
+        }
+        let half = b.len() / 2;
+        if odd * 10 >= half * 4 && even * 10 <= half {
+            Some(true)
+        } else if even * 10 >= half * 4 && odd * 10 <= half {
+            Some(false)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some(le) = le else { return Utf16::No };
+    let units: Vec<u16> = b
+        .chunks(2)
+        .filter(|p| p.len() == 2)
+        .map(|p| {
+            if le {
+                u16::from_le_bytes([p[0], p[1]])
+            } else {
+                u16::from_be_bytes([p[0], p[1]])
+            }
+        })
+        .collect();
+    match String::from_utf16(&units) {
+        Ok(t) if b.len() & 1 == 0 => Utf16::Text(t),
+        _ => Utf16::Broken(String::from_utf16_lossy(&units)),
+    }
 }
 
 /// Run `git cat-file <mode>` feeding `request`, handing the reader to `f`.

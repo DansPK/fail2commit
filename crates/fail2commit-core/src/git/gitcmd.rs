@@ -18,9 +18,28 @@ impl GitOut {
     }
 }
 
+/// The one place every guard `git` subprocess (scanner, classifier,
+/// pre-push, server pre-receive ancestry) gets its environment. Repository
+/// state must not change what the guard sees (R1-001):
+/// - `GIT_NO_REPLACE_OBJECTS`: `refs/replace/*` could swap a secret blob for a
+///   clean one in `cat-file`/`log` while a push still sends the real object.
+///   Git also ignores `info/grafts` under this switch where it reads them.
+/// - `core.commitGraph=false`: a forged commit-graph file is a repository
+///   controlled cache that could alter traversal.
+/// - `core.fsmonitor=false`: a repository config value there names a program.
+/// - `GIT_NO_LAZY_FETCH`: a partial clone must not start a network fetch.
+/// - no prompts, no optional locks.
 pub(crate) fn command(git: &Path, repo: &Path) -> Command {
     let mut c = Command::new(git);
     c.current_dir(repo)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "core.commitGraph")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env_remove("GIT_REPLACE_REF_BASE")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")

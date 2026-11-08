@@ -10,7 +10,7 @@ use std::path::Path;
 
 mod classify;
 mod detect;
-mod gitcmd;
+pub(crate) mod gitcmd;
 mod integ;
 pub mod intent;
 pub mod prepush;
