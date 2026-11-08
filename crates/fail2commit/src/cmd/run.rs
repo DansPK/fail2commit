@@ -63,6 +63,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
     // of this fail2commit-owned root.
     let staging = ctx.paths.cache_dir.join("sandbox-stage");
     fsutil::ensure_private_dir(&staging)?;
+    fail2commit_core::npm::sweep_stale(&staging); // ER-005
     let stage = Stage::new(&staging)?;
     let work = stage.0.join("work");
     fs::create_dir(&work)?;

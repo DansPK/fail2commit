@@ -82,12 +82,14 @@ impl NpmWorld {
     /// Files left behind in the sandbox stage root (must be none).
     pub fn stage_leftovers(&self) -> Vec<String> {
         let root = self.w.paths.cache_dir.join("sandbox-stage");
-        std::fs::read_dir(root)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+        match std::fs::read_dir(&root) {
+            Ok(rd) => rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            // No stage root yet is "nothing left"; any other failure is not.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => panic!("cannot list {}: {e}", root.display()),
+        }
     }
 }

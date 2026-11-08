@@ -22,6 +22,7 @@ mod runner;
 mod scripts;
 mod shim;
 mod stage;
+pub use stage::sweep_stale;
 mod tree;
 
 use crate::approval::ApprovalCtx;
@@ -219,6 +220,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     // 1. Stage: nothing from the project except the three inputs.
     let stage_root = paths.cache_dir.join("sandbox-stage"); // CR-007
     crate::fsutil::ensure_private_dir(&stage_root)?;
+    stage::sweep_stale(&stage_root); // ER-005
     let stage = tempfile::Builder::new()
         .prefix("npm-")
         .tempdir_in(&stage_root)?;

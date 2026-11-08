@@ -6,7 +6,7 @@
 //! their own `core.hooksPath`; the hook then asks once for the whole plan.
 
 use super::{CmdResult, Ctx, Outcome};
-use fail2commit_core::approval::relay;
+use fail2commit_core::approval::{self, relay};
 use fail2commit_core::approver::ApproverChoice;
 use fail2commit_core::git::intent::{
     config_overrides, is_forced_refspec, push_intent, subcommand_index,
@@ -67,7 +67,20 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
                         cmd.env(super::hook::FAIL_CLOSED_ENV, "1");
                     }
                     if ctx.approver == ApproverChoice::Stdio {
-                        let r = relay::start()?;
+                        // Record the password generation before git runs, as the
+                        // hook-side check used to; the host verifies the password.
+                        let _ = approval::password_required(&ctx.paths);
+                        let (paths, settings) = (ctx.paths.clone(), ctx.settings.clone());
+                        let r = relay::start(move |req| {
+                            approval::approve_relayed(
+                                &approval::ApprovalCtx {
+                                    paths: &paths,
+                                    settings: &settings,
+                                    choice: ApproverChoice::Stdio,
+                                },
+                                req,
+                            )
+                        })?;
                         cmd.env(relay::ENV, r.env_value());
                         _relay = Some(r);
                     }

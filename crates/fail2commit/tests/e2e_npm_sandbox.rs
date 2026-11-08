@@ -102,6 +102,15 @@ fn native_build_runs_in_the_real_sandbox_and_its_artifact_is_installed() {
     no_scratch(&n.project);
 }
 
+/// Wait until the listener thread has counted at least `n` connections.
+fn wait_conns(c: &AtomicUsize, n: usize) -> usize {
+    let t0 = std::time::Instant::now();
+    while c.load(Ordering::SeqCst) < n && t0.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    c.load(Ordering::SeqCst)
+}
+
 #[test]
 fn hostile_script_cannot_reach_network_home_or_checkout() {
     require_node();
@@ -126,37 +135,79 @@ fn hostile_script_cannot_reach_network_home_or_checkout() {
         }
     });
 
+    let hostile = hostile_js(&canary, &n.project, &outside, port);
+
+    // ER-007 positive control: the same script, unsandboxed on the host, reads
+    // the canary, lists the checkout, writes outside and connects. So every
+    // "blocked" below is the sandbox, not a bad path or a dead listener.
+    let ctl = n.w.env.root.join("control");
+    std::fs::create_dir_all(&ctl).unwrap();
+    std::fs::write(ctl.join("hostile.js"), &hostile).unwrap();
+    let st = std::process::Command::new("node")
+        .arg("hostile.js")
+        .current_dir(&ctl)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let control: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ctl.join("build/report.json")).unwrap())
+            .unwrap();
+    assert!(control["read_home_canary"]
+        .as_str()
+        .unwrap()
+        .starts_with("READ:"));
+    assert!(control["list_checkout"]
+        .as_str()
+        .unwrap()
+        .contains("checkout-secret.txt"));
+    assert_eq!(control["net"], "CONNECTED");
+    assert!(outside.exists(), "control: the host write succeeds");
+    std::fs::remove_file(&outside).unwrap();
+    let baseline = wait_conns(&conns, 1);
+    assert_eq!(baseline, 1, "control: the listener saw the host connection");
+
     n.reg.publish(
         &Pkg::new("hostile", "1.0.0")
             .script("install", "node hostile.js")
-            .file(
-                "hostile.js",
-                &hostile_js(&canary, &n.project, &outside, port),
-            ),
+            .file("hostile.js", &hostile),
     );
     let before_checkout = std::fs::read(&checkout_file).unwrap();
     let r = n.w.run(
         &n.project,
         &["--json", "--approver", "none", "npm", "install", "hostile"],
     );
-    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert_eq!(
+        r.code, 0,
+        "{}
+{}",
+        r.stdout, r.stderr
+    );
     let report: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(n.project.join("node_modules/hostile/build/report.json")).unwrap(),
     )
     .unwrap();
     // `write_outside` may succeed inside bubblewrap's private /tmp; the host
-    // check below is what proves nothing escaped.
+    // check below is what proves nothing escaped. A block is a denial or a
+    // path hidden from the job, never any other error.
     for k in ["read_home_canary", "list_checkout"] {
         let v = report[k].as_str().unwrap();
-        assert!(v.starts_with("blocked:"), "{k} reached the host: {v}");
+        assert!(
+            ["blocked:EACCES", "blocked:EPERM", "blocked:ENOENT"].contains(&v),
+            "{k} was not denied by the sandbox: {v}"
+        );
     }
+    assert!(
+        canary.is_file() && checkout_file.is_file(),
+        "ENOENT must not come from a bad path"
+    );
     let net = report["net"].as_str().unwrap();
     assert!(net.starts_with("blocked:"), "network reachable: {net}");
     assert!(report["cwd"].as_str().unwrap().contains("sandbox-stage"));
     assert_eq!(
         conns.load(Ordering::SeqCst),
-        0,
-        "the loopback listener saw a connection"
+        baseline,
+        "the loopback listener saw a connection from the sandbox"
     );
     assert!(!outside.exists(), "package wrote outside its stage");
     assert_eq!(std::fs::read(&checkout_file).unwrap(), before_checkout);

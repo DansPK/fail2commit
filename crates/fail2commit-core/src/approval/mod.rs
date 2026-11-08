@@ -88,13 +88,35 @@ pub(crate) fn approve_with(
     req: &ApprovalRequest,
     channel: &dyn Approver,
 ) -> crate::Result<Decision> {
+    approve_checked(ctx, req, channel, true)
+}
+
+/// CR-010: the relay host approves a request that an authenticated Git hook
+/// process built, so its session id is the hook's, not this process's. Every
+/// other check (expiry, replay, one prompt, binding, password) is unchanged.
+/// Only `Operation` requests (Git pushes) may be relayed.
+pub fn approve_relayed(ctx: &ApprovalCtx<'_>, req: &ApprovalRequest) -> crate::Result<Decision> {
+    if req.kind != crate::protocol::ApprovalKind::Operation {
+        return Err(crate::Error::rejected(
+            "only operation requests are relayed",
+        ));
+    }
+    approve_checked(ctx, req, &channels::Stdio, false)
+}
+
+fn approve_checked(
+    ctx: &ApprovalCtx<'_>,
+    req: &ApprovalRequest,
+    channel: &dyn Approver,
+    own_session: bool,
+) -> crate::Result<Decision> {
     password::reject_secret_env()?;
     if req.version != PROTOCOL_VERSION {
         return Err(crate::Error::rejected(
             "approval request has an unknown version",
         ));
     }
-    if req.session != session_id() {
+    if own_session && req.session != session_id() {
         return Err(crate::Error::rejected(
             "approval request belongs to another session",
         ));
