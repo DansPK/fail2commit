@@ -136,3 +136,7 @@ home, or user directory is granted" is now checked for the link case as well as 
 Pending, unchanged: the live external endpoint test stays `#[ignore]` (no authorization for live
 network traffic), and the full staged MinGW GCC closure is still unavailable — the installed root is
 11 871 files / 961 MB, and copying only `gcc.exe` would not be a legitimate toolchain test.
+## Known limitation: user profile required
+
+The AppContainer backend calls `CreateAppContainerProfile`, which needs the user's registry hives (including the `_Classes` hive) to be loaded. In a batch or service logon without a loaded profile (for example a VMware Tools guest operation, a scheduled task without profile loading, or some CI runners) it fails with `HRESULT 0x80070002`; `probe()` then reports the backend unavailable and installs with scripts fail closed. Observed on a clean Windows 11 25H2 VM through VMware Tools (see docs/verify/VERIFY-2026-11-09-release.md section 5). Run guarded installs from an interactive session, or load the profile for the service account.
+
