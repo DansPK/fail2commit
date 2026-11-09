@@ -78,6 +78,24 @@ VMware `win11` (Windows 11 Pro 25H2, NT 10.0.26200), snapshot `pre-f2c-test` tak
 
 Finding: `fail2commit sandbox status` in this session reported the AppContainer backend unavailable: `CreateAppContainerProfile failed: HRESULT 0x80070002`. The session was a VMware Tools guest operation: `NT AUTHORITY\BATCH` logon, session 0, with the user's registry hives (including `_Classes`) not loaded. `CreateAppContainerProfile` needs that profile. The backend failed closed as designed. In an interactive session on the development host the same backend passes 12/12 attack tests. Documented as a known limitation in docs/sandbox-windows.md: batch or service logons without a loaded profile report the sandbox unavailable and fail closed.
 
+## 5b. Windows 10 and interactive-session runs (same release artifacts)
+
+VMware `win10` (Windows 10 IoT Enterprise LTSC 2021, 21H2, NT 10.0.19044.7725) and `win11` again, each from a fresh `pre-f2c-test` snapshot and reverted afterwards. MinGit 2.47.1 was downloaded on the host (SHA-256 `50b04b55425b5c465d076cdb184f63a0cd0f86f6ec8bb4d5860114a713d2c29a`, equal to the release notes) and copied in. Interactive probes ran as a scheduled task with `LogonType Interactive` in the signed-in console session (`NT AUTHORITY\INTERACTIVE`, session 1): on win10 as a new standard user `f2cuser` signed in by auto-logon, on win11 as the VM's own console user.
+
+| Check | Windows 10 LTSC 21H2 | Windows 11 25H2 |
+|---|---|---|
+| `f2c-vm-test.ps1` install, guard, uninstall (section 5 checks) | all pass: install exit 0; normal push exit 0 with the third-party hook chained; unattended `--force` exit 1 `Approve ForceIntent`, remote unchanged; uninstall exit 0; hooksPath, hook file and user PATH restored | passed earlier (section 5) |
+| `sandbox status` in the interactive session | available; all 9 AppContainer controls `ok` | available; all 9 controls `ok` |
+| `run -- cmd /d /c ...` reading `C:\f2c\secret.txt` (synthetic) outside the input | `Access is denied.`; secret not exported | `Access is denied.`; secret not exported |
+| Network from inside the sandbox (`curl http://1.1.1.1/`) with host control | inconclusive (curl ran silent; see Defender finding) | denied: `curl: (7) Failed to connect`; host control `http=301` |
+| Benign workload x4 (`status` + `run`), Defender detections | 0 | 0 |
+| Re-export onto an existing file | refused: `cannot create destination: The file exists` (by design) | same |
+
+Findings:
+
+1. **`run -- cmd.exe` failed** with `cmd.exe was not found on PATH`, because `toolpath::find_real` appended `.exe` to a name that already had it (`cmd` worked). Fixed after the release candidate in `11be0a6` (FR-007) with a regression test; `.bat`/`.cmd` stay unresolvable. Host re-run: core lib 151/151, `run_cli` 3/3, `sandbox_windows_matrix` 7/7 including ignored. The 0.1.0 artifacts above predate this fix.
+2. **Microsoft Defender quarantined the unsigned `fail2commit.exe`** on win10 (`Behavior:Win32/DefenseEvasion.A!ml`, severity 5, signatures 1.463.203.0) during the third run of the adversarial probe, whose sandboxed `cmd` reads a file named `secret.txt` and connects to a bare IP. Afterwards the same hash was blocked as soon as it was written to disk. From a fresh snapshot, the benign workload produced no detection on win10 or win11, and on win11 the adversarial probe ran without detection. The machine-learning verdict therefore depends on what the sandboxed child does, which for fail2commit is untrusted package code. Release prerequisite: Authenticode signing and a Microsoft false-positive submission (section 6).
+
 ## 6. Pending gates (missing prerequisite)
 
 | Gate | Status | Missing prerequisite |
@@ -90,5 +108,7 @@ Finding: `fail2commit sandbox status` in this session reported the AppContainer 
 | Windows full staged-gcc native build in AppContainer | Pending | The MinGW closure is 961 MB / 11,871 files to stage; a staged native workload and the npm node build pass instead |
 | LPAC (less-privileged AppContainer) | Not claimed | Runtime verification of LPAC capability with this backend |
 | Live internet tests (OSV live smoke, Linux external TCP control) | Pending (ignored tests) | Explicit authorization to contact live endpoints from tests |
-| Windows editions other than Windows 11 Pro 26200 / 25H2 | Pending | Additional Windows hosts |
-| Windows sandbox on the clean VM in an interactive sign-in | Pending | A console sign-in on the VM (the guest-operations session is a BATCH logon without the user profile; see section 5) |
+| Windows editions other than Windows 11 Pro 25H2 and Windows 10 IoT Enterprise LTSC 2021 | Pending | Additional Windows hosts (Windows 10 LTSC 21H2 passed in section 5b) |
+| Windows sandbox on a clean VM in an interactive sign-in | **Passed** (section 5b) | - |
+| Microsoft Defender false positive on the unsigned CLI (`Behavior:Win32/DefenseEvasion.A!ml`) | **Open, release blocker for Windows** | An Authenticode code-signing certificate and a Microsoft false-positive submission; both are outward-facing and need the owner |
+| Release artifacts including `11be0a6` (`run -- cmd.exe` fix) | Pending | A rebuild of the Windows CLI, Setup.exe and the Linux artifacts from the new commit |

@@ -17,7 +17,7 @@ Integration branch: `DansPK/f2-commit-coordinator`. Release candidate built from
 | T-005 | Guard pip installs | FR-005, SPEC-005 | orca:claude-sonnet | done | T-006, T-007 |
 | T-006 | Scan packages and scripts | FR-006, SPEC-006 | orca:cline-deepseek | done; live OSV smoke pending | CHORE-001 |
 | T-007 | Isolate build scripts: T-007a Linux Bubblewrap, export, `run`, Linux test harness | FR-007, SPEC-007 | orca:claude-opus | done | CHORE-001 |
-| T-007 | Isolate build scripts: T-007b Windows AppContainer | FR-007, SPEC-007 | orca:codex, cline-deepseek | done; clean-VM interactive run, LPAC and staged MinGW build pending | CHORE-001 |
+| T-007 | Isolate build scripts: T-007b Windows AppContainer | FR-007, SPEC-007 | orca:codex, cline-deepseek | done; clean-VM interactive run passed on Windows 10 and 11; Defender false positive needs code signing; LPAC and staged MinGW build pending | CHORE-001 |
 | T-008 | Manage sandbox policy | FR-008, SPEC-008 | orca:claude-sonnet | done | T-007 |
 | T-009 | Ship Windows desktop integration | FR-009, SPEC-009 | orca:claude-sonnet | done; tray GUI click-through pending | T-002, T-008 |
 | T-010 | Integrate VS Code | FR-010, SPEC-010 | orca:claude-sonnet | done; GUI and Remote-WSL session pending | T-002, T-004, T-005, T-008 |

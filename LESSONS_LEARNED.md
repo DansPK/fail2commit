@@ -2,7 +2,7 @@
 
 > **Critical patterns and anti-patterns discovered during development**
 > **Purpose:** Prevent recurring bugs and document invisible failure modes
-> **Last Updated:** 2026-11-08
+> **Last Updated:** 2026-11-09
 
 ---
 
@@ -54,6 +54,22 @@
 **Problem:** about 10 concurrent agent worktrees, each running cargo at full parallelism with Docker builds, made the Windows host lag badly, and agents crashed.
 
 **Correct Pattern:** run at most 3 workers at once with `cargo -j 2` and one Docker build at a time. Release finished workers' terminals promptly.
+
+## VMware Tools guest operations are not an interactive sign-in
+
+**Problem:** the AppContainer sandbox reported itself unavailable (`CreateAppContainerProfile` HRESULT 0x80070002) when tested through VMware Tools guest operations, which run as a BATCH logon.
+
+**Correct Pattern:** to test anything that needs the user's desktop session or profile, register a scheduled task with `New-ScheduledTaskPrincipal -LogonType Interactive` for the console user, start it, and read its output file. If nobody is signed in, set up auto-logon for a throwaway user in the disposable VM and reboot with `shutdown.exe /r` (a `Restart-Computer` after a failing script never runs).
+
+**Why it's invisible:** the guest command succeeds and the product fails closed, so it looks like a product limitation.
+
+## Antivirus judges the sandbox host by what the sandboxed child does
+
+**Problem:** Defender quarantined the unsigned `fail2commit.exe` (`Behavior:Win32/DefenseEvasion.A!ml`) after a sandboxed `cmd` tried to read `secret.txt` and reach a bare IP. Afterwards the hash was blocked on write, which spoiled later runs on that VM.
+
+**Correct Pattern:** run benign workloads first from a fresh snapshot, keep adversarial probes for last, and check `Get-MpThreatDetection` after every Windows VM run. Plan for code signing before a Windows release.
+
+**Why it's invisible:** later runs just print nothing, because the executable has vanished.
 
 ---
 
