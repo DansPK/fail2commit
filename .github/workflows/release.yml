@@ -51,17 +51,22 @@ jobs:
           } else {
             Write-Host "packaging/windows/build.ps1 is not present; NSIS artifact pending T-009 integration"
           }
-      - name: Collect Windows packages
+      - name: Check Windows packages
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force target/dist | Out-Null
-          Get-ChildItem packaging/windows,target -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '(setup|installer).*\.exe$' } |
-            ForEach-Object { Copy-Item -Force $_.FullName target/dist/ }
+          # build.ps1 writes the installer straight into target/dist; drop its staging tree.
+          Remove-Item -Recurse -Force target/dist/stage -ErrorAction SilentlyContinue
+          if (-not (Get-ChildItem target/dist -Filter 'fail2commit-*-setup.exe')) { throw "installer missing from target/dist" }
+          Get-ChildItem target/dist | Format-Table Name, Length
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-artifacts
-          path: target/dist/*
+          path: |
+            target/dist/fail2commit-*-setup.exe
+            target/dist/fail2commit-windows-x86_64.exe
+            target/dist/LICENSE
+            target/dist/NOTICE
+            target/dist/THIRD-PARTY-NOTICES.md
           if-no-files-found: error
 
   linux:
