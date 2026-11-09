@@ -411,10 +411,14 @@ pub fn review_pkg_in(dir: &Path, tree: Option<&Path>, exts: Vec<String>) -> Resu
             cx.expand(&p)?;
             let mine = cx.wanted.clone();
             if !mine.iter().any(|r| dir.join(r).is_file()) {
+                // Nothing to shadow: named for approval as built at runtime (CR-012).
                 out.missing.push(p);
+            } else {
+                // A reviewed candidate exists; any other candidate appearing
+                // later could shadow it, so those must stay absent.
+                out.absent
+                    .extend(mine.iter().filter(|r| !dir.join(r).exists()).cloned());
             }
-            out.absent
-                .extend(mine.iter().filter(|r| !dir.join(r).exists()).cloned());
             cx.wanted.extend(before);
         }
         if let Some(tree) = tree {
@@ -517,13 +521,16 @@ pub fn review(
                 .location(name.clone()),
             );
         }
+        // CR-012: a build that compiles and then runs its own output is
+        // legitimate (FR-007), so a path absent at review is named for a
+        // one-time approval rather than denied; the sandbox stays the boundary.
         for name in &r.missing {
             reviewed.findings.push(
                 Finding::new(
                     FindingKind::IncompleteScan,
-                    FindingAction::Deny,
+                    FindingAction::Approve,
                     "npm.scripts",
-                    format!("lifecycle command runs `{name}`, which does not exist at review time and could be created by an earlier script"),
+                    format!("lifecycle command runs `{name}`, which does not exist at review time (built or created by the package's scripts); it was not inspected"),
                 )
                 .target(id.display())
                 .location(name.clone()),

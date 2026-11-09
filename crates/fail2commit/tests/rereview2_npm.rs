@@ -330,9 +330,17 @@ fn control_gitignore_token_names_nothing_npm_extracted() {
         .file(".gitignore", HOSTILE);
     // npm extracted no `.gitignore` (it is `.npmignore` on disk), so the script
     // opens nothing that exists; the extracted tree is what is reviewed (CR-008).
-    // A local command path with no file on disk is an incomplete scan (round 3).
-    let e = run_pkg(p).unwrap_err();
-    assert!(e.contains("does not exist at review time"), "{e}");
+    // A local command path with no file on disk is named for approval as not
+    // inspected (CR-012); the hostile bytes are never presented as reviewed.
+    let bytes = p.tarball();
+    let (_, seen) = run_seen(p, bytes);
+    assert!(
+        !seen
+            .iter()
+            .flat_map(|(_, files)| files)
+            .any(|(path, _)| path.contains("gitignore")),
+        "the renamed .gitignore was offered as reviewed content: {seen:?}"
+    );
 }
 
 // ---------------------------------------------------------------- RN2 repros

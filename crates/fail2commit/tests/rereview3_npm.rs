@@ -71,6 +71,8 @@ struct Outcome {
     env: Env,
     jobs: Vec<fail2commit_core::isolation::JobSpec>,
     digests: Vec<String>,
+    /// Findings carried by every approval request that was asked.
+    asked: Vec<fail2commit_core::Finding>,
     data: serde_json::Value,
 }
 
@@ -144,6 +146,13 @@ fn run(bytes: Vec<u8>, execute: bool, want_approval: bool, approve_hook: Option<
         .iter()
         .map(|r| r.digest.clone())
         .collect();
+    let asked = rn
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r.findings.clone())
+        .collect();
     let jobs = backend.jobs();
     drop(rn);
     Outcome {
@@ -152,6 +161,7 @@ fn run(bytes: Vec<u8>, execute: bool, want_approval: bool, approve_hook: Option<
         env,
         jobs,
         digests,
+        asked,
         data,
     }
 }
@@ -661,32 +671,30 @@ fn two_scripts(pre: &str, post: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
     tar_gz(&e)
 }
 
-/// An earlier script creates `./later.js`, a later script runs it: denied at review.
+/// An earlier script creates `./later.js`, a later script runs it. CR-012: a
+/// path absent at review is never silently trusted; it is named in an
+/// Approve finding, so scripts run only after the user saw and approved it.
 #[test]
-fn d5_command_path_missing_at_review_is_denied() {
+fn d5_command_path_missing_at_review_is_named_for_approval() {
     let make = b"require('fs').writeFileSync('later.js','console.log(1)')";
-    let bytes = two_scripts(
-        "node make.js",
+    for post in [
         "node ./later.js",
-        &[("package/make.js", make)],
-    );
-    let o = run(bytes, true, false, None);
-    assert!(denied_with(&o, "later.js"), "{:?}", o.result);
-    assert!(!committed(&o, "scripty"));
-    assert!(o.jobs.is_empty(), "no script may run: {:?}", o.jobs.len());
-    // The same through a bare interpreter argument and a `./` command.
-    for post in ["node later.js", "./later.js", "sh ./later.sh"] {
+        "node later.js",
+        "./later.js",
+        "sh ./later.sh",
+    ] {
         let o = run(
             two_scripts("node make.js", post, &[("package/make.js", make)]),
             true,
             false,
             None,
         );
-        assert!(
-            denied_with(&o, "does not exist at review time"),
-            "{post}: {:?}",
-            o.result
-        );
+        let named = o.asked.iter().any(|f| {
+            f.action == fail2commit_core::FindingAction::Approve
+                && f.evidence.contains("does not exist at review time")
+                && f.location.as_deref().is_some_and(|l| l.contains("later."))
+        });
+        assert!(named, "{post}: not named for approval: {:?}", o.asked);
     }
 }
 
