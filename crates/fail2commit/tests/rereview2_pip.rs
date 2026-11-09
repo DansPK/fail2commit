@@ -237,6 +237,9 @@ fn rp2_001_pth_alias_is_named_as_startup_code() {
         return;
     }
     let marker = l.marker("alias-pth-ran");
+    // CR-001: a startup hook that was named in the approval and then approved
+    // may run; only an alias that slips in unnamed is a bypass.
+    let mut approved_named = false;
     for (i, alias) in ["alias_a.pth.", "alias_b.pth ", "alias_c.pth::$DATA"]
         .iter()
         .enumerate()
@@ -261,11 +264,12 @@ fn rp2_001_pth_alias_is_named_as_startup_code() {
             named || !ran_file,
             "RP2-001: {alias:?} became a *.pth in site-packages with no pip.startup finding"
         );
+        approved_named |= named;
     }
     l.plain_python();
     assert!(
-        !marker.exists(),
-        "RP2-001: an unapproved alias .pth ran at the next Python start"
+        approved_named || !marker.exists(),
+        "RP2-001: an alias .pth ran at the next Python start without being named in the approval"
     );
 }
 

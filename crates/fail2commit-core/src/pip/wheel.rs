@@ -142,7 +142,8 @@ enum Dest {
     Data(Vec<String>),
     /// `*.data/scripts`: the venv's `Scripts`/`bin` directory.
     Scripts(Vec<String>),
-    /// A component that names nothing once Windows folds it (`...`, `. `).
+    /// A component that names nothing once Windows folds it (`...`, `. `), or
+    /// uses NTFS stream syntax (`name::$DATA`).
     Bad,
     Other,
 }
@@ -159,7 +160,8 @@ fn classify(name: &str) -> Dest {
         .filter(|c| !c.is_empty() && *c != ".")
         .map(fold)
         .collect();
-    if comps.iter().any(String::is_empty) {
+    // `:` only appears in NTFS stream syntax (`x.pth::$DATA` writes `x.pth`).
+    if comps.iter().any(|c| c.is_empty() || c.contains(':')) {
         return Dest::Bad;
     }
     let Some(first) = comps.first() else {
@@ -270,7 +272,10 @@ pub fn scan(path: &Path, dist: &str, reserved: &[String]) -> Result<Scan, WheelE
         let mut startup: Option<&'static str> = None;
         match classify(&name) {
             Dest::Bad => {
-                deny = Some("an entry name component that Windows folds to nothing".into());
+                deny = Some(
+                    "an entry name component that Windows folds to nothing or names an NTFS stream"
+                        .into(),
+                );
             }
             Dest::Site(rel)
                 if rel.len() == 2
