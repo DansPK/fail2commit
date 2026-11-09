@@ -129,6 +129,55 @@ fn native_build_runs_in_the_real_sandbox_and_its_artifact_is_installed() {
 }
 
 /// Wait until the listener thread has counted at least `n` connections.
+/// CR-014: install scripts that start child processes with piped stdio (the
+/// esbuild pattern) must finish inside the sandbox instead of hanging until
+/// the job timeout.
+const PIPES_JS: &str = r#"
+const fs = require('fs'), cp = require('child_process');
+const n = process.execPath, args = (s) => ['-e', s];
+const sync = cp.execFileSync(n, args('process.stdout.write("sync-ok")')).toString();
+const input = cp.spawnSync(n, args('process.stdin.pipe(process.stdout)'), { input: 'input-ok' }).stdout.toString();
+const c = cp.spawn(n, args('console.log("async-ok"); console.error("err-ok")'));
+let out = '', err = '';
+c.stdout.on('data', (d) => out += d);
+c.stderr.on('data', (d) => err += d);
+c.on('close', (code) => {
+  fs.mkdirSync('build', { recursive: true });
+  fs.writeFileSync('build/pipes.txt', [sync, input, out.trim(), err.trim(), code].join('|'));
+});
+"#;
+
+#[test]
+fn install_script_child_processes_with_pipes_finish_in_the_sandbox() {
+    require_node();
+    if !require_sandbox("install_script_child_processes_with_pipes_finish_in_the_sandbox") {
+        return;
+    }
+    let n = NpmWorld::new(&[], true);
+    n.reg.publish(
+        &Pkg::new("pipes", "1.0.0")
+            .script("install", "node pipes.js")
+            .file("pipes.js", PIPES_JS),
+    );
+    let started = std::time::Instant::now();
+    let r = n.w.run(
+        &n.project,
+        &["--json", "--approver", "none", "npm", "install", "pipes"],
+    );
+    assert_eq!(r.code, 0, "{}\n{}\n{}", r.stdout, r.stderr, r.json);
+    assert_eq!(r.json["data"]["scripts"], "Sandboxed", "{}", r.json);
+    assert_eq!(
+        std::fs::read_to_string(n.project.join("node_modules/pipes/build/pipes.txt")).unwrap(),
+        "sync-ok|input-ok|async-ok|err-ok|0"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(n.stage_leftovers().is_empty(), "{:?}", n.stage_leftovers());
+}
+
 fn wait_conns(c: &AtomicUsize, n: usize) -> usize {
     let t0 = std::time::Instant::now();
     while c.load(Ordering::SeqCst) < n && t0.elapsed() < std::time::Duration::from_secs(5) {

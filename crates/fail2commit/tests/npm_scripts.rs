@@ -174,7 +174,10 @@ fn failing_script_rolls_everything_back() {
     let backend = FakeBackend::new(true, true);
     let run = Run::new(&env, &backend);
     let e = npm::execute(&run.deps(Behavior::default()), &env.request(&["ci"])).unwrap_err();
-    assert!(e.message.contains("lifecycle script failed"), "{e}");
+    assert!(
+        e.message.contains("lifecycle script") && e.message.contains("nothing was installed"),
+        "{e}"
+    );
     assert_eq!(snapshot(&env.project), before);
     assert_no_scratch(&env.project);
 }

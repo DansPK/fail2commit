@@ -367,6 +367,32 @@ pub(super) fn bin_dirs(tree: &Path, pkg_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// CR-014: preload written next to the staged node on Windows. Inside the
+/// AppContainer, libuv cannot create the named pipes it uses for child stdio
+/// and loops forever; the preload routes piped child stdio through files.
+pub(crate) const NODE_PRELOAD_NAME: &str = "f2c-node-preload.js";
+pub(crate) const NODE_PRELOAD: &str = include_str!("node_preload.js");
+
+/// `NODE_OPTIONS` for lifecycle scripts on Windows. An AppContainer cannot
+/// lstat the ancestors of its stage (`C:\`), which node's default realpath of
+/// the main script and of every required module does; npm on Windows creates
+/// no symlinks, so resolving without it is equivalent. The preload is added
+/// when it sits beside the (staged) node.
+#[cfg(windows)]
+fn node_options(tc: &Toolchain) -> String {
+    let mut o = String::from("--preserve-symlinks --preserve-symlinks-main");
+    let preload = tc.node_dir().join(NODE_PRELOAD_NAME);
+    if preload.is_file() {
+        // Forward slashes: NODE_OPTIONS treats a backslash inside quotes as an
+        // escape character.
+        let p = crate::fsutil::plain_path(&preload)
+            .to_string_lossy()
+            .replace('\\', "/");
+        o.push_str(&format!(" --require \"{p}\""));
+    }
+    o
+}
+
 /// npm's lifecycle environment: `npm_*` context, `.bin` dirs on PATH,
 /// cwd = the package directory. Nothing is inherited.
 fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, OsString)> {
@@ -399,7 +425,9 @@ fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, O
         ("HOME".into(), tmp.clone().into()),
         ("TMPDIR".into(), tmp.clone().into()),
         ("TEMP".into(), tmp.clone().into()),
-        ("TMP".into(), tmp.into()),
+        ("TMP".into(), tmp.clone().into()),
+        // CR-014 preload: Windows overrides TEMP inside the AppContainer.
+        ("F2C_IO_DIR".into(), tmp.into()),
     ];
     if let Some(gyp) = tc
         .npm_root()
@@ -413,10 +441,7 @@ fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, O
     // module does. npm on Windows creates no symlinks, so resolving without it
     // is equivalent.
     #[cfg(windows)]
-    e.push((
-        "NODE_OPTIONS".into(),
-        "--preserve-symlinks --preserve-symlinks-main".into(),
-    ));
+    e.push(("NODE_OPTIONS".into(), node_options(tc).into()));
     #[cfg(windows)]
     for k in ["SystemRoot", "windir", "ComSpec"] {
         if let Some(v) = std::env::var_os(k) {
@@ -480,7 +505,7 @@ pub fn run_scripts(
             let tail = runner::tail(&[out.stderr.as_slice(), out.stdout.as_slice()].concat());
             (out.status, tail)
         } else {
-            let mut cmd = std::process::Command::new(&program);
+            let mut cmd = crate::winenv::command(&program);
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -507,8 +532,21 @@ pub fn run_scripts(
             )
         };
         if status != JobStatus::Exited(0) {
+            let why = match status {
+                JobStatus::Exited(code) => format!("exited with {code}"),
+                JobStatus::TimedOut => format!(
+                    "did not finish within limits.job_timeout_secs ({} s)",
+                    deps.settings.limits.job_timeout_secs
+                ),
+                JobStatus::Killed => "was stopped by a sandbox resource limit".to_string(),
+            };
+            let tail = if tail.is_empty() {
+                "no output".to_string()
+            } else {
+                tail
+            };
             return Err(Error::internal(format!(
-                "lifecycle script failed ({label}): {tail}"
+                "lifecycle script {why} ({label}); nothing was installed: {tail}"
             )));
         }
         ran.push(label);

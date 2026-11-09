@@ -24,6 +24,12 @@ impl Tools {
         fs::create_dir_all(&node_dir)?;
         let node = node_dir.join(tc.node.file_name().unwrap_or_default());
         fs::copy(&tc.node, &node)?;
+        // CR-014: lets sandboxed scripts start piped child processes.
+        #[cfg(windows)]
+        fs::write(
+            node_dir.join(super::apply::NODE_PRELOAD_NAME),
+            super::apply::NODE_PRELOAD,
+        )?;
         let mut t = Tools {
             toolchain: Toolchain {
                 node,
