@@ -668,18 +668,7 @@ fn canonical_file(path: &Path, label: &str) -> crate::Result<PathBuf> {
     Ok(p)
 }
 
-/// The plain DOS form of a canonical path: the extended `\\?\` prefix removed,
-/// and `\\?\UNC\server` restored to `\\server`.
-fn plain_path(path: &Path) -> PathBuf {
-    let text = path.as_os_str().to_string_lossy();
-    match text.strip_prefix(r"\\?\") {
-        Some(rest) => match rest.strip_prefix("UNC\\") {
-            Some(unc) => PathBuf::from(format!(r"\\{unc}")),
-            None => PathBuf::from(rest),
-        },
-        None => path.to_path_buf(),
-    }
-}
+use crate::fsutil::plain_path;
 
 fn first_child_under(parent: &Path, path: &Path) -> Option<PathBuf> {
     let relative = path.strip_prefix(parent).ok()?;

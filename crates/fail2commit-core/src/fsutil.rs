@@ -72,9 +72,40 @@ pub fn read_bounded(path: &Path, max: u64) -> crate::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The plain DOS form of a canonical path: the extended `\\?\` prefix removed,
+/// and `\\?\UNC\server` restored to `\\server`. Use it for paths handed to a
+/// child process (CreateProcessW, cmd.exe and Node 22's main-script resolution
+/// reject `\\?\`); containment checks keep the canonical form.
+pub fn plain_path(path: &Path) -> std::path::PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix("UNC\\") {
+            Some(unc) => format!(r"\\{unc}").into(),
+            None => rest.into(),
+        },
+        None => path.to_path_buf(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_path_strips_only_the_extended_prefix() {
+        assert_eq!(
+            plain_path(Path::new(r"\\?\C:\a\b.js")),
+            Path::new(r"C:\a\b.js")
+        );
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\srv\s\x")),
+            Path::new(r"\\srv\s\x")
+        );
+        assert_eq!(
+            plain_path(Path::new("/usr/bin/node")),
+            Path::new("/usr/bin/node")
+        );
+    }
 
     #[test]
     fn atomic_write_replaces_and_locks() {

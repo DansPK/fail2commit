@@ -42,9 +42,10 @@ impl Toolchain {
         }
         for c in cands {
             if c.file_name().is_some_and(|n| n == "npm-cli.js") && c.is_file() {
+                // Node 22 fails with `lstat 'C:'` on a `\\?\` main script.
                 return Ok(Toolchain {
-                    node,
-                    npm_cli: c.canonicalize().unwrap_or(c),
+                    node: crate::fsutil::plain_path(&node),
+                    npm_cli: crate::fsutil::plain_path(&c.canonicalize().unwrap_or(c)),
                 });
             }
         }
@@ -194,4 +195,23 @@ pub fn passthrough(paths: &TrustedPaths, args: &[OsString]) -> Result<i32> {
         .status()
         .map_err(|e| Error::internal(format!("could not start npm: {e}")))?;
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CI regression: Node 22 on Windows exits with `lstat 'C:'` when npm-cli.js
+    /// is passed in the `\\?\` form that canonicalize returns.
+    #[test]
+    fn npm_toolchain_paths_are_plain() {
+        let Ok(paths) = crate::paths::TrustedPaths::resolve() else {
+            return;
+        };
+        if let Ok(tc) = Toolchain::resolve(&paths) {
+            for p in [&tc.node, &tc.npm_cli] {
+                assert!(!p.to_string_lossy().starts_with(r"\\?\"), "{}", p.display());
+            }
+        }
+    }
 }
