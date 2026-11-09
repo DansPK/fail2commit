@@ -37,8 +37,10 @@ fn rules() -> &'static Rules {
                 ("gitlab-token", re(r"\bglpat-[A-Za-z0-9_-]{20,}")),
                 ("slack-token", re(r"\bxox[abposr]-[A-Za-z0-9-]{10,}")),
             ],
+            // A quoted value runs to its closing quote (`#`, `,`, `;` are
+            // password characters there); only an unquoted value stops at them.
             generic: re(
-                r#"(?i)[\w.-]*(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)[\w.-]*["']?\s*[:=]\s*["']?([^\s"'#,;]{8,})"#,
+                r#"(?i)[\w.-]*(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)[\w.-]*["']?\s*[:=]\s*(?:"([^"\s]{8,})"|'([^'\s]{8,})'|["']?([^\s"'#,;]{8,}))"#,
             ),
         }
     })
@@ -101,7 +103,7 @@ pub fn scan_text(text: &str) -> Vec<Hit> {
                 }
             }
             if let Some(c) = r.generic.captures(line) {
-                let v = &c[1];
+                let v = (1..=3).find_map(|i| c.get(i)).map_or("", |m| m.as_str());
                 if !placeholder(v) && entropy(v) >= 3.0 {
                     hits.push(Hit {
                         detector: "generic-assignment",
@@ -170,6 +172,24 @@ pub fn is_env_file(path: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Found by the Linux full-flow run: `#` inside a quoted password cut the
+    /// value to 3 characters, so the push went through unflagged.
+    #[test]
+    fn quoted_password_with_hash_or_comma_is_flagged() {
+        for line in [
+            r#"db_password = "Zq8#vT2kPw9xLmR4sQ7""#,
+            "api_key: 'Zq8,vT2k;Pw9xLmR4sQ7'",
+            r#"{"secret": "Zq8#vT2kPw9xLmR4sQ7"}"#,
+        ] {
+            let hits = scan_text(line);
+            assert_eq!(hits.len(), 1, "{line}");
+            assert_eq!(hits[0].detector, "generic-assignment", "{line}");
+        }
+        // Unquoted: `#` still starts a comment, so only the short head is seen.
+        assert!(scan_text("password=Zq8 # trailing comment").is_empty());
+        assert!(scan_text(r#"password = "changeme#1234""#).is_empty());
+    }
 
     #[test]
     fn env_names() {
