@@ -50,6 +50,7 @@ foreach ($f in "fail2commit.exe", "fail2commit-tray.exe") {
 # The binaries carry third-party code whose licenses require these notices.
 Copy-Item (Join-Path $root "LICENSE") $stage
 Copy-Item (Join-Path $root "NOTICE") $stage
+Copy-Item (Join-Path $root "asset\logo.ico") $stage
 Copy-Item (Join-Path $root "THIRD-PARTY-NOTICES.md") (Join-Path $stage "THIRD-PARTY-NOTICES.txt")
 Copy-Item (Join-Path $root "docs\windows.md") (Join-Path $stage "docs")
 

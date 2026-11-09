@@ -4,6 +4,7 @@
   "description": "Guarded Git push, npm and pip installs through the fail2commit CLI.",
   "version": "0.1.0",
   "publisher": "fail2commit",
+  "icon": "media/logo.png",
   "license": "Apache-2.0",
   "private": true,
   "repository": { "type": "git", "url": "https://github.com/fail2commit/fail2commit" },

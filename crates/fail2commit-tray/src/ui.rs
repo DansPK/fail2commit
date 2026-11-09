@@ -123,6 +123,7 @@ pub fn run() -> ExitCode {
         dc.lpszClassName = dlg_class.as_ptr();
         dc.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
         dc.hbrBackground = (COLOR_BTNFACE + 1) as usize as _;
+        dc.hIcon = logo_icon();
         RegisterClassW(&dc);
 
         let title = wide("fail2commit");
@@ -176,6 +177,40 @@ fn copy_wide<const N: usize>(dst: &mut [u16; N], text: &str) {
     }
 }
 
+/// The fail2commit logo (`asset/logo.ico`), built once from the embedded file;
+/// the stock shield icon if Windows cannot read it.
+unsafe fn logo_icon() -> HICON {
+    const LOGO_ICO: &[u8] = include_bytes!("../../../asset/logo.ico");
+    static ICON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let h = *ICON.get_or_init(|| {
+        // ICONDIR (6 bytes) then the first ICONDIRENTRY: size at +8, offset at +12.
+        let entry = |at: usize| {
+            LOGO_ICO
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        };
+        match (entry(6 + 8), entry(6 + 12)) {
+            (Some(size), Some(offset)) if offset + size <= LOGO_ICO.len() => {
+                CreateIconFromResourceEx(
+                    LOGO_ICO[offset..].as_ptr(),
+                    size as u32,
+                    1,
+                    0x0003_0000,
+                    0,
+                    0,
+                    LR_DEFAULTCOLOR,
+                ) as usize
+            }
+            _ => 0,
+        }
+    });
+    if h == 0 {
+        LoadIconW(std::ptr::null_mut(), IDI_SHIELD)
+    } else {
+        h as HICON
+    }
+}
+
 unsafe fn notify(hwnd: HWND, op: u32, balloon: Option<&str>) {
     let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
     nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -183,7 +218,7 @@ unsafe fn notify(hwnd: HWND, op: u32, balloon: Option<&str>) {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_SHIELD);
+    nid.hIcon = logo_icon();
     let n = pending_count();
     copy_wide(
         &mut nid.szTip,
