@@ -128,16 +128,21 @@ Findings:
 |---|---|---|---|---|
 | 42584670597 | `02fd51f` | pass | pass (494) | fail: `e2e_npm_approval` 4 tests, `EISDIR lstat 'C:'` under the runner's Node 22.23.4 |
 | 42592243721 | `7046e37` | pass | pass | fail: `e2e_npm_sandbox` 4 tests |
+| 42604881871 | `3ac9f20` | pass | pass | fail: `rereview3_npm` 1 test (8.3 TEMP in a fixture) |
+| 42612574385 | `5eccfb3` | pass | pass | fail: `sandbox_windows_matrix` handle-list test (STATUS_INVALID_HANDLE) |
+| **42616731444** | **`82004af`** | **pass** | **pass, 497 passed, 0 failed, 3 ignored** | **pass, 507 passed, 0 failed, 3 ignored** |
 
 - `7046e37` (FR-004): npm-cli.js was passed to node in the `\\?\` form; Node 22 cannot resolve it. Reproduced locally with the official Node 22.23.4 zip (old code fails identically, fix passes 3 runs in a row).
 - The second run's failures: three came from the test fixture embedding the runner's 8.3 `TEMP` (`RUNNER~1`), which the npm guard correctly refuses; reproduced locally with an 8.3 alias and fixed in the test support (long form). One was a leftover `probe-*` stage: the AppContainer probe stage is now removed with a short retry, and stale `probe-*` stages are swept like `npm-*` and `run-*`.
+- `82004af` (FR-007): on the runner the handle-list probe raised `STATUS_INVALID_HANDLE` (strict handle checks) instead of returning `ERROR_INVALID_HANDLE`; both prove the handle was not inherited, and a successful read still fails the test.
+- `5885ca8` (FR-011): license audit; the Windows installer and standalone binaries now ship `LICENSE`, `NOTICE` and the third-party notices, which now cover the Rust standard library and the MinGW-w64 runtime (`docs/release.md`, Licensing). The 0.1.0 artifacts in section 3 predate this and must not be published.
 - The Linux job does not install bubblewrap, so the hostile-sandbox suites skip there; real-sandbox evidence is section 5c and the WSL runs in section 2.
 
 ## 6. Pending gates (missing prerequisite)
 
 | Gate | Status | Missing prerequisite |
 |---|---|---|
-| GitHub Actions `ci.yml` runs | In progress (section 5d) | - |
+| GitHub Actions `ci.yml` runs | **Passed** on `82004af` (section 5d) | - |
 | GitHub `release.yml` run | Pending | `workflow_dispatch` needs the workflow on the default branch, i.e. merging PR #1 |
 | Linux CI exercising the real sandbox | Pending | Install bubblewrap in the CI job and require the sandbox; on stock Ubuntu 24.04 runners AppArmor may need a bwrap userns profile |
 | Stock Ubuntu desktop with AppArmor userns restriction | Pending | A non-WSL Ubuntu 24.04+ host (WSL does not enforce the restriction) |
