@@ -31,6 +31,17 @@ jobs:
       - name: Release build
         shell: pwsh
         run: scripts/release/build-windows.ps1
+      # windows-latest no longer ships NSIS; use the same pinned portable 3.11
+      # as the local builds (hash recorded in VERIFY-2026-11-08-windows-tray.md).
+      - name: Portable NSIS 3.11 (pinned)
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "nsis-3.11.zip"
+          curl.exe -fsSL -A Wget -o $zip "https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/nsis-3.11.zip/download"
+          if ($LASTEXITCODE -ne 0) { throw "NSIS download failed ($LASTEXITCODE)" }
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($hash -ne "c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1") { throw "nsis-3.11.zip SHA-256 mismatch: $hash" }
+          Expand-Archive -Path $zip -DestinationPath target/nsis -Force
       - name: NSIS installer when available
         shell: pwsh
         run: |
