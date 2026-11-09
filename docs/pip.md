@@ -14,6 +14,13 @@ fail2commit pip [--python <interpreter>] recover [--discard]
 * The `pip` / `pip3` shims (installed by `fail2commit setup`, PATH ordering
   by the Git integration) run exactly this command. Without `--python` the
   interpreter is the Python next to the real `pip` outside the shim dir.
+* **Virtualenvs (CR-015).** Activating a venv puts `venv/bin` (`venv\Scripts`)
+  first on PATH, ahead of the shim. `fail2commit setup` therefore also adds
+  `pip`, `pip3` and `npm` shell functions to `~/.bashrc`, an existing
+  `~/.zshrc` and the PowerShell profiles; functions win over PATH, so plain
+  `pip install` in an activated venv is guarded and installs into that venv.
+  Open a new shell after setup. cmd.exe has no functions: use
+  `fail2commit pip ...` there.
 * **A shim cannot intercept `python -m pip` or `py -m pip`.** Use the guarded
   replacement instead:
 

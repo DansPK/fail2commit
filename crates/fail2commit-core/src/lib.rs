@@ -39,6 +39,7 @@ pub mod scan;
 pub mod server;
 
 pub mod machine;
+pub mod shellinteg;
 
 pub use error::{Error, Result};
 pub use protocol::{Finding, FindingAction, FindingKind, ResultCode};

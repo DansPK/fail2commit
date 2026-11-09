@@ -18,6 +18,7 @@ fn integrations() -> Vec<Box<dyn Integration>> {
         git::integration(),
         npm::integration(),
         pip::integration(),
+        fail2commit_core::shellinteg::integration(),
         ipc::integration(),
     ]
     .into_iter()
@@ -181,7 +182,7 @@ pub fn status(ctx: &Ctx) -> CmdResult {
         } else if cfg!(windows) {
             "Windows searches the machine PATH before your user PATH; run `fail2commit machine-shims install` as administrator."
         } else {
-            "Put the fail2commit bin directory first on PATH, then open a new shell."
+            "Run `. ~/.profile` or sign in again so the fail2commit bin directory comes first on PATH. In interactive bash/zsh the fail2commit pip/npm functions guard it anyway."
         };
         text.push_str(&format!(
             "\nwarning: `{tool}` runs {file} and is NOT guarded. {hint}"
