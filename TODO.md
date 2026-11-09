@@ -23,3 +23,65 @@ Integration branch: `DansPK/f2-commit-coordinator`. Release candidate built from
 | T-010 | Integrate VS Code | FR-010, SPEC-010 | orca:claude-sonnet | done; GUI and Remote-WSL session pending | T-002, T-004, T-005, T-008 |
 | T-011 | Ship reproducible releases | FR-011, SPEC-011 | orca:codex + coordinator | done; Arch pacman package added (CR-016); GitHub release workflow run pending | T-003–T-010 |
 | T-012 | Keep resource use bounded | NFR-012, SPEC-012 | orca:claude-sonnet | done | T-004, T-005, T-007, T-009 |
+
+## Production roadmap (proposed, not yet approved)
+
+The MVP stops install-time attacks for npm and pip when the install goes through the guard (verify report sections 5f and 5g). Production grade means three more things: the guard is hard to bypass by accident, it costs a developer little time and few prompts, and the OS trusts the releases. Each row below needs its requirement written with `/write-requirements` and approved before code starts. "Exit" is the check that closes the row.
+
+### Phase 1: close the gaps (v0.2)
+
+| ID | Task | Why | Exit | Depends on |
+|---|---|---|---|---|
+| P-101 | Code-sign the Windows binaries and installer; submit the CLI to Microsoft as a false positive | Defender quarantined the unsigned CLI (`Behavior:Win32/DefenseEvasion.A!ml`), which blocks the Windows release | Signed installer passes SmartScreen and Defender on clean Windows 10 and 11 VMs, including the attack simulation | owner: certificate |
+| P-102 | `setup` writes `ignore-scripts=true` to the user `~/.npmrc`, recorded and undone by uninstall; `status` warns if it is removed | Unguarded npm (`npm.cmd`, nvm, IDEs, CI scripts) then never runs install scripts | Attack simulation run with bare `npm.cmd` and nvm's npm runs no lifecycle script | - |
+| P-103 | cmd.exe `doskey` macros through the per-user cmd AutoRun key | cmd has no shell functions, so a venv in cmd bypasses the guard (CR-015) | `venv\Scripts\activate.bat`, then `pip install`, is guarded | - |
+| P-104 | Registry gate: the user's npm `registry=` and pip `index-url` point at a fail2commit loopback service that reviews before serving; grows from the existing wheel-only pip proxy (`pip/proxy.rs`) | Closes `python -m pip`, IDEs and every other launcher that reads the standard config files | Attack simulation through `python -m pip` and `npm.cmd` is blocked; with the service stopped, installs fail closed | P-102 |
+| P-105 | Minimum release age: versions published less than N hours ago (default 72) need approval | Most malicious versions are found and pulled within days; this also catches new malware that has no findings | A freshly published simulation package prompts; a pinned year-old lockfile installs with no prompt | - |
+| P-106 | Linux CI with real bubblewrap; AppArmor userns check on stock Ubuntu 24.04 | Open gates in the verify report, section 6 | CI fails if any sandbox control fails | - |
+| P-107 | Fuzz the untrusted parsers (tar/gzip, wheel ZIP, lockfiles, pre-push input, IPC) with `cargo fuzz` in CI | They parse attacker-controlled bytes | 1 h per target without a crash; corpus committed | - |
+
+### Phase 2: user experience (v0.3)
+
+| ID | Task | Why | Exit | Depends on |
+|---|---|---|---|---|
+| P-201 | False-positive benchmark: install the top 500 npm and top 500 PyPI packages through the guard and record every prompt and deny | People switch off a guard that prompts on normal work; this is the number to drive down | Prompt rate and false-deny rate recorded in `docs/verify/`; 0 false denies on the corpus | - |
+| P-202 | Overhead budget: time the same installs with and without the guard (guarded esbuild took 26 s on Arch and 32 s on Windows; unguarded not yet measured) | Install speed decides adoption | Median overhead recorded, a target set in NFR-012 and met | P-201 |
+| P-203 | Review cache keyed by package integrity hash | Re-installs, CI runs and fresh clones rescan the same tarballs | A second install of an unchanged lockfile does no rescan and shows no prompt | - |
+| P-204 | Project approval file: approvals bound to the lockfile digest, which a team commits and reviews in a PR | One-time approvals repeat on every machine for every teammate (approval fatigue) | A teammate with the same lockfile gets no prompt; any lockfile change invalidates the approval | P-203 |
+| P-205 | Plain-language prompts and errors: what was found, why it matters and the next command, with no internal names (`RefRewrite`, `IncompleteScan`) | Testers had to read the docs to act on a prompt | Every finding kind has a reviewed message and a "what to do" line, covered by snapshot tests | - |
+| P-206 | `fail2commit doctor`: checks PATH order, shims, shell functions, npmrc, sandbox controls and the Linux user manager, then prints the fix | Most issues found in testing were setup issues: PATH order, visible consoles, cgroups without a login session | Each check has a test that breaks the setup and confirms `doctor` names the fix | - |
+| P-207 | Tray and dialog polish: test the menu items, add screen-reader labels and a high-DPI icon, show decision history | The tray menu was never clicked through; accessibility is untested | Narrator reads every control; menu click-through recorded | - |
+| P-208 | Document and test `fail2commit run -- npm test` / `npm start` as the way to run untrusted code at use time | Malicious code that runs on `require()` is outside install-time isolation | A simulation package with a require-time payload is contained when run through `fail2commit run` | - |
+| P-209 | Distribution through winget, Scoop, a signed apt repository and the AUR | Download-and-run installs are hard to keep updated | Each channel installs, upgrades and removes cleanly on a clean VM | P-101 |
+| P-210 | Signed releases with an SBOM and GitHub build provenance; an update check with no telemetry | Users need to verify what they install | `gh attestation verify` passes for every artifact | P-101 |
+
+### Phase 3: more package managers (v0.4 and later)
+
+First, split the npm and pip code into one ecosystem adapter trait. Its steps:
+
+1. Plan: resolve without running package code.
+2. Fetch the packages and verify their integrity.
+3. Review: scan them.
+4. Stage: install offline with scripts off.
+5. Run the approved build steps in the sandbox.
+6. Commit the result into the project.
+
+Shims, shell functions and the registry gate (P-104) then come from the trait. The order below is install-time code-execution risk multiplied by usage.
+
+| ID | Package manager | Registry and scan | Where package code runs | Approach |
+|---|---|---|---|---|
+| P-300 | Adapter refactor, no behaviour change | - | - | npm and pip move onto the trait; every existing test passes unchanged |
+| P-301 | pnpm | npm registry; reuse the npm scan | Lifecycle scripts (pnpm 10 gates them with `onlyBuiltDependencies`) | Install with `--ignore-scripts`, then run approved builds with `pnpm rebuild` in the sandbox; parse `pnpm-lock.yaml` |
+| P-302 | Yarn classic and Yarn Berry | npm registry | Lifecycle scripts; Berry plugins | As pnpm; Berry with `enableScripts: false`, then `yarn rebuild`; parse `yarn.lock` |
+| P-303 | Bun | npm registry | Lifecycle scripts of `trustedDependencies` | Install with `--ignore-scripts`; sandboxed build step |
+| P-304 | uv and pipx | PyPI; reuse the pip scan | sdist builds | Point `UV_INDEX_URL` at the wheel-only gate; `--no-build` unless the build is approved and sandboxed |
+| P-305 | Poetry | PyPI | sdist builds, plugins | Gate as the package source; `poetry install` under the guard |
+| P-306 | Cargo | crates.io; OSV and RustSec | `build.rs` and proc macros at build time | Sandbox `cargo build` through `fail2commit run`; scan `Cargo.lock` |
+| P-307 | RubyGems/Bundler, Composer, NuGet | Each registry; OSV | Native extensions, Composer scripts, MSBuild targets | Same adapter steps, one ecosystem at a time |
+| P-308 | Go modules | proxy.golang.org; OSV and `sum.golang.org` | None at install | Advisory scan only |
+| Later | VS Code extensions, GitHub Actions, container images | - | - | Different install shape; needs its own requirement |
+
+A package manager is done when it passes the same gate as npm and pip:
+- the attack simulation, ported to that ecosystem, is blocked at every step on the Windows, Debian and Arch VMs;
+- the false-positive benchmark (P-201) runs on its top 200 packages;
+- uninstall leaves the host unchanged.
