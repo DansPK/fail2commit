@@ -177,7 +177,9 @@ fn committed(o: &Outcome, rel: &str) -> bool {
 #[test]
 fn control_extraction_runs_no_package_code() {
     let dir = tempfile::tempdir().unwrap();
-    let mark = |n: &str| dir.path().join(n).to_string_lossy().replace('\\', "/");
+    // Long form: an 8.3 TEMP (CI's `RUNNER~1`) is refused by the guard.
+    let long = fail2commit_core::fsutil::plain_path(&dir.path().canonicalize().unwrap());
+    let mark = |n: &str| long.join(n).to_string_lossy().replace('\\', "/");
     let js = |n: &str| {
         format!(
             "node -e \\\"require('fs').writeFileSync('{}','x')\\\"",
