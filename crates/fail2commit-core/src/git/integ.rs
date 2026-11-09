@@ -369,6 +369,13 @@ impl Integration for GitIntegration {
         let dir = hooks_dir(&ctx.paths);
         let ours = git_path(&dir);
         let shim = shim_path(&ctx.paths);
+        // Windows: the per-user install dir is not on PATH, so put the CLI
+        // itself beside the shims (unless setup already runs from there).
+        let cli = if cfg!(windows) {
+            Some(ctx.paths.bin_dir.join("fail2commit.exe")).filter(|c| !same_path(&ctx.exe, c))
+        } else {
+            None
+        };
         let prior_file = dir.join("prior-hookspath");
         let current = global_get(&git)?;
         // Re-running setup must not record our own value as "previous".
@@ -390,35 +397,50 @@ impl Integration for GitIntegration {
             make_executable(&hook)?;
             crate::fsutil::ensure_private_dir(&ctx.paths.bin_dir)?;
             install_shim(&ctx.exe, &shim)?;
+            if let Some(cli) = &cli {
+                install_shim(&ctx.exe, cli)?;
+            }
             global_set(&git, Some(&ours))?;
             self.editor.add(&ctx.paths.bin_dir)?
         };
-        Ok(vec![
-            OwnedChange {
-                integration: ID.into(),
-                kind: "git-config".into(),
-                path: None,
-                detail: json!({ "key": KEY, "previous": previous, "value": ours }),
-            },
-            OwnedChange {
-                integration: ID.into(),
-                kind: "hook-file".into(),
-                path: Some(dir),
-                detail: Value::Null,
-            },
-            OwnedChange {
+        let mut extra = Vec::new();
+        if let Some(cli) = cli {
+            extra.push(OwnedChange {
                 integration: ID.into(),
                 kind: "shim".into(),
-                path: Some(shim),
+                path: Some(cli),
                 detail: Value::Null,
-            },
-            OwnedChange {
-                integration: ID.into(),
-                kind: "path-entry".into(),
-                path: Some(ctx.paths.bin_dir.clone()),
-                detail: path_detail,
-            },
-        ])
+            });
+        }
+        Ok(extra
+            .into_iter()
+            .chain([
+                OwnedChange {
+                    integration: ID.into(),
+                    kind: "git-config".into(),
+                    path: None,
+                    detail: json!({ "key": KEY, "previous": previous, "value": ours }),
+                },
+                OwnedChange {
+                    integration: ID.into(),
+                    kind: "hook-file".into(),
+                    path: Some(dir),
+                    detail: Value::Null,
+                },
+                OwnedChange {
+                    integration: ID.into(),
+                    kind: "shim".into(),
+                    path: Some(shim),
+                    detail: Value::Null,
+                },
+                OwnedChange {
+                    integration: ID.into(),
+                    kind: "path-entry".into(),
+                    path: Some(ctx.paths.bin_dir.clone()),
+                    detail: path_detail,
+                },
+            ])
+            .collect())
     }
 
     fn uninstall(&self, ctx: &SetupCtx, owned: &[OwnedChange]) -> crate::Result<()> {
@@ -480,6 +502,13 @@ impl Integration for GitIntegration {
 
 /// Copy `exe` to `shim` (replace atomically; a running copy cannot be
 /// replaced on Windows, which is reported rather than ignored).
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 fn install_shim(exe: &Path, shim: &Path) -> crate::Result<()> {
     if exe == shim {
         return Err(crate::Error::invalid(
