@@ -180,6 +180,14 @@ impl RegistryEditor {
         Ok(())
     }
 
+    /// `path` with every entry equal to `dir` removed; other entries unchanged.
+    fn without(path: &str, dir: &str) -> String {
+        path.split(';')
+            .filter(|e| !Self::same(e, dir))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
     fn same(a: &str, b: &str) -> bool {
         a.trim_end_matches(['\\', '/'])
             .eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
@@ -203,9 +211,14 @@ impl PathEditor for RegistryEditor {
             .collect::<Vec<_>>()
             .join(";");
         Self::write(&ty, &new)?;
+        // Re-running setup must not record our own entry as "previous", or
+        // uninstall would restore it (found on a real PC after a reinstall).
+        let previous = prev
+            .map(|(t, v)| (t, RegistryEditor::without(&v, &d)))
+            .filter(|(_, v)| !v.is_empty());
         Ok(json!({
             "editor": "registry",
-            "previous": prev.map(|(t, v)| json!({ "type": t, "value": v })),
+            "previous": previous.map(|(t, v)| json!({ "type": t, "value": v })),
             "written": new,
             "type": ty,
         }))
@@ -483,6 +496,21 @@ mod tests {
         let detail = e.add(Path::new("/b")).unwrap();
         e.remove(Path::new("/b"), &detail).unwrap();
         assert!(!f.exists());
+    }
+
+    /// A second setup run sees our entry already on the user PATH; "previous"
+    /// must not keep it, or uninstall restores it (seen on a real PC).
+    #[cfg(windows)]
+    #[test]
+    fn registry_previous_excludes_our_own_entry() {
+        let ours = r"C:\Users\u\AppData\Local\fail2commit\bin";
+        let on_path = r"c:\users\u\appdata\local\fail2commit\bin\;C:\Tools;%USERPROFILE%\x";
+        assert_eq!(
+            RegistryEditor::without(on_path, ours),
+            r"C:\Tools;%USERPROFILE%\x"
+        );
+        assert_eq!(RegistryEditor::without(r"C:\Tools", ours), r"C:\Tools");
+        assert_eq!(RegistryEditor::without(ours, ours), "");
     }
 
     #[test]
