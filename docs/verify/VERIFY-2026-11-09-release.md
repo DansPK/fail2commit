@@ -225,7 +225,7 @@ Host: VMware VM `arch-f2c`, installed from the official `archlinux-x86_64.iso` (
 
 Clean-container scripts, run from Windows Docker Desktop against the same source tarball:
 
-- `bash scripts/release/build-arch.sh target/arch-in/fail2commit-0.1.0-src.tar.gz target/arch-out`: exit 0. `check()` ran 148 tests, all passed. Output `fail2commit-0.1.0-1-x86_64.pkg.tar.zst` (3,305,188 bytes, SHA-256 `4f22761411a1aca91fe8198f3bf41c50b4247549b536a65ab79d9b938a7111c4`), plus Arch's default `-debug` package, which is not released.
+- `bash scripts/release/build-arch.sh target/arch-in/fail2commit-0.1.0-src.tar.gz target/arch-out`: exit 0. `check()` ran 148 tests, all passed. Output `fail2commit-0.1.0-1-x86_64.pkg.tar.zst` (3,305,188 bytes, SHA-256 `4f22761411a1aca91fe8198f3bf41c50b4247549b536a65ab79d9b938a7111c4`). Arch's default `-debug` package was also copied in this run; `build-arch.sh` now copies only the main package.
 - `bash scripts/release/verify-arch.sh target/arch-out/fail2commit-0.1.0-1-x86_64.pkg.tar.zst`: exit 0. Install, `status` as a normal user, and removal all passed, with the user's Git config and hooks hash-identical throughout. bubblewrap reports unavailable inside an unprivileged container, as expected.
 
 The VM was reverted to its `clean` snapshot afterwards. One harness artifact was not a product issue: bash's command hash reported `fail2commit` after removal, but the file was gone.

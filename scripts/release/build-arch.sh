@@ -30,6 +30,6 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     cp /input/PKGBUILD /input/*.tar.gz /home/builder/pkg/
     chown -R builder:builder /home/builder/pkg
     su builder -c "cd /home/builder/pkg && MAKEFLAGS=-j\${CARGO_BUILD_JOBS:-2} makepkg --force --noconfirm --cleanbuild"
-    cp /home/builder/pkg/*.pkg.tar.zst /out/
-    ls -l /out/*.pkg.tar.zst
+    cp /home/builder/pkg/fail2commit-[0-9]*.pkg.tar.zst /out/
+    ls -l /out/fail2commit-[0-9]*.pkg.tar.zst
   '
