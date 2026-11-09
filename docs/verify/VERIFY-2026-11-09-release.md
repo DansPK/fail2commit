@@ -1,7 +1,8 @@
 # Verify Report: MVP release candidate (2026-11-09)
 
 > **Requirements covered:** FR-001 to FR-011, NFR-012
-> **Commit / branch:** release commit `4559bab` (`DansPK/f2c-release-a026090`) = integration commit `a026090` plus regenerated notices and docs. Product code is unchanged since the gated commit `d15f559`; the only later changes are two test files and documentation, each re-run.
+> **Current release candidate:** RC2 built from `d4ca070` on `DansPK/f2-commit-coordinator` (section 3a); CI green on `82004af` (section 5d).
+> **Original commit / branch:** release commit `4559bab` (`DansPK/f2c-release-a026090`) = integration commit `a026090` plus regenerated notices and docs. Product code is unchanged since the gated commit `d15f559`; the only later changes are two test files and documentation, each re-run.
 > **Verified by:** Orca coordinator (gates, release builds, VM run); independent reviewers per area (see section 4)
 
 ---
@@ -35,6 +36,34 @@
 | Clean Windows 11 install/uninstall | `C:\f2c\f2c-vm-test.ps1` in the `win11` VM | see section 5 | see section 5 |
 
 ## 3. Artifacts (`target/dist/SHA256SUMS`)
+
+### 3a. Release candidate 2 (current), built from `d4ca070`
+
+Supersedes the RC1 set below. Includes every fix through `82004af` (Node 22 npm path, quoted-secret detector, `run -- cmd.exe`, probe stage cleanup) and the license notices from `5885ca8`. Built with `scripts/release/build-windows.ps1`, `packaging/windows/build.ps1` (NSIS 3.11), `build-deb.sh`, `source-tarball.sh`, `vsce package`, and `hashes.sh`.
+
+```text
+910990ec9bb50433f3971c78dd7c640b03383a234da725d93e0533c6ffd7a667  fail2commit-0.1.0-setup.exe
+972e7fb8cf86eb24b5e29b98932281994e47d4d31971d087218f251cce98e59e  fail2commit-windows-x86_64.exe
+03c2a1dc7001bfa0cf841a9029d4273691391491792d0d89846b7b16ceb37f2b  fail2commit_0.1.0_amd64.deb
+ecb58747c45dbb20156bcd5c3be0d1fd5771ea379dfe9caa0c3f1c1ca383fdae  fail2commit-0.1.0-linux-amd64
+e8d896afa57b64eb6d3b765aec2d3c20f0fd5e4e3842eb562d4668cfd577f9d4  fail2commit-0.1.0-src.tar.gz
+21873d0da408f540efa37612931ff36a48719004c4ecee27e752ac51e7152414  fail2commit-0.1.0.vsix
+3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5  LICENSE
+a6a1eae9bdf7c7e23c4f83fcafef66b2bb60f422f3244efe7cc2cdec978e2368  NOTICE
+ae48a34bed6918e659ccb44b6399901974f50eee6dc6eccb484d7ba813f71431  THIRD-PARTY-NOTICES.md
+```
+
+| Check on RC2 | Result |
+|---|---|
+| `.deb` verify (clean `ubuntu:24.04` install, status, remove, purge) | passed; package contains `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.md`, `LICENSE.template-MIT` |
+| Source tarball offline build | passed |
+| Reproducibility (`reproducible-linux.sh`) | `.deb`, Linux binary and notices bit-identical across two builds and equal to the released hashes |
+| VSIX tests against the RC2 CLIs | 13/13 Windows, 13/13 Linux (container, Node 20.19); VSIX carries `extension/LICENSE.txt`, no `node_modules` |
+| Clean win11 (25H2) and win10 (LTSC 21H2) install / guard / uninstall | all checks pass on both; `LICENSE`, `NOTICE`, `THIRD-PARTY-NOTICES.txt` installed and the notices include the MinGW-w64 runtime |
+| Interactive sandbox, win11 and win10 | available, all 9 controls; `run -- cmd.exe` now works; secret read `Access is denied.`; external TCP `Failed to connect` with host control `http=301`; benign x4 plus adversarial: 0 Defender detections on both |
+| Linux full flow with the RC2 `.deb` (fresh Ubuntu 24.04 WSL distro, bubblewrap 0.9.0) | every step of section 5c passes again; all 13 sandbox controls ok; the secret push now reports both `github-token` and the quoted `#` password (`generic-assignment`), values redacted |
+
+### 3b. Release candidate 1 (superseded; do not publish: no third-party notices in the Windows installer or beside the binaries)
 
 ```text
 f19ad03b254ff5dcd2f3ce27a2f0b19882e592ffca548f525da525ca6ac64218  fail2commit-0.1.0-setup.exe
@@ -156,4 +185,4 @@ Findings:
 | Windows editions other than Windows 11 Pro 25H2 and Windows 10 IoT Enterprise LTSC 2021 | Pending | Additional Windows hosts (Windows 10 LTSC 21H2 passed in section 5b) |
 | Windows sandbox on a clean VM in an interactive sign-in | **Passed** (section 5b) | - |
 | Microsoft Defender false positive on the unsigned CLI (`Behavior:Win32/DefenseEvasion.A!ml`) | **Open, release blocker for Windows** | An Authenticode code-signing certificate and a Microsoft false-positive submission; both are outward-facing and need the owner |
-| Release artifacts including `11be0a6` (`run -- cmd.exe` fix) | Pending | A rebuild of the Windows CLI, Setup.exe and the Linux artifacts from the new commit |
+| Release artifacts including the post-RC1 fixes | **Done**: RC2 (section 3a) | - |
