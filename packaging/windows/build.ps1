@@ -47,10 +47,10 @@ $rel = Join-Path $root "target\release"
 foreach ($f in "fail2commit.exe", "fail2commit-tray.exe") {
   Copy-Item (Join-Path $rel $f) $stage
 }
+# The binaries carry third-party code whose licenses require these notices.
 Copy-Item (Join-Path $root "LICENSE") $stage
-foreach ($n in "NOTICE", "THIRD-PARTY-NOTICES.txt") {
-  if (Test-Path (Join-Path $root $n)) { Copy-Item (Join-Path $root $n) $stage }
-}
+Copy-Item (Join-Path $root "NOTICE") $stage
+Copy-Item (Join-Path $root "THIRD-PARTY-NOTICES.md") (Join-Path $stage "THIRD-PARTY-NOTICES.txt")
 Copy-Item (Join-Path $root "docs\windows.md") (Join-Path $stage "docs")
 
 $out = Join-Path $dist "fail2commit-$Version-setup.exe"

@@ -22,6 +22,10 @@ try {
     cargo build --release --locked -p fail2commit
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
     Copy-Item -Force (Join-Path $TargetPath "release/fail2commit.exe") (Join-Path $OutPath "fail2commit-windows-x86_64.exe")
+    # The standalone binary ships with the notices its licenses require.
+    foreach ($n in "LICENSE", "NOTICE", "THIRD-PARTY-NOTICES.md") {
+        Copy-Item -Force (Join-Path $RepoRoot $n) (Join-Path $OutPath $n)
+    }
 }
 finally {
     Pop-Location

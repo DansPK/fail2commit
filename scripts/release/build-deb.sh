@@ -46,6 +46,7 @@ MSYS_NO_PATHCONV=1 docker run --rm \
     test -n "$deb"
     cp "$deb" "$RELEASE_OUT/fail2commit_${RELEASE_VERSION}_amd64.deb"
     cp /target/x86_64-unknown-linux-gnu/release/fail2commit "$RELEASE_OUT/fail2commit-${RELEASE_VERSION}-linux-amd64"
+    cp LICENSE NOTICE THIRD-PARTY-NOTICES.md "$RELEASE_OUT/"
   '
 
 printf 'built %s\n' "$repo/$out/fail2commit_${version}_amd64.deb"

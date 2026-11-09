@@ -56,6 +56,19 @@ copied into release notes. NSIS, native desktop, WSL, VS Code, and server
 integration evidence remains platform-gated and must not be inferred from a
 successful unit-test job.
 
+## Licensing
+
+fail2commit is Copyright 2026 Nut Youlong under Apache-2.0 (`LICENSE`, `NOTICE`). Files inherited from the project template keep their MIT notice (`LICENSE.template-MIT`); do not delete it while those files remain.
+
+Every binary artifact ships `LICENSE`, `NOTICE` and the generated `THIRD-PARTY-NOTICES.md` (`.txt` inside the Windows installer; beside the standalone binaries in `target/dist`; under `/usr/share/doc/fail2commit` in the `.deb`). Besides the Cargo crates it covers code the toolchain links in, from texts vendored in `packaging/licenses/`:
+
+- the Rust standard library (all binaries), from the toolchain's `COPYRIGHT-library.html`;
+- the MinGW-w64 runtime (Windows, `x86_64-pc-windows-gnu`), whose license requires its notice in binary distributions;
+- libgcc (Windows), under the GCC Runtime Library Exception, which imposes no conditions;
+- the LLVM exception and Unicode-3.0 texts referenced by dependency expressions.
+
+The Linux binary links glibc and libgcc_s dynamically (system libraries, no notice obligation). The VSIX contains only fail2commit code and its license. When the toolchain or target changes, refresh `packaging/licenses/` and rerun `scripts/release/notices.py`.
+
 ## License elections
 
 - `r-efi` (`MIT OR Apache-2.0 OR LGPL-2.1-or-later`): used under MIT or Apache-2.0; it is only compiled for UEFI targets (getrandom's UEFI backend) and is not part of the Windows or Linux artifacts. `notices.py` still flags it because the expression contains a copyleft alternative.

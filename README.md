@@ -12,5 +12,9 @@ This archive is the implementation scaffold. Product features are specified and 
 - [ORCA-PROMPT.md](ORCA-PROMPT.md) is ready to paste into the coordinator.
 - [SETUP.md](SETUP.md) covers fresh repository setup.
 
-The existing template is retained under its MIT license. New fail2commit code uses Apache-2.0.
+## License
+
+Copyright 2026 Nut Youlong. fail2commit is licensed under the [Apache License 2.0](LICENSE); see [NOTICE](NOTICE).
+Development files inherited from the project template stay under their [MIT license](LICENSE.template-MIT).
+Third-party notices for everything compiled into the release binaries are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 "# fail2commit" 

@@ -1,0 +1,15 @@
+fail2commit
+Copyright 2026 Nut Youlong
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Development files inherited from the project template (agent hooks and
+skills under .claude/ and .codex/, .githooks/, .github/ issue and pull request
+templates, and documentation templates) remain under the MIT License; see
+LICENSE.template-MIT. The skill under .claude/skills/skill-creator/ carries its
+own Apache-2.0 license in that directory. CODE_OF_CONDUCT.md is adapted from
+the Contributor Covenant 2.1.
+
+The release binaries include third-party software (Rust crates, the Rust
+standard library and, on Windows, the MinGW-w64 runtime). Their notices are in
+THIRD-PARTY-NOTICES.md (THIRD-PARTY-NOTICES.txt in the Windows installer).

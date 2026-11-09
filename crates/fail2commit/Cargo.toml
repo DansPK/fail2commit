@@ -21,7 +21,7 @@ zip = { version = "=9.4.2", default-features = false, features = ["deflate"] }
 
 [package.metadata.deb]
 name = "fail2commit"
-maintainer = "fail2commit contributors"
+maintainer = "Nut Youlong"
 section = "utils"
 priority = "optional"
 depends = "$auto"
@@ -32,6 +32,7 @@ assets = [
     ["../../docs/install.md", "usr/share/doc/fail2commit/install.md", "644"],
     ["../../docs/release.md", "usr/share/doc/fail2commit/release.md", "644"],
     ["../../LICENSE", "usr/share/doc/fail2commit/LICENSE", "644"],
+    ["../../NOTICE", "usr/share/doc/fail2commit/NOTICE", "644"],
     ["../../LICENSE.template-MIT", "usr/share/doc/fail2commit/LICENSE.template-MIT", "644"],
     ["../../THIRD-PARTY-NOTICES.md", "usr/share/doc/fail2commit/THIRD-PARTY-NOTICES.md", "644"],
 ]
