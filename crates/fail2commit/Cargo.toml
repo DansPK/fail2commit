@@ -1,0 +1,38 @@
+[package]
+name = "fail2commit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+fail2commit-core = { version = "0.1.0", path = "../fail2commit-core" }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+base64 = "=0.23.1"
+flate2 = "=1.1.11"
+hex = "=0.4.3"
+sha2 = "=0.11.1"
+tar = "=0.4.46"
+tempfile = "3.27.0"
+zip = { version = "=9.4.2", default-features = false, features = ["deflate"] }
+
+[package.metadata.deb]
+name = "fail2commit"
+maintainer = "Nut Youlong"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = "Guards Git pushes and package installs with explicit, operation-bound approval. Per-user hooks and shims are installed only by fail2commit setup."
+assets = [
+    ["target/release/fail2commit", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/fail2commit/README.md", "644"],
+    ["../../docs/install.md", "usr/share/doc/fail2commit/install.md", "644"],
+    ["../../docs/release.md", "usr/share/doc/fail2commit/release.md", "644"],
+    ["../../LICENSE", "usr/share/doc/fail2commit/LICENSE", "644"],
+    ["../../NOTICE", "usr/share/doc/fail2commit/NOTICE", "644"],
+    ["../../LICENSE.template-MIT", "usr/share/doc/fail2commit/LICENSE.template-MIT", "644"],
+    ["../../THIRD-PARTY-NOTICES.md", "usr/share/doc/fail2commit/THIRD-PARTY-NOTICES.md", "644"],
+]

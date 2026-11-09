@@ -1,0 +1,41 @@
+# CHORE-001 CI entry points (SPEC-011). Platform-gated integration checks
+# (real sandbox, tray, VS Code, packaging) run in separate jobs added by
+# T-007/T-009/T-010/T-011; this job is the always-on baseline.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  scaffold:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard self-tests
+        run: |
+          python3 -m unittest discover -s .claude/hooks -p "test_*.py"
+          python3 -m unittest discover -s .codex/hooks -p "test_*.py"
+      - name: Traceability
+        run: python3 .claude/hooks/trace_check.py

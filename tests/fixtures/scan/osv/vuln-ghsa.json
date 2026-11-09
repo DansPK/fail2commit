@@ -1,0 +1,5 @@
+{
+  "id": "GHSA-aaaa-bbbb-cccc",
+  "summary": "Synthetic advisory used by fail2commit tests",
+  "details": "Not a real advisory. Recorded shape only, so tests never need the internet."
+}
