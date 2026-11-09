@@ -160,8 +160,12 @@ fn classify(name: &str) -> Dest {
         .filter(|c| !c.is_empty() && *c != ".")
         .map(fold)
         .collect();
-    // `:` only appears in NTFS stream syntax (`x.pth::$DATA` writes `x.pth`).
-    if comps.iter().any(|c| c.is_empty() || c.contains(':')) {
+    // `:` only appears in NTFS stream syntax (`x.pth::$DATA` writes `x.pth`);
+    // 8.3 short names alias long names the checks never see.
+    if comps
+        .iter()
+        .any(|c| c.is_empty() || c.contains(':') || is_short_name(c))
+    {
         return Dest::Bad;
     }
     let Some(first) = comps.first() else {
@@ -192,21 +196,34 @@ pub(crate) fn pth_executes(bytes: &[u8]) -> bool {
         return true;
     };
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    text.split(|c| {
-        matches!(
-            c,
-            '\n' | '\r'
-                | '\x0b'
-                | '\x0c'
-                | '\x1c'
-                | '\x1d'
-                | '\x1e'
-                | '\u{85}'
-                | '\u{2028}'
-                | '\u{2029}'
-        )
+    text.split(is_py_line_sep)
+        .any(|l| l.starts_with("import ") || l.starts_with("import\t"))
+}
+
+/// The line boundaries of Python's `str.splitlines`, which both CPython's
+/// `site` and the installer's INI parsing use (CF-001: bare CR, FF, U+2028).
+fn is_py_line_sep(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r'
+            | '\x0b'
+            | '\x0c'
+            | '\x1c'
+            | '\x1d'
+            | '\x1e'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// An 8.3 short-name shape (`PIP313~1.EXE`): Windows may resolve it to a long
+/// name the checks never saw (CF-003).
+fn is_short_name(c: &str) -> bool {
+    c.split('.').next().is_some_and(|base| {
+        base.rsplit_once('~')
+            .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     })
-    .any(|l| l.starts_with("import ") || l.starts_with("import\t"))
 }
 
 fn is_startup_name(leaf: &str) -> bool {
@@ -244,6 +261,11 @@ fn bad_script(rest: &[String], reserved: &[String]) -> Option<String> {
         return Some("a nested path under the interpreter's scripts directory".into());
     }
     let leaf = fold(rest.first()?);
+    // Entry-point names are free text: a separator, stream or 8.3 alias could
+    // name a path other than the script it appears to be (CF-002, CF-003).
+    if leaf.is_empty() || leaf.contains(['/', '\\', ':']) || is_short_name(&leaf) {
+        return Some(format!("{leaf:?} is not a plain script name"));
+    }
     let base = leaf.split('.').next().unwrap_or("");
     let hit = base.starts_with("python")
         || is_pip_script(base)
@@ -354,7 +376,7 @@ pub fn scan(path: &Path, dist: &str, reserved: &[String]) -> Result<Scan, WheelE
 fn console_script_names(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_scripts = false;
-    for line in text.lines() {
+    for line in text.split(is_py_line_sep) {
         let l = line.trim();
         if l.starts_with('[') {
             let section = l.trim_matches(|c| c == '[' || c == ']').trim();
