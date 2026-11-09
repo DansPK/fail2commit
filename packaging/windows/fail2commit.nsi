@@ -103,7 +103,7 @@ SectionEnd
 ; when they accepted it, start the tray now.
 Function .onInstSuccess
   ${If} ${SectionIsSelected} ${SecStartup}
-    Exec '"$INSTDIRail2commit-tray.exe"'
+    Exec '"$INSTDIR\fail2commit-tray.exe"'
   ${ElseIf} ${SectionIsSelected} ${SecSetup}
     DeleteRegValue HKCU "${RUN_KEY}" "${RUN_VALUE}"
   ${EndIf}
