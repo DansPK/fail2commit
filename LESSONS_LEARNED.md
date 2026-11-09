@@ -63,6 +63,8 @@
 
 **Why it's invisible:** the guest command succeeds and the product fails closed, so it looks like a product limitation.
 
+The Linux equivalent: a guest-ops shell has no logind session, `XDG_RUNTIME_DIR` or user bus. So `fail2commit sandbox status` fails only `cgroup_v2_limits`, because the systemd user scope cannot be created. For a session-equivalent check, run `sudo loginctl enable-linger <user>`, then export `XDG_RUNTIME_DIR=/run/user/<uid>` and `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus`. Also, bash's command hash keeps reporting a removed binary with `command -v`, so check removal with `test -e`.
+
 ## Antivirus judges the sandbox host by what the sandboxed child does
 
 **Problem:** Defender quarantined the unsigned `fail2commit.exe` (`Behavior:Win32/DefenseEvasion.A!ml`) after a sandboxed `cmd` tried to read `secret.txt` and reach a bare IP. Afterwards the hash was blocked on write, which spoiled later runs on that VM.

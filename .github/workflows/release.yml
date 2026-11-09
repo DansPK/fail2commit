@@ -79,6 +79,10 @@ jobs:
         run: scripts/release/source-tarball.sh "$GITHUB_SHA" target/dist
       - name: Verify offline source build
         run: scripts/release/verify-source-tarball.sh target/dist/*-src.tar.gz
+      - name: Arch package in archlinux container
+        run: scripts/release/build-arch.sh target/dist/*-src.tar.gz target/dist
+      - name: Verify Arch package in clean archlinux
+        run: scripts/release/verify-arch.sh target/dist/fail2commit-[0-9]*-x86_64.pkg.tar.zst
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-artifacts
@@ -86,6 +90,7 @@ jobs:
             target/dist/*.deb
             target/dist/*-linux-amd64
             target/dist/*-src.tar.gz
+            target/dist/fail2commit-[0-9]*-x86_64.pkg.tar.zst
           if-no-files-found: error
 
   vsix:
