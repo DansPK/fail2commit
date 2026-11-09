@@ -47,7 +47,7 @@ pub fn default_path_editor() -> Box<dyn PathEditor> {
     }
     #[cfg(windows)]
     {
-        Box::new(RegistryEditor)
+        Box::new(RegistryEditor::user())
     }
     #[cfg(not(windows))]
     {
@@ -132,17 +132,33 @@ impl PathEditor for ProfileEditor {
     }
 }
 
-/// `HKCU\Environment\Path` through `reg.exe` (no extra dependencies).
+/// A `Path` value under an environment registry key, through `reg.exe` (no
+/// extra dependencies): the user PATH, or the machine PATH (administrators).
 #[cfg(windows)]
-pub struct RegistryEditor;
+pub struct RegistryEditor {
+    key: &'static str,
+    label: &'static str,
+}
 
 #[cfg(windows)]
 impl RegistryEditor {
-    const KEY: &'static str = r"HKCU\Environment";
+    pub const fn user() -> Self {
+        RegistryEditor {
+            key: r"HKCU\Environment",
+            label: "user",
+        }
+    }
 
-    fn read() -> crate::Result<Option<(String, String)>> {
-        let out = std::process::Command::new("reg")
-            .args(["query", Self::KEY, "/v", "Path"])
+    pub const fn machine() -> Self {
+        RegistryEditor {
+            key: r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            label: "machine",
+        }
+    }
+
+    fn read(&self) -> crate::Result<Option<(String, String)>> {
+        let out = crate::winenv::command("reg")
+            .args(["query", self.key, "/v", "Path"])
             .output()?;
         if !out.status.success() {
             return Ok(None); // value does not exist yet
@@ -162,21 +178,26 @@ impl RegistryEditor {
         Ok(None)
     }
 
-    fn write(ty: &str, value: &str) -> crate::Result<()> {
-        let st = std::process::Command::new("reg")
-            .args(["add", Self::KEY, "/v", "Path", "/t", ty, "/d", value, "/f"])
+    fn write(&self, ty: &str, value: &str) -> crate::Result<()> {
+        let st = crate::winenv::command("reg")
+            .args(["add", self.key, "/v", "Path", "/t", ty, "/d", value, "/f"])
             .output()?;
         if st.status.success() {
+            crate::winenv::broadcast_environment_change();
             Ok(())
         } else {
-            Err(crate::Error::internal("could not update the user PATH"))
+            Err(crate::Error::internal(format!(
+                "could not update the {} PATH",
+                self.label
+            )))
         }
     }
 
-    fn delete() -> crate::Result<()> {
-        let _ = std::process::Command::new("reg")
-            .args(["delete", Self::KEY, "/v", "Path", "/f"])
+    fn delete(&self) -> crate::Result<()> {
+        let _ = crate::winenv::command("reg")
+            .args(["delete", self.key, "/v", "Path", "/f"])
             .output()?;
+        crate::winenv::broadcast_environment_change();
         Ok(())
     }
 
@@ -198,7 +219,7 @@ impl RegistryEditor {
 impl PathEditor for RegistryEditor {
     fn add(&self, dir: &Path) -> crate::Result<Value> {
         let d = dir.to_string_lossy().to_string();
-        let prev = Self::read()?;
+        let prev = self.read()?;
         let (ty, old) = prev
             .clone()
             .unwrap_or_else(|| ("REG_EXPAND_SZ".to_string(), String::new()));
@@ -210,7 +231,7 @@ impl PathEditor for RegistryEditor {
             .chain(rest)
             .collect::<Vec<_>>()
             .join(";");
-        Self::write(&ty, &new)?;
+        self.write(&ty, &new)?;
         // Re-running setup must not record our own entry as "previous", or
         // uninstall would restore it (found on a real PC after a reinstall).
         let previous = prev
@@ -226,25 +247,32 @@ impl PathEditor for RegistryEditor {
 
     fn remove(&self, dir: &Path, detail: &Value) -> crate::Result<()> {
         let d = dir.to_string_lossy().to_string();
-        let Some((ty, cur)) = Self::read()? else {
+        let Some((ty, cur)) = self.read()? else {
             return Ok(());
         };
-        if detail.get("written").and_then(Value::as_str) == Some(cur.as_str()) {
+        // The machine PATH is never restored wholesale or deleted: only our
+        // entry is taken out, whatever else changed meanwhile.
+        if self.label == "user"
+            && detail.get("written").and_then(Value::as_str) == Some(cur.as_str())
+        {
             return match detail.get("previous").filter(|p| !p.is_null()) {
-                Some(p) => Self::write(
+                Some(p) => self.write(
                     p["type"].as_str().unwrap_or("REG_EXPAND_SZ"),
                     p["value"].as_str().unwrap_or(""),
                 ),
-                None => Self::delete(),
+                None => self.delete(),
             };
         }
-        let kept: Vec<&str> = cur.split(';').filter(|e| !Self::same(e, &d)).collect();
-        Self::write(&ty, &kept.join(";"))
+        let kept = Self::without(&cur, &d);
+        if kept == cur {
+            return Ok(());
+        }
+        self.write(&ty, &kept)
     }
 
     fn contains(&self, dir: &Path) -> bool {
         let d = dir.to_string_lossy();
-        Self::read()
+        self.read()
             .ok()
             .flatten()
             .map(|(_, v)| v.split(';').any(|e| Self::same(e, &d)))

@@ -124,11 +124,39 @@ pub fn uninstall(ctx: &Ctx) -> CmdResult {
     Ok(o)
 }
 
+/// What bare `npm` / `pip` run for a new terminal, and which of them miss
+/// fail2commit's shims. A tool that is not installed at all is not a warning.
+fn command_resolution(ctx: &Ctx) -> (serde_json::Value, Vec<(String, String)>) {
+    use fail2commit_core::winenv;
+    let path = winenv::effective_path();
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    let machine_dir = fail2commit_core::machine::shim_dir().ok();
+    let mut dirs: Vec<&std::path::Path> = vec![ctx.paths.bin_dir.as_path()];
+    if let Some(d) = machine_dir.as_deref() {
+        dirs.push(d);
+    }
+    let mut out = serde_json::Map::new();
+    let mut unguarded = Vec::new();
+    for tool in ["npm", "pip"] {
+        let hit = winenv::resolve_command(tool, &path, &pathext);
+        let guarded = hit.as_deref().map(|h| winenv::is_in_any(h, &dirs));
+        if let (Some(h), Some(false)) = (&hit, guarded) {
+            unguarded.push((tool.to_string(), h.display().to_string()));
+        }
+        out.insert(
+            tool.into(),
+            serde_json::json!({ "resolves_to": hit, "guarded": guarded }),
+        );
+    }
+    (serde_json::Value::Object(out), unguarded)
+}
+
 pub fn status(ctx: &Ctx) -> CmdResult {
     let sctx = setup_ctx(ctx, true)?;
     let integrations: Vec<_> = integrations().iter().map(|i| i.status(&sctx)).collect();
     let probe = fail2commit_core::sandbox::platform_backend().probe();
-    let mut o = Outcome::msg(format!(
+    let (resolution, unguarded) = command_resolution(ctx);
+    let mut text = format!(
         "sandbox {} ({}: {})",
         if ctx.settings.sandbox.enabled {
             "on"
@@ -141,10 +169,30 @@ pub fn status(ctx: &Ctx) -> CmdResult {
         } else {
             "unavailable"
         }
-    ));
+    );
+    for (tool, file) in &unguarded {
+        let shim = ctx.paths.bin_dir.join(if cfg!(windows) {
+            format!("{tool}.exe")
+        } else {
+            tool.to_string()
+        });
+        let hint = if !shim.is_file() {
+            "Run `fail2commit setup`, then open a new terminal."
+        } else if cfg!(windows) {
+            "Windows searches the machine PATH before your user PATH; run `fail2commit machine-shims install` as administrator."
+        } else {
+            "Put the fail2commit bin directory first on PATH, then open a new shell."
+        };
+        text.push_str(&format!(
+            "\nwarning: `{tool}` runs {file} and is NOT guarded. {hint}"
+        ));
+    }
+    let mut o = Outcome::msg(text);
     o.data = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "integrations": integrations,
+        "commands": resolution,
+        "machine_shims": fail2commit_core::machine::status(),
         // SPEC-012: report the configured bounds in effect.
         "limits": ctx.settings.limits,
         "advisories": {

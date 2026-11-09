@@ -32,7 +32,7 @@ impl GitOut {
 /// - `GIT_NO_LAZY_FETCH`: a partial clone must not start a network fetch.
 /// - no prompts, no optional locks.
 pub(crate) fn command(git: &Path, repo: &Path) -> Command {
-    let mut c = Command::new(git);
+    let mut c = crate::winenv::command(git);
     c.current_dir(repo)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")

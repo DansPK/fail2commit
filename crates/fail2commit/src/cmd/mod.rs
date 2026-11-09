@@ -3,6 +3,7 @@
 pub mod api;
 pub mod git;
 pub mod hook;
+pub mod machine;
 pub mod npm;
 pub mod password;
 pub mod pip;

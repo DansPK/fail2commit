@@ -125,7 +125,7 @@ pub(crate) fn python_c(
     body: &str,
 ) -> Command {
     let tail = snapshot.map(snapshot_tail).unwrap_or_default();
-    let mut cmd = Command::new(python);
+    let mut cmd = crate::winenv::command(python);
     cmd.args(["-I", "-S", "-c"])
         .arg(format!("{BOOT}{tail}{body}"));
     cmd

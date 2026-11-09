@@ -26,6 +26,7 @@ pub mod protocol;
 pub mod redact;
 pub mod settings;
 pub mod toolpath;
+pub mod winenv;
 
 pub mod approval;
 pub mod exec;
@@ -36,6 +37,8 @@ pub mod pip;
 pub mod sandbox;
 pub mod scan;
 pub mod server;
+
+pub mod machine;
 
 pub use error::{Error, Result};
 pub use protocol::{Finding, FindingAction, FindingKind, ResultCode};

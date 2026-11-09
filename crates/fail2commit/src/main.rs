@@ -71,6 +71,8 @@ enum Command {
     Run(cmd::run::Args),
     /// Sandbox on / off / status (T-008).
     Sandbox(cmd::sandbox::Args),
+    /// Windows, administrators: guard machine-wide npm and pip (CR-013).
+    MachineShims(cmd::machine::Args),
     /// Force-push password set / change / reset / disable (T-002).
     Password(cmd::password::Args),
     /// Self-hosted protected remote: pre-receive and approval issuer (T-003).
@@ -136,6 +138,7 @@ pub fn execute(cli: Cli, id: Option<String>) -> Response {
         Command::Scan(a) => cmd::scan::run(&ctx, a),
         Command::Run(a) => cmd::run::run(&ctx, a),
         Command::Sandbox(a) => cmd::sandbox::run(&ctx, a),
+        Command::MachineShims(a) => cmd::machine::run(&ctx, a),
         Command::Password(a) => cmd::password::run(&ctx, a),
         Command::Server(a) => cmd::server::run(&ctx, a),
         Command::Hook(a) => cmd::hook::run(&ctx, a),

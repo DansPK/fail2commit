@@ -15,7 +15,6 @@ use fail2commit_core::git::{hooks_dir, prepush::INTENT_ENV};
 use fail2commit_core::toolpath::find_real;
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::Command;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -31,7 +30,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    let mut cmd = Command::new(&real);
+    let mut cmd = fail2commit_core::winenv::command(&real);
     cmd.env_remove(INTENT_ENV).env_remove(relay::ENV);
     // CR-008: under `fail2commit api` the pre-push hook asks through this relay.
     let mut _relay = None;
@@ -151,7 +150,7 @@ fn git_config(real: &Path, globals: &[String], args: &[&str]) -> Option<String> 
 }
 
 fn git_out(real: &Path, globals: &[String], sub: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(real)
+    let out = fail2commit_core::winenv::command(real)
         .args(globals)
         .arg(sub)
         .args(args)

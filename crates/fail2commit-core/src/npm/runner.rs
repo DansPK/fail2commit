@@ -161,7 +161,7 @@ pub fn run_npm(
     timeout: Duration,
     cap: u64,
 ) -> Result<Captured> {
-    let mut cmd = Command::new(&tc.node);
+    let mut cmd = crate::winenv::command(&tc.node);
     cmd.arg(&tc.npm_cli)
         .args(args)
         .current_dir(cwd)
@@ -189,7 +189,7 @@ pub fn tail(bytes: &[u8]) -> String {
 /// Run a non-installing command with the real npm and inherited stdio.
 pub fn passthrough(paths: &TrustedPaths, args: &[OsString]) -> Result<i32> {
     let tc = Toolchain::resolve(paths)?;
-    let status = Command::new(&tc.node)
+    let status = crate::winenv::command(&tc.node)
         .arg(&tc.npm_cli)
         .args(args)
         .status()

@@ -180,7 +180,7 @@ impl Guard {
         }
         // Precompile once so each launch starts fast with `dont_write_bytecode`.
         // The bytecode is part of the manifest.
-        let mut cmd = Command::new(exe);
+        let mut cmd = crate::winenv::command(exe);
         cmd.args(["-I", "-S", "-m", "compileall", "-q"]).arg(&site);
         let _ = run(&mut cmd, limits, cancel)?;
         let mut files = BTreeMap::new();

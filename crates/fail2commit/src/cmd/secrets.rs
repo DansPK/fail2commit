@@ -7,7 +7,7 @@ use fail2commit_core::protocol::FindingKind;
 use fail2commit_core::toolpath::find_real;
 use fail2commit_core::Error;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -20,7 +20,7 @@ pub struct Args {
 }
 
 fn git_out(git: &Path, args: &[&str]) -> Option<String> {
-    let o = Command::new(git)
+    let o = fail2commit_core::winenv::command(git)
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -64,7 +64,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
     // explicit --remote asks the remote itself, over the network.
     let zero = "0".repeat(new.len());
     let old = if args.query_remote {
-        let o = Command::new(&git)
+        let o = fail2commit_core::winenv::command(&git)
             .args(["ls-remote", "--", &remote, &head])
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())

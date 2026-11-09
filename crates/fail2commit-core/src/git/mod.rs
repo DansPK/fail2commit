@@ -16,6 +16,8 @@ pub mod intent;
 pub mod prepush;
 mod scan;
 
+#[cfg(windows)]
+pub use integ::RegistryEditor;
 pub use integ::{
     default_path_editor, hooks_dir, shim_path, GitIntegration, PathEditor, ProfileEditor,
     PATH_TARGET_ENV,

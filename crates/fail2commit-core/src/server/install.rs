@@ -30,7 +30,7 @@ pub fn install(
             "server state must be outside the repository",
         ));
     }
-    let bare = std::process::Command::new(git)
+    let bare = crate::winenv::command(git)
         .arg("--git-dir")
         .arg(repo)
         .args(["rev-parse", "--is-bare-repository"])
@@ -66,7 +66,7 @@ pub fn install(
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
     }
-    let st = std::process::Command::new(git)
+    let st = crate::winenv::command(git)
         .arg("--git-dir")
         .arg(repo)
         .args(["config", "receive.advertisePushOptions", "true"])

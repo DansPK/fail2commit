@@ -13,10 +13,23 @@ The per-user installer (`fail2commit-<version>-setup.exe`, NSIS) needs no admini
 | Start Menu, `fail2commit\fail2commit tray.lnk` | Tray shortcut |
 | `HKCU\...\CurrentVersion\Run`, value `fail2commit-tray` | Only if you choose "Start the tray at sign-in" |
 
-The installer offers two optional steps, both visible on the components page:
+The installer offers three optional steps, all visible on the components page:
 
-- **Set up guards** runs `fail2commit setup`. Every change it makes is recorded in `setup.json` under `%LOCALAPPDATA%\fail2commit\state`.
+- **Set up guards** runs `fail2commit setup`. Every change it makes is recorded in `setup.json` under `%LOCALAPPDATA%\fail2commit\state`. If it fails, the installer says so and keeps its log on screen.
+- **Guard machine-wide npm and pip** (default on) asks for administrator rights, see below.
 - **Start the tray at sign-in** adds the Run value. You can toggle it later from the tray menu.
+
+## Machine-wide npm and pip (administrator)
+
+Windows gives every new process the machine PATH first and the user PATH second. A Node.js or Python installed for all users (the Node.js installer's default, `C:\Program Files\nodejs`) is therefore found before the per-user shims in `%LOCALAPPDATA%\fail2commit\bin`, and plain `npm install` bypasses fail2commit. `fail2commit status` warns when this happens:
+
+```text
+warning: `npm` runs C:\Program Files\nodejs\npm.cmd and is NOT guarded. ...
+```
+
+`fail2commit machine-shims install`, run as administrator (the installer does this through a UAC prompt), copies the CLI as `npm.exe`, `pip.exe`, `pip3.exe` and `fail2commit.exe` into `C:\Program Files\fail2commit\shims` and puts that directory first on the machine PATH. Program Files is writable only by administrators, which matters: a user-writable directory early on the machine PATH would let any program running as a user plant commands that administrators and services then run. The shims guard npm and pip for every user of the PC, each with their own settings and approvals. `machine-shims status` exits 0 when installed; `machine-shims uninstall` (administrator) removes the entry and the files, and the uninstaller runs it for you.
+
+Still not covered: programs that call `npm.cmd`, `node ...\npm-cli.js` or a Python interpreter by full path. Use `fail2commit npm ...` / `fail2commit pip ...` there.
 
 ## Uninstall
 
