@@ -167,6 +167,43 @@ Findings:
 - `5885ca8` (FR-011): license audit; the Windows installer and standalone binaries now ship `LICENSE`, `NOTICE` and the third-party notices, which now cover the Rust standard library and the MinGW-w64 runtime (`docs/release.md`, Licensing). The 0.1.0 artifacts in section 3 predate this and must not be published.
 - The Linux job does not install bubblewrap, so the hostile-sandbox suites skip there; real-sandbox evidence is section 5c and the WSL runs in section 2.
 
+## 5e. Normal-user flows on real machines (2026-11-09/10)
+
+**Windows 11 25H2 VM** (clean snapshot; Node.js 22.23.4 installed for all users in `C:\Program Files\nodejs` like the official installer; Python 3.12.10 per user from python.org, Authenticode-valid; MinGit 2.47.1). The installer was driven through its GUI with the keyboard, with the defaults plus "Start the tray at sign-in", and the UAC prompt was approved:
+
+| Step | Result |
+|---|---|
+| Installer | Logo on installer, uninstaller, title bar and taskbar; log stays on screen; setup installed `git, npm, pip, shell, tray-startup`; UAC prompt "Publisher: Unknown" (unsigned); machine shims installed in `C:\Program Files\fail2commit\shims` |
+| New PowerShell window | `npm`, `pip` are fail2commit functions; `fail2commit status` sandbox available, no warnings; tray running with no console window |
+| Force push | Tray approval dialog with the logo, ref update and finding; Esc cancels ("push canceled; nothing was sent"); with the fixed dialog, focus starts on Cancel, Alt+A approves ("push approved", forced update) |
+| Secret push | Dialog shows "github-token in config.py ... [redacted 40 chars]"; Esc cancels |
+| `npm install esbuild` | guarded, postinstall sandboxed, 31.8 s, `esbuild --version` 0.28.2 |
+| `pip install six` in an activated venv | `pip` is a function; installed into `C:\play\venv` |
+| Uninstall through the GUI with UAC | machine and user PATH clean, Program Files folder gone, PowerShell profiles removed, `core.hooksPath` unset, tray stopped, Run value and Apps entry gone |
+
+**Debian 13 VM** (real kernel 6.12, bubblewrap 0.12, Node 20.19, Python 3.13, Git 2.47; provisioned fresh), driven from the tty1 login like an SSH/server user: `.deb` install, `fail2commit setup`; `status` correctly warned that npm/pip were unguarded until `. ~/.profile`; then all 13 sandbox controls ok including `cgroup_v2_limits` (systemd user scope); the terminal prompt showed the operation, ref update, both findings and expiry, and typing `approve` pushed; `npm install esbuild` guarded and sandboxed in 4.5 s; `pip install six` in an activated venv guarded into the venv (after CR-015); `uninstall-integrations` removed the shell block.
+
+Bugs found and fixed in these flows: machine-wide npm/pip bypass (CR-013), npm child processes hanging in the AppContainer (CR-014), venv bypass (CR-015), visible consoles from helpers and the tray, the PATH restore on re-run setup, the installer's tray launch path, silent setup failures, a keyboard trap in the approval dialog, the terminal retitled "npm ci", `\\?\` paths in pip output, and `fail2commit` missing from PATH without the admin step.
+
+## 5f. Supply-chain attack simulation (`scripts/attack-sim/`)
+
+Four malicious packages from a loopback registry, synthetic secrets only: a Shai-Hulud-style obfuscated worm (`color-utils-pro`), a ua-parser-js-style second-stage downloader (`ua-parse-lite`), a plain force-push script (`deploy-helper`) and a known-malware typosquat (`lodahs`, OSV `MAL-`). Token environment variables (`NPM_TOKEN`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`) were set in the installing shell.
+
+| Attack step | Debian 13, fail2commit | Windows 11, fail2commit | Without fail2commit (control, both) |
+|---|---|---|---|
+| `lodahs` (known malware) | denied, `malware/deny`; approve over the API refused, no option offered | same | - |
+| `deploy-helper` (force push in script) | denied before running, `suspicious_script/deny` | same | - |
+| Second-stage download | `blocked:7` (curl, no network) | `blocked:1` (PowerShell) | - |
+| Read `.npmrc`, SSH key, AWS, `.git-credentials`, `gh` token | all `ENOENT` (not visible) | all `EPERM` | all stolen |
+| Token environment variables | none (only `npm_*`) | none | all three |
+| Persistence (`.bashrc`, crontab, Startup folder, Run key) | blocked or confined to the job's throwaway home | all blocked | `.bashrc`, crontab (Linux), Startup `update.cmd` and Run key (Windows) written |
+| Backdoor project source, add CI workflow | confined / blocked | blocked | written |
+| `git push --force`, `npm publish` | blocked | blocked | push succeeded |
+| Exfiltration (loopback canary, HTTPS, DNS) | blocked; canary saw 0 connections | blocked; 0 connections | loopback and HTTPS sent |
+| Host after the guarded runs | byte-for-byte unchanged (`.bashrc`, crontab, project, remote) | unchanged (`.bashrc`, Startup, Run key, project, remote) | modified |
+
+A re-run against a rebuilt registry also showed lockfile tamper detection: the re-packed tarball no longer matched `package-lock.json` and the install stopped with `integrity_failure` (exit 13). Both VMs were reverted afterwards.
+
 ## 6. Pending gates (missing prerequisite)
 
 | Gate | Status | Missing prerequisite |
@@ -177,7 +214,8 @@ Findings:
 | Stock Ubuntu desktop with AppArmor userns restriction | Pending | A non-WSL Ubuntu 24.04+ host (WSL does not enforce the restriction) |
 | GitHub repository rulesets (SPEC-003 hosted path) | Pending | A hosted GitHub repository with admin access |
 | VS Code GUI click-through (modal approval, picker) and a real Remote-WSL session | Pending | An interactive desktop session; the extension and protocol are covered against both real CLIs headless |
-| Tray GUI click-through (dialog, menu) | Pending | An interactive desktop session; pipe, ACL and rendering are covered by tests |
+| Tray GUI click-through (approval dialog) | **Passed** (section 5e); tray menu items not clicked | - |
+| Non-WSL Linux | **Passed** on Debian 13 (section 5e) | - |
 | Interactive terminal approval prompt on Windows | Pending | A ConPTY harness; terminal approval is covered on Linux with a real pty and by the stdio channel |
 | Windows full staged-gcc native build in AppContainer | Pending | The MinGW closure is 961 MB / 11,871 files to stage; a staged native workload and the npm node build pass instead |
 | LPAC (less-privileged AppContainer) | Not claimed | Runtime verification of LPAC capability with this backend |
