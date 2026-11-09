@@ -38,8 +38,44 @@ sudo dpkg --purge fail2commit
 
 The package contains no maintainer scripts and never edits a home directory.
 It installs `/usr/bin/fail2commit` and documentation under
-`/usr/share/doc/fail2commit`. Debian/Ubuntu architectures other than amd64 and
-other Linux package managers are not supplied as binary packages.
+`/usr/share/doc/fail2commit`. Debian/Ubuntu architectures other than amd64 are
+not supplied as binary packages.
+
+## Arch Linux and Arch-based x86_64 (pacman)
+
+For Arch, Manjaro, EndeavourOS and other pacman-based distributions. Install
+the release package:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+sudo pacman -U fail2commit-<version>-1-x86_64.pkg.tar.zst
+fail2commit status
+fail2commit setup
+```
+
+Or build it yourself from the source archive (offline; the crates are
+vendored). Put the PKGBUILD from `packaging/arch/` and the source archive in
+one directory, then:
+
+```sh
+sudo pacman -S --needed base-devel rust
+makepkg -si
+```
+
+The package depends on `git` and `bubblewrap`; `nodejs`/`npm` and `python`
+are optional and only needed for the matching guards. It has no install
+scriptlet and never edits a home directory: it installs
+`/usr/bin/fail2commit`, licenses under `/usr/share/licenses/fail2commit` and
+documentation under `/usr/share/doc/fail2commit`. Run `fail2commit sandbox
+status` from a normal login session: the cgroup v2 job limits need your
+systemd user manager.
+
+To remove:
+
+```sh
+fail2commit uninstall-integrations
+sudo pacman -R fail2commit
+```
 
 ## Linux source archive
 

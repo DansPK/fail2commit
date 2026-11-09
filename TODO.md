@@ -21,5 +21,5 @@ Integration branch: `DansPK/f2-commit-coordinator`. Release candidate built from
 | T-008 | Manage sandbox policy | FR-008, SPEC-008 | orca:claude-sonnet | done | T-007 |
 | T-009 | Ship Windows desktop integration | FR-009, SPEC-009 | orca:claude-sonnet | done; tray GUI click-through pending | T-002, T-008 |
 | T-010 | Integrate VS Code | FR-010, SPEC-010 | orca:claude-sonnet | done; GUI and Remote-WSL session pending | T-002, T-004, T-005, T-008 |
-| T-011 | Ship reproducible releases | FR-011, SPEC-011 | orca:codex + coordinator | done; GitHub release workflow run pending | T-003–T-010 |
+| T-011 | Ship reproducible releases | FR-011, SPEC-011 | orca:codex + coordinator | done; Arch pacman package added (CR-016); GitHub release workflow run pending | T-003–T-010 |
 | T-012 | Keep resource use bounded | NFR-012, SPEC-012 | orca:claude-sonnet | done | T-004, T-005, T-007, T-009 |

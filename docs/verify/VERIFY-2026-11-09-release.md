@@ -204,6 +204,32 @@ Four malicious packages from a loopback registry, synthetic secrets only: a Shai
 
 A re-run against a rebuilt registry also showed lockfile tamper detection: the re-packed tarball no longer matched `package-lock.json` and the install stopped with `integrity_failure` (exit 13). Both VMs were reverted afterwards.
 
+## 5g. Arch Linux package and full flow (CR-016, 2026-11-10)
+
+Host: VMware VM `arch-f2c`, installed from the official `archlinux-x86_64.iso` (SHA-256 `01bcdcf01af2f7d58f2794899c834770d25c9bfc945bd092b32bb66672a4a216`, checked against the published sum). The tools were kernel 7.2.14-arch1-1, bubblewrap 0.13.1, Node v26.13.0, npm 12.2.2, Python 3.14.9, git 2.56.0 and cargo 1.99.1, on cgroup2. User `dev`, not root, with sudo. The source tarball was built from `856905e`, with `packaging/arch/PKGBUILD`.
+
+| Step | Result |
+|---|---|
+| `makepkg` natively in the VM | exit 0 in 3m53s; `check()` ran the core unit tests: 148 passed, 0 failed |
+| `sudo pacman -U fail2commit-0.1.0-1-x86_64.pkg.tar.zst` | exit 0. `pacman -Qi`: licenses Apache-2.0 and MIT; depends gcc-libs, glibc, git and bubblewrap. Files: `/usr/bin/fail2commit`, 4 license files and 2 docs |
+| `fail2commit setup` / `status` | exit 0, `ok`; bubblewrap available; integrations git, npm, pip and shell installed |
+| `fail2commit sandbox status` | 13/13 controls ok with the user's systemd manager running. In a VMware guest-ops shell, with no logind session and no user bus, only `cgroup_v2_limits` fails, as expected |
+| Git guard | Normal push ok and the third-party hook still ran. Unattended force push stopped (exit 1) with the remote unchanged; approved once, it went through. A secret push was stopped with 2 findings and no secret value in the output |
+| npm guard | `hello-build` built in the sandbox (`Sandboxed`, cwd in `sandbox-stage`). `hostile` could not read home, SSH key or repo (`ENOENT`) and had no external or loopback network; 0 canary connections. Unattended `advised` gave `approval_unavailable` (exit 11) and changed nothing; cancel left everything unchanged and approve-once installed it |
+| Real registry `npm install esbuild` | exit 0 in 26 s, scripts `Sandboxed`, `esbuild --version` 0.28.2 |
+| pip guard | Clean wheel installed into the venv. Advised: unattended exit 11, not installed; approved once, installed |
+| venv `pip install` through the CR-015 shell function (interactive bash) | `pip`/`npm` resolve to functions; installed into `~/v2/bin/python3`; import ok |
+| `fail2commit run` | Output exported; home secret, SSH key and repo not visible; secret leaked 0 |
+| Attack simulation (section 5f) | `lodahs` `malware/deny`, and approval was refused over the API. `deploy-helper` `suspicious_script/deny`. Second stage `blocked:7`. All credentials `ENOENT`, no token env vars, all exfiltration blocked, canary 0. `.bashrc`, crontab, project and remote byte-for-byte unchanged. The unguarded control stole all five credentials and all three token env vars, wrote `.bashrc`, the project source and a CI workflow, and force-pushed |
+| `uninstall-integrations`, `pacman -R` | exit 0; `.bashrc` block removed, `core.hooksPath` restored to the user's third-party hooks, `/usr/bin/fail2commit` gone |
+
+Clean-container scripts, run from Windows Docker Desktop against the same source tarball:
+
+- `bash scripts/release/build-arch.sh target/arch-in/fail2commit-0.1.0-src.tar.gz target/arch-out`: exit 0. `check()` ran 148 tests, all passed. Output `fail2commit-0.1.0-1-x86_64.pkg.tar.zst` (3,305,188 bytes, SHA-256 `4f22761411a1aca91fe8198f3bf41c50b4247549b536a65ab79d9b938a7111c4`), plus Arch's default `-debug` package, which is not released.
+- `bash scripts/release/verify-arch.sh target/arch-out/fail2commit-0.1.0-1-x86_64.pkg.tar.zst`: exit 0. Install, `status` as a normal user, and removal all passed, with the user's Git config and hooks hash-identical throughout. bubblewrap reports unavailable inside an unprivileged container, as expected.
+
+The VM was reverted to its `clean` snapshot afterwards. One harness artifact was not a product issue: bash's command hash reported `fail2commit` after removal, but the file was gone.
+
 ## 6. Pending gates (missing prerequisite)
 
 | Gate | Status | Missing prerequisite |
@@ -215,7 +241,8 @@ A re-run against a rebuilt registry also showed lockfile tamper detection: the r
 | GitHub repository rulesets (SPEC-003 hosted path) | Pending | A hosted GitHub repository with admin access |
 | VS Code GUI click-through (modal approval, picker) and a real Remote-WSL session | Pending | An interactive desktop session; the extension and protocol are covered against both real CLIs headless |
 | Tray GUI click-through (approval dialog) | **Passed** (section 5e); tray menu items not clicked | - |
-| Non-WSL Linux | **Passed** on Debian 13 (section 5e) | - |
+| Non-WSL Linux | **Passed** on Debian 13 (section 5e) and Arch Linux (section 5g) | - |
+| Manjaro / EndeavourOS and other Arch derivatives | Pending | Same pacman package; only vanilla Arch was run |
 | Interactive terminal approval prompt on Windows | Pending | A ConPTY harness; terminal approval is covered on Linux with a real pty and by the stdio channel |
 | Windows full staged-gcc native build in AppContainer | Pending | The MinGW closure is 961 MB / 11,871 files to stage; a staged native workload and the npm node build pass instead |
 | LPAC (less-privileged AppContainer) | Not claimed | Runtime verification of LPAC capability with this backend |

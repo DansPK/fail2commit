@@ -1,0 +1,55 @@
+# Maintainer: Nut Youlong
+#
+# fail2commit for Arch Linux and Arch-based distributions (FR-011; CR-016).
+# Builds offline from the release source tarball, which vendors every crate:
+#   scripts/release/source-tarball.sh HEAD target/dist
+#   cp target/dist/fail2commit-<ver>-src.tar.gz packaging/arch/
+#   cd packaging/arch && makepkg -si
+# scripts/release/build-arch.sh does the same in a clean archlinux container.
+
+pkgname=fail2commit
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Guards Git pushes and npm/pip installs with explicit, operation-bound approval and a sandbox'
+arch=('x86_64')
+url='https://github.com/DansPK/fail2commit'
+license=('Apache-2.0' 'MIT')
+depends=('gcc-libs' 'glibc' 'git' 'bubblewrap')
+makedepends=('cargo')
+optdepends=('nodejs: guarded npm installs'
+            'npm: guarded npm installs'
+            'python: guarded pip installs')
+options=('!lto')
+source=("$pkgname-$pkgver-src.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver-src"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --offline --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver-src"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p fail2commit
+}
+
+check() {
+  cd "$pkgname-$pkgver-src"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release -p fail2commit-core --lib
+}
+
+package() {
+  cd "$pkgname-$pkgver-src"
+  install -Dm755 target/release/fail2commit "$pkgdir/usr/bin/fail2commit"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 LICENSE.template-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE.template-MIT"
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 THIRD-PARTY-NOTICES.md "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.md"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/install.md "$pkgdir/usr/share/doc/$pkgname/install.md"
+}

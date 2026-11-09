@@ -28,6 +28,15 @@ vendored source archive is rebuilt with `--network none`, `--locked`, and
 `--offline`. `reproducible-linux.sh` uses two independent target volumes and
 compares the Linux binary and `.deb` SHA-256 values.
 
+The Arch package (CR-016) is built from that same source archive with
+`makepkg` in a clean `archlinux` container as an unprivileged user
+(`build-arch.sh`, which runs the core unit tests in `check()`). `verify-arch.sh`
+then installs it with `pacman -U` in another clean container, runs `status` as
+a normal user with that user's Git configuration hashed before and after, and
+removes it. Arch's rolling toolchain means this package is not byte-for-byte
+reproducible across days; the `.deb` and the Linux binary remain the
+reproducibility references.
+
 ## Evidence required for release approval
 
 Create a report under `docs/verify/` from `VERIFY-template.md`. For every
