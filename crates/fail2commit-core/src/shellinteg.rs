@@ -27,6 +27,8 @@ const END: &str = "# <<< fail2commit shell <<<";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flavor {
     Posix,
+    // PowerShell profiles are only targeted on Windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
     PowerShell,
 }
 
