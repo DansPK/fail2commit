@@ -42,6 +42,11 @@ pub fn find_real(name: &str, skip_dir: Option<&Path>) -> crate::Result<PathBuf> 
 
 #[cfg(windows)]
 fn candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
+    // "cmd.exe" is a bare name too; only .exe/.com are ever accepted as-is.
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".exe") || lower.ends_with(".com") {
+        return vec![dir.join(name)];
+    }
     vec![
         dir.join(format!("{name}.exe")),
         dir.join(format!("{name}.com")),
@@ -63,5 +68,18 @@ mod tests {
         if let Ok(other) = super::find_real("git", Some(&dir)) {
             assert_ne!(other.parent().unwrap(), dir);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_exe_suffix_resolves_but_scripts_never_do() {
+        let git = super::find_real("git", None).expect("git on PATH");
+        assert_eq!(super::find_real("git.exe", None).unwrap(), git);
+        assert_eq!(super::find_real("GIT.EXE", None).unwrap(), git);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tool.cmd"), "@echo off").unwrap();
+        assert!(super::candidates(dir.path(), "tool.cmd")
+            .iter()
+            .all(|c| !c.is_file()));
     }
 }
