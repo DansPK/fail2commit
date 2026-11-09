@@ -39,7 +39,10 @@ pub fn file_url(p: &Path) -> String {
 impl Env {
     pub fn new() -> Env {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("f2c root");
+        // Long form: CI runners have an 8.3 TEMP (`RUNNER~1`), which the npm
+        // guard rightly refuses when a fixture script embeds the path.
+        let long = fail2commit_core::fsutil::plain_path(&tmp.path().canonicalize().unwrap());
+        let root = long.join("f2c root");
         let home = root.join("home dir");
         let f2c_home = root.join("f2c state");
         let gitcfg = root.join("gitconfig");

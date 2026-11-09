@@ -213,15 +213,18 @@ fn probe_host_inner(controls: &mut [(String, bool)]) -> crate::Result<()> {
             cmd_source.display()
         )));
     }
-    let stage = tempfile::Builder::new()
-        .prefix("probe-")
-        .tempdir_in(&stage_root)
-        .map_err(|e| {
-            crate::Error::isolation_unavailable(format!(
-                "create probe stage below {}: {e}",
-                stage_root.display()
-            ))
-        })?;
+    let stage = ProbeStage(
+        tempfile::Builder::new()
+            .prefix("probe-")
+            .tempdir_in(&stage_root)
+            .map_err(|e| {
+                crate::Error::isolation_unavailable(format!(
+                    "create probe stage below {}: {e}",
+                    stage_root.display()
+                ))
+            })?
+            .keep(),
+    );
     let read_only = stage.path().join("read-only");
     let work = stage.path().join("work");
     fs::create_dir_all(&read_only)?;
@@ -333,6 +336,28 @@ fn probe_host_inner(controls: &mut [(String, bool)]) -> crate::Result<()> {
         mark(controls, name);
     }
     Ok(())
+}
+
+/// The probe's stage, removed on every exit path. The killed probe child can
+/// keep its staged `cmd.exe` open for a moment after the job ends, so removal
+/// is retried briefly instead of being dropped silently like a `TempDir`.
+struct ProbeStage(PathBuf);
+
+impl ProbeStage {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ProbeStage {
+    fn drop(&mut self) {
+        for _ in 0..30 {
+            if fs::remove_dir_all(&self.0).is_ok() || !self.0.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 fn probe_limits() -> crate::isolation::JobLimits {

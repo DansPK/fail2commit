@@ -128,7 +128,10 @@ fn sweep_older_than(root: &Path, age: std::time::Duration) {
     let Ok(rd) = fs::read_dir(root) else { return };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if !(name.starts_with("npm-") || name.starts_with("run-")) {
+        if !["npm-", "run-", "probe-"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
             continue;
         }
         let stale = e
