@@ -4,6 +4,9 @@
 //! `docs/verify/REVIEW-2026-11-09-coordinator-fixes.md`. Disposable venvs, the
 //! loopback fixture index only. Product code is not modified.
 
+// The lab helpers mirror rereview2_pip.rs; not every one is used here.
+#![allow(dead_code)]
+
 mod pip_support;
 
 use fail2commit_core::pip;
@@ -188,7 +191,10 @@ fn cf_001_entry_points_text_that_python_splits_differently_replaces_pip() {
         ("ls", "[console_scripts]\u{2028}pip = {p}:main\n"),
         ("ff", "[console_scripts]\x0cpip = {p}:main\n"),
         ("comment-cr", "# note\r[console_scripts]\rpip = {p}:main\n"),
-        ("bracket-line", "[console_scripts]\n[a = b\npip = {p}:main\n"),
+        (
+            "bracket-line",
+            "[console_scripts]\n[a = b\npip = {p}:main\n",
+        ),
     ];
     let mut hit = Vec::new();
     for (i, (label, text)) in variants.iter().enumerate() {
@@ -250,10 +256,16 @@ fn cf_003_short_name_of_the_versioned_pip_launcher_replaces_it() {
             b.starts_with("pip3.") && b.ends_with(".exe")
         });
     let Some(long) = long else {
-        eprintln!("CF-003: no pip3.N.exe in {}; not exercised", scripts.display());
+        eprintln!(
+            "CF-003: no pip3.N.exe in {}; not exercised",
+            scripts.display()
+        );
         return;
     };
-    let stem = long.trim_end_matches(".exe").replace('.', "").to_ascii_uppercase();
+    let stem = long
+        .trim_end_matches(".exe")
+        .replace('.', "")
+        .to_ascii_uppercase();
     let short = format!("{}~1.EXE", &stem[..6.min(stem.len())]);
     let before = std::fs::read(scripts.join(&long)).unwrap();
     let entry = format!("cfshort-1.0.data/scripts/{short}");
