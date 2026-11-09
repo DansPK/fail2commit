@@ -162,6 +162,13 @@ pub fn run_npm(
     cap: u64,
 ) -> Result<Captured> {
     let mut cmd = crate::winenv::command(&tc.node);
+    // Output is captured, so npm never needs the user's console; its own
+    // console also keeps npm from retitling the user's terminal ("npm ci").
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     cmd.arg(&tc.npm_cli)
         .args(args)
         .current_dir(cwd)

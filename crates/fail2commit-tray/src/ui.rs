@@ -21,6 +21,9 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, SetFocus, VK_SHIFT, VK_TAB,
+};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NOTIFYICONDATAW,
@@ -154,6 +157,20 @@ pub fn run() -> ExitCode {
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             // Tab/Esc handling for the approval dialogs.
             let top = GetAncestor(msg.hwnd, GA_ROOT);
+            // The read-only details box is a multi-line edit, which keeps Tab
+            // for itself; move focus explicitly so the buttons stay reachable.
+            if !top.is_null()
+                && top != hwnd
+                && msg.message == WM_KEYDOWN
+                && msg.wParam == VK_TAB as usize
+            {
+                let back = GetKeyState(VK_SHIFT as i32) < 0;
+                let next = GetNextDlgTabItem(top, GetFocus(), back as i32);
+                if !next.is_null() {
+                    SetFocus(next);
+                    continue;
+                }
+            }
             if !top.is_null() && top != hwnd && IsDialogMessageW(top, &msg) != 0 {
                 continue;
             }
@@ -494,13 +511,13 @@ unsafe fn open_dialog(mut pending: Box<Pending>) {
         } as u32;
         child(hwnd, "BUTTON", text, style | WS_TABSTOP, (x, y, w, 30), id);
     };
-    // Cancel first: it owns the default focus.
-    btn("Cancel", BTN_CANCEL, 12, 100, true);
+    // Cancel first: it owns the default focus. Alt+C / Alt+A / Alt+R work.
+    btn("&Cancel", BTN_CANCEL, 12, 100, true);
     if render::offers(&req, Decision::ApproveOnce) {
-        btn("Approve once", BTN_APPROVE, 300, 110, false);
+        btn("&Approve once", BTN_APPROVE, 300, 110, false);
     }
     if render::offers(&req, Decision::RunOnHostOnce) {
-        btn("Run on host once", BTN_HOST, 420, 132, false);
+        btn("&Run on host once", BTN_HOST, 420, 132, false);
     }
     let remaining_ms = req
         .expires_at
@@ -511,6 +528,20 @@ unsafe fn open_dialog(mut pending: Box<Pending>) {
     STATE.with(|s| s.borrow_mut().dialogs.push(hwnd));
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
+    focus_default(hwnd);
+}
+
+/// Keyboard focus on the password box when there is one, else on Cancel.
+unsafe fn focus_default(hwnd: HWND) {
+    let pw = GetDlgItem(hwnd, EDIT_PASSWORD);
+    let target = if pw.is_null() {
+        GetDlgItem(hwnd, BTN_CANCEL)
+    } else {
+        pw
+    };
+    if !target.is_null() {
+        SetFocus(target);
+    }
 }
 
 unsafe fn read_password(edit: HWND) -> Option<String> {
@@ -562,6 +593,17 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_TIMER | WM_CLOSE => {
             answer(hwnd, None);
+            0
+        }
+        WM_ACTIVATE => {
+            // Windows may refuse the tray foreground at creation; give the
+            // keyboard a defined starting point whenever the user activates it.
+            if (wp & 0xFFFF) as u32 != WA_INACTIVE {
+                let f = GetFocus();
+                if f.is_null() || GetAncestor(f, GA_ROOT) != hwnd {
+                    focus_default(hwnd);
+                }
+            }
             0
         }
         WM_DESTROY => {

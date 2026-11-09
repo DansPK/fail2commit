@@ -63,7 +63,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         format!(
             "installed {} wheel(s) into {}: {}",
             r.packages.len(),
-            r.interpreter,
+            fail2commit_core::fsutil::plain_path(std::path::Path::new(&r.interpreter)).display(),
             r.packages
                 .iter()
                 .map(|w| format!("{}=={}", w.name, w.version))
