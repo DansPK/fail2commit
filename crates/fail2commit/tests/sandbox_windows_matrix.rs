@@ -407,10 +407,14 @@ fn explicit_handle_list_excludes_an_inheritable_secret_handle() {
     let outcome = backend().run(&job).unwrap();
     set_inheritable(&secret, false);
     let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
-    assert_eq!(
-        outcome.status,
-        JobStatus::Exited(0),
-        "the child could read an inheritable handle: stderr={stderr}"
+    // Both mean "no such handle in the child": ReadFile failing with
+    // ERROR_INVALID_HANDLE (helper exit 0), or, where strict handle checks are
+    // enforced (GitHub's windows-latest), the STATUS_INVALID_HANDLE exception.
+    const STATUS_INVALID_HANDLE: i32 = 0xC000_0008_u32 as i32;
+    assert!(
+        matches!(outcome.status, JobStatus::Exited(0 | STATUS_INVALID_HANDLE)),
+        "the child could read an inheritable handle: status={:?} stderr={stderr}",
+        outcome.status
     );
     assert!(
         !stderr.contains("inherited handle was readable"),
