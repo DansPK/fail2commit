@@ -7,10 +7,9 @@ Dependency license expressions and bundled license texts follow.
 
 ## Review flags
 
-- flatbuffers 24.12.23: no license text found in crate source
 - r-efi 6.0.0: copyleft license expression, no license text found in crate source
 
-## Dependencies (145)
+## Dependencies (126)
 
 ## adler2 2.0.1
 
@@ -92,14 +91,6 @@ Dependency license expressions and bundled license texts follow.
 
 - License file `LICENSE-APACHE`: text `59013a5c8d3a`
 - License file `LICENSE-MIT`: text `79697635de72`
-
-## bitflags 1.3.2
-
-- License expression: `MIT/Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `LICENSE-APACHE`: text `769f80b5bcb4`
-- License file `LICENSE-MIT`: text `14435fbcd271`
 
 ## bitflags 2.13.2
 
@@ -307,13 +298,6 @@ Dependency license expressions and bundled license texts follow.
 
 - License file `LICENSE-APACHE`: text `769f80b5bcb4`
 - License file `LICENSE-MIT`: text `84e1bbfebd74`
-
-## flatbuffers 24.12.23
-
-- License expression: `Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-_No license file was present in the resolved crate source._
 
 ## flate2 1.1.11
 
@@ -533,13 +517,6 @@ _No license file was present in the resolved crate source._
 
 _No license file was present in the resolved crate source._
 
-## rappct 0.13.3
-
-- License expression: `MIT`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `LICENSE`: text `4b9c7f877849`
-
 ## regex 1.13.1
 
 - License expression: `MIT OR Apache-2.0`
@@ -587,14 +564,6 @@ _No license file was present in the resolved crate source._
 
 - License file `LICENSE-APACHE`: text `59899c6091b5`
 
-## rustc_version 0.4.1
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `LICENSE-APACHE`: text `769f80b5bcb4`
-- License file `LICENSE-MIT`: text `8d1f81ea4e87`
-
 ## rustix 1.1.6
 
 - License expression: `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`
@@ -630,21 +599,6 @@ _No license file was present in the resolved crate source._
 - License file `LICENSE`: text `3ac27594ed56`
 
 ## rustversion 1.0.23
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `LICENSE-APACHE`: text `95bd3988beee`
-- License file `LICENSE-MIT`: text `30fefc3a7d6a`
-
-## sandboxrs-windows 0.1.1
-
-- License expression: `MIT`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `LICENSE`: text `b7029efec9b9`
-
-## semver 1.0.28
 
 - License expression: `MIT OR Apache-2.0`
 - Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
@@ -760,22 +714,6 @@ _No license file was present in the resolved crate source._
 
 - License file `LICENSE-APACHE`: text `769f80b5bcb4`
 - License file `LICENSE-MIT`: text `7bdd5c5e8ad0`
-
-## thiserror 2.0.21
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `LICENSE-APACHE`: text `95bd3988beee`
-- License file `LICENSE-MIT`: text `30fefc3a7d6a`
-
-## thiserror-impl 2.0.21
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `LICENSE-APACHE`: text `95bd3988beee`
-- License file `LICENSE-MIT`: text `30fefc3a7d6a`
 
 ## toml 1.2.1+spec-1.1.0
 
@@ -922,54 +860,6 @@ _No license file was present in the resolved crate source._
 
 - License file `LICENSE`: text `d30183ec6610`
 
-## windows 0.62.2
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-collections 0.3.2
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-core 0.62.2
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-future 0.3.2
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-implement 0.60.2
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-interface 0.59.3
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
 ## windows-link 0.2.1
 
 - License expression: `MIT OR Apache-2.0`
@@ -978,39 +868,7 @@ _No license file was present in the resolved crate source._
 - License file `license-apache-2.0`: text `72de958052e4`
 - License file `license-mit`: text `d9a1b1e30d63`
 
-## windows-numerics 0.3.1
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-result 0.4.1
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-strings 0.5.1
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
 ## windows-sys 0.52.0
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-sys 0.59.0
 
 - License expression: `MIT OR Apache-2.0`
 - Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
@@ -1027,14 +885,6 @@ _No license file was present in the resolved crate source._
 - License file `license-mit`: text `d9a1b1e30d63`
 
 ## windows-targets 0.52.6
-
-- License expression: `MIT OR Apache-2.0`
-- Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
-
-- License file `license-apache-2.0`: text `72de958052e4`
-- License file `license-mit`: text `d9a1b1e30d63`
-
-## windows-threading 0.2.1
 
 - License expression: `MIT OR Apache-2.0`
 - Cargo source: `registry+https://github.com/rust-lang/crates.io-index`
@@ -4766,34 +4616,6 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-## Text `4b9c7f877849`
-
-Source filenames: `LICENSE`
-
-```text
-MIT License
-
-Copyright (c) 2025 cpjet64
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
 ## Text `edb9c6dbff46`
 
 Source filenames: `LICENSE`
@@ -5292,38 +5114,6 @@ Source filenames: `LICENSE-APACHE`
    END OF TERMS AND CONDITIONS
 ```
 
-## Text `8d1f81ea4e87`
-
-Source filenames: `LICENSE-MIT`
-
-```text
-Copyright (c) 2016 The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-```
-
 ## Text `fde2a68c47d2`
 
 Source filenames: `COPYRIGHT`
@@ -5678,34 +5468,6 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 The files under third-party/chromium are licensed as described in
 third-party/chromium/LICENSE.
-```
-
-## Text `b7029efec9b9`
-
-Source filenames: `LICENSE`
-
-```text
-MIT License
-
-Copyright (c) 2026 sandboxrs-windows contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 ```
 
 ## Text `535a6aa345e8`

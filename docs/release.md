@@ -55,3 +55,9 @@ Known unsupported paths are listed in [install.md](install.md) and must be
 copied into release notes. NSIS, native desktop, WSL, VS Code, and server
 integration evidence remains platform-gated and must not be inferred from a
 successful unit-test job.
+
+## License elections
+
+- `r-efi` (`MIT OR Apache-2.0 OR LGPL-2.1-or-later`): used under MIT or Apache-2.0; it is only compiled for UEFI targets (getrandom's UEFI backend) and is not part of the Windows or Linux artifacts. `notices.py` still flags it because the expression contains a copyleft alternative.
+- `flatbuffers` is no longer a dependency: `sandboxrs-windows` was dropped (CR-006).
+
