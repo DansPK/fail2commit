@@ -96,11 +96,51 @@ Findings:
 1. **`run -- cmd.exe` failed** with `cmd.exe was not found on PATH`, because `toolpath::find_real` appended `.exe` to a name that already had it (`cmd` worked). Fixed after the release candidate in `11be0a6` (FR-007) with a regression test; `.bat`/`.cmd` stay unresolvable. Host re-run: core lib 151/151, `run_cli` 3/3, `sandbox_windows_matrix` 7/7 including ignored. The 0.1.0 artifacts above predate this fix.
 2. **Microsoft Defender quarantined the unsigned `fail2commit.exe`** on win10 (`Behavior:Win32/DefenseEvasion.A!ml`, severity 5, signatures 1.463.203.0) during the third run of the adversarial probe, whose sandboxed `cmd` reads a file named `secret.txt` and connects to a bare IP. Afterwards the same hash was blocked as soon as it was written to disk. From a fresh snapshot, the benign workload produced no detection on win10 or win11, and on win11 the adversarial probe ran without detection. The machine-learning verdict therefore depends on what the sandboxed child does, which for fail2commit is untrusted package code. Release prerequisite: Authenticode signing and a Microsoft false-positive submission (section 6).
 
+## 5c. Linux full user flow with real bubblewrap (released `.deb`)
+
+A disposable WSL distro `f2c-e2e` imported from the official Ubuntu 24.04 WSL rootfs (SHA-256 `8251e27f...15ea`, equal to Canonical's `SHA256SUMS`); kernel 6.18.54.1-microsoft-standard-WSL2, bubblewrap 0.9.0 (Ubuntu package), Node 18.19.1, npm 9.2.0, Python 3.12.3, Git 2.43.0. The released `fail2commit_0.1.0_amd64.deb` (`f52ddf76...0815`) was installed with `dpkg -i`; the flow ran as a new normal user `dev` under `setsid` (no controlling terminal, so unattended paths fail closed), against a loopback npm registry, PyPI index and OSV stub serving synthetic packages, with approvals given through `fail2commit api` exactly as the VS Code client does. Scripts: `setup_root.sh`, `flow.sh`, `secret_probe.sh`, `uninstall_root.sh`, `servers.py`, `approve.py`.
+
+| Step | Result |
+|---|---|
+| `fail2commit setup`, `status` | exit 0; integrations `git, npm, pip`; sandbox `bubblewrap available=True`; 12 of 13 controls ok, `cgroup_v2_limits` not verified because `wsl --exec` processes are outside a systemd session (`0::/non-systemd`), so limits fell back to rlimits as designed |
+| Normal push | exit 0; the third-party `core.hooksPath` pre-push hook ran |
+| Unattended `git push --force` | exit 1 `Approve RefRewrite`; remote unchanged |
+| Same push, approved once over `api` | asked once with findings `force_intent`, `ref_rewrite`; exit 0; remote updated |
+| Secret pushes, unattended | GitHub token, AWS access key, private key and `password = "..."` each exit 1 with the value redacted (`[redacted N chars]`) |
+| npm `plain` (no scripts) | exit 0 |
+| npm `hello-build` (install script) | exit 0, `scripts: Sandboxed`; artifact `built-in-sandbox:1,4,9` built inside a `sandbox-stage` job and merged into `node_modules` |
+| npm `hostile` | exit 0; inside the sandbox: home secret, `~/.ssh` key and the user's repo `ENOENT`; loopback canary `ECONNREFUSED` (0 connections seen by the listener); external TCP `ENETUNREACH`; child environment only npm lifecycle keys; nothing written to the real home |
+| npm `advised` (synthetic OSV advisory) | unattended exit 11 `approval_unavailable`, nothing changed; cancel over `api` exit 10, nothing changed; approve once exit 0, installed |
+| Sandbox off, npm package with a required install script | exit 11: a host-run approval is required and unattended fails closed; no script ran |
+| pip `cleanpkg` wheel into a venv | exit 0, importable |
+| pip `pyadvised` (advisory) | unattended exit 11, not installed; approved once over `api` exit 0, installed |
+| `fail2commit run` | exit 0; output exported; the home secret, `~/.ssh` key and repo were not visible (`No such file or directory`) |
+| `uninstall-integrations`, `dpkg --purge` | exit 0 / 0; binary gone; `core.hooksPath` restored to the third-party directory with its hook intact |
+
+Findings:
+
+1. **Generic secret detector missed quoted values containing `#`, `,` or `;`**: `db_password = "Zq8#vT2kPw9xLmR4sQ7"` was pushed unattended without a finding, because the value pattern stopped at `#`. Fixed (FR-001): a quoted value now runs to its closing quote; unquoted values still treat `#` as a comment. Regression test `quoted_password_with_hash_or_comma_is_flagged`.
+2. In a session with a terminal the guard prompts on the terminal and waits, as specified; the first flow attempt (run from a backgrounded console) stopped there.
+
+## 5d. GitHub Actions (PR #1, private repository)
+
+| Run | Commit | scaffold | rust (ubuntu-latest) | rust (windows-latest) |
+|---|---|---|---|---|
+| 42584670597 | `02fd51f` | pass | pass (494) | fail: `e2e_npm_approval` 4 tests, `EISDIR lstat 'C:'` under the runner's Node 22.23.4 |
+| 42592243721 | `7046e37` | pass | pass | fail: `e2e_npm_sandbox` 4 tests |
+
+- `7046e37` (FR-004): npm-cli.js was passed to node in the `\\?\` form; Node 22 cannot resolve it. Reproduced locally with the official Node 22.23.4 zip (old code fails identically, fix passes 3 runs in a row).
+- The second run's failures: three came from the test fixture embedding the runner's 8.3 `TEMP` (`RUNNER~1`), which the npm guard correctly refuses; reproduced locally with an 8.3 alias and fixed in the test support (long form). One was a leftover `probe-*` stage: the AppContainer probe stage is now removed with a short retry, and stale `probe-*` stages are swept like `npm-*` and `run-*`.
+- The Linux job does not install bubblewrap, so the hostile-sandbox suites skip there; real-sandbox evidence is section 5c and the WSL runs in section 2.
+
 ## 6. Pending gates (missing prerequisite)
 
 | Gate | Status | Missing prerequisite |
 |---|---|---|
-| GitHub Actions `ci.yml` / `release.yml` runs | Pending | Running them needs a push to GitHub, which this implementation run must not do |
+| GitHub Actions `ci.yml` runs | In progress (section 5d) | - |
+| GitHub `release.yml` run | Pending | `workflow_dispatch` needs the workflow on the default branch, i.e. merging PR #1 |
+| Linux CI exercising the real sandbox | Pending | Install bubblewrap in the CI job and require the sandbox; on stock Ubuntu 24.04 runners AppArmor may need a bwrap userns profile |
+| Stock Ubuntu desktop with AppArmor userns restriction | Pending | A non-WSL Ubuntu 24.04+ host (WSL does not enforce the restriction) |
 | GitHub repository rulesets (SPEC-003 hosted path) | Pending | A hosted GitHub repository with admin access |
 | VS Code GUI click-through (modal approval, picker) and a real Remote-WSL session | Pending | An interactive desktop session; the extension and protocol are covered against both real CLIs headless |
 | Tray GUI click-through (dialog, menu) | Pending | An interactive desktop session; pipe, ACL and rendering are covered by tests |
