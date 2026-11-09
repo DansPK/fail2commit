@@ -37,7 +37,35 @@
 
 ## 3. Artifacts (`target/dist/SHA256SUMS`)
 
-### 3a. Release candidate 2 (current), built from `d4ca070`
+### 3a0. GitHub release-candidate run (current), built from `2888aec` on `main`
+
+`release.yml` run [42685056421](https://github.com/DansPK/fail2commit/actions/runs/42685056421) succeeded:
+- **windows:** fmt, clippy, tests, release build, NSIS 3.11 installer.
+- **linux:** fmt, clippy, tests, notices, then each package plus its check: the `.deb` and its clean-Ubuntu verify; the source tarball and its offline rebuild; the Arch package and its clean-archlinux verify.
+- **vsix** and **hashes** also passed.
+
+The two earlier runs failed only in packaging, fixed by PRs #4 and #5:
+- `windows-latest` no longer ships NSIS;
+- a recursive glob matched test binaries.
+
+`SHA256SUMS` from the run:
+
+```
+3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5  LICENSE
+f55e059611ca38d5fc77a0f645f9fd43c10d8a6c9e576ba09210d9c21db56df5  NOTICE
+1ccbfb4c66bc58874472e5648cb2144e0ba269aab3b2d881917095641ae18cb5  THIRD-PARTY-NOTICES.md
+5140b9f4b0266f6374a13813ca3925ffd790fb7c6534046711df75eb3a474011  fail2commit-0.1.0-1-x86_64.pkg.tar.zst
+3a7c657f75b4245e52cbcd5f710ed18ab06ab00ff982343b4255f493c48af7e0  fail2commit-0.1.0-linux-amd64
+bb0f5a35c9863369f3338daa91e6ef0ab1ad07b7877c93ac4f1b3e3fb6cd128a  fail2commit-0.1.0-setup.exe
+b651f013787b4f342d9546687224cc66702d96b22655a66ba4fc19a82d71c7fa  fail2commit-0.1.0-src.tar.gz
+be0a7dde757e29abbb72b40607b8e22083959c3f231391e431b84b08e12f4ef5  fail2commit-0.1.0.vsix
+9e574ff246561e9696854496dbfef09136048d19def24abb9b7b5f248eb89cca  fail2commit-windows-x86_64.exe
+de052a145c23d5fe6ebb5fa3a6a7abf705e3b8f225104a54265733cce75878fa  fail2commit_0.1.0_amd64.deb
+```
+
+These are CI workflow artifacts. Nothing was published as a GitHub Release. The Windows binaries are still unsigned (TODO P-101).
+
+### 3a. Release candidate 2 (local), built from `d4ca070`
 
 Supersedes the RC1 set below. Includes every fix through `82004af` (Node 22 npm path, quoted-secret detector, `run -- cmd.exe`, probe stage cleanup) and the license notices from `5885ca8`. Built with `scripts/release/build-windows.ps1`, `packaging/windows/build.ps1` (NSIS 3.11), `build-deb.sh`, `source-tarball.sh`, `vsce package`, and `hashes.sh`.
 
@@ -235,7 +263,7 @@ The VM was reverted to its `clean` snapshot afterwards. One harness artifact was
 | Gate | Status | Missing prerequisite |
 |---|---|---|
 | GitHub Actions `ci.yml` runs | **Passed** on `82004af` (section 5d) | - |
-| GitHub `release.yml` run | Pending | `workflow_dispatch` needs the workflow on the default branch, i.e. merging PR #1 |
+| GitHub `release.yml` run | **Passed** on `2888aec` (section 3a0) | - |
 | Linux CI exercising the real sandbox | Pending | Install bubblewrap in the CI job and require the sandbox; on stock Ubuntu 24.04 runners AppArmor may need a bwrap userns profile |
 | Stock Ubuntu desktop with AppArmor userns restriction | Pending | A non-WSL Ubuntu 24.04+ host (WSL does not enforce the restriction) |
 | GitHub repository rulesets (SPEC-003 hosted path) | Pending | A hosted GitHub repository with admin access |
