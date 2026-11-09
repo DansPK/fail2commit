@@ -272,11 +272,21 @@ fn linux_native_c_build_through_the_sandbox() {
                 "#include <stdio.h>\nint main(void){printf(\"native-c:%d\\n\", 6*7);return 0;}\n",
             ),
     );
-    let r = n.w.run(
-        &n.project,
-        &["--json", "--approver", "none", "npm", "install", "native-c"],
+    // CR-012: the script runs its own compiled output, which does not exist at
+    // review, so the install asks once and names it; approve on the api channel.
+    let mut api = n.w.api(&n.project, &["npm", "install", "native-c"]);
+    let req = api.approval_request();
+    assert!(
+        req.findings
+            .iter()
+            .any(|f| f.location.as_deref() == Some("build/addon")),
+        "build/addon not named for approval: {:?}",
+        req.findings
     );
-    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    api.send(&answer(&req, Decision::ApproveOnce, None));
+    let (resp, exit, out) = api.finish();
+    assert_eq!(resp.code, ResultCode::Ok, "{out}");
+    assert_eq!(exit, 0);
     assert_eq!(
         std::fs::read_to_string(n.project.join("node_modules/native-c/build/artifact.txt"))
             .unwrap(),
