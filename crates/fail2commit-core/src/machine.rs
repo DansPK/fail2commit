@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 /// Copies of the CLI placed in the shim directory. `fail2commit.exe` lets an
 /// administrator remove the shims even after the per-user install is gone.
 pub const SHIMS: [&str; 4] = ["npm.exe", "pip.exe", "pip3.exe", "fail2commit.exe"];
+#[cfg(windows)]
 const STATE: &str = "machine-path.json";
 
 /// `<ProgramFilesDir>\fail2commit\shims`, from

@@ -137,13 +137,14 @@ const fs = require('fs'), cp = require('child_process');
 const n = process.execPath, args = (s) => ['-e', s];
 const sync = cp.execFileSync(n, args('process.stdout.write("sync-ok")')).toString();
 const input = cp.spawnSync(n, args('process.stdin.pipe(process.stdout)'), { input: 'input-ok' }).stdout.toString();
+const ignored = cp.spawnSync(n, args('process.exit(0)'), { stdio: 'ignore' }).status;
 const c = cp.spawn(n, args('console.log("async-ok"); console.error("err-ok")'));
 let out = '', err = '';
 c.stdout.on('data', (d) => out += d);
 c.stderr.on('data', (d) => err += d);
 c.on('close', (code) => {
   fs.mkdirSync('build', { recursive: true });
-  fs.writeFileSync('build/pipes.txt', [sync, input, out.trim(), err.trim(), code].join('|'));
+  fs.writeFileSync('build/pipes.txt', [sync, input, ignored, out.trim(), err.trim(), code].join('|'));
 });
 "#;
 
@@ -168,7 +169,7 @@ fn install_script_child_processes_with_pipes_finish_in_the_sandbox() {
     assert_eq!(r.json["data"]["scripts"], "Sandboxed", "{}", r.json);
     assert_eq!(
         std::fs::read_to_string(n.project.join("node_modules/pipes/build/pipes.txt")).unwrap(),
-        "sync-ok|input-ok|async-ok|err-ok|0"
+        "sync-ok|input-ok|0|async-ok|err-ok|0"
     );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(120),

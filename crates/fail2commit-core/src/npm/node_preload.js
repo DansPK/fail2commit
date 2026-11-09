@@ -51,16 +51,20 @@
       try {
         if (options && Array.isArray(options.stdio)) {
           options.stdio = options.stdio.map((s, i) => {
-            if (!s || s.type !== 'pipe') return s;
+            // 'ignore' on 0-2 opens the NUL device, which some AppContainer
+            // hosts refuse (EPERM); an empty file / discard file works everywhere.
+            const pipe = s && s.type === 'pipe';
+            const ignore = s && s.type === 'ignore' && i <= 2;
+            if (!pipe && !ignore) return s;
             const file = tempFile('s' + i);
             if (i === 0) {
-              fs.writeFileSync(file, toBuffer(s.input));
+              fs.writeFileSync(file, pipe ? toBuffer(s.input) : Buffer.alloc(0));
               const fd = fs.openSync(file, 'r');
               files.push({ i, file, fd, out: false });
               return { type: 'fd', fd };
             }
             const fd = fs.openSync(file, 'w+');
-            files.push({ i, file, fd, out: true });
+            files.push({ i, file, fd, out: pipe });
             return { type: 'fd', fd };
           });
         }
@@ -89,28 +93,41 @@
       else stdio = stdio.slice();
       while (stdio.length < 3) stdio.push(undefined);
       const tails = [];
+      const discards = [];
       for (let i = 0; i < stdio.length; i++) {
-        if (!isPipe(stdio[i])) continue;
-        if (i === 0 || i > 2) {
-          stdio[i] = 'ignore'; // writing to a child's stdin is not supported here
+        const pipe = isPipe(stdio[i]);
+        const ignore = stdio[i] === 'ignore' && i <= 2;
+        if (!pipe && !ignore) continue;
+        if (i > 2) {
+          stdio[i] = 'ignore'; // extra pipes are not supported here
           continue;
         }
+        // stdin, and 'ignore' on 0-2, become files: 'ignore' opens the NUL
+        // device, which some AppContainer hosts refuse with EPERM.
         const file = tempFile('a' + i);
-        const fd = fs.openSync(file, 'w+');
+        if (i === 0) fs.writeFileSync(file, Buffer.alloc(0));
+        const fd = fs.openSync(file, i === 0 ? 'r' : 'w+');
         stdio[i] = fd;
-        tails.push({ i, file, fd });
+        if (pipe && i > 0) tails.push({ i, file, fd });
+        else discards.push({ file, fd });
       }
-      if (tails.length === 0) return originalSpawn.call(this, options);
+      if (tails.length === 0 && discards.length === 0) return originalSpawn.call(this, options);
       options.stdio = stdio;
       let ret;
       try {
         ret = originalSpawn.call(this, options);
       } finally {
-        for (const t of tails) {
+        for (const t of tails.concat(discards)) {
           try { fs.closeSync(t.fd); } catch (_) {}
         }
       }
       const child = this;
+      if (discards.length) {
+        const drop = () => { for (const d of discards) cleanup(null, d.file); };
+        child.once('exit', drop);
+        child.once('error', drop);
+      }
+      if (tails.length === 0) return ret;
       let open = tails.length;
       let deferredClose = null;
       const emit = child.emit;

@@ -370,7 +370,9 @@ pub(super) fn bin_dirs(tree: &Path, pkg_dir: &Path) -> Vec<PathBuf> {
 /// CR-014: preload written next to the staged node on Windows. Inside the
 /// AppContainer, libuv cannot create the named pipes it uses for child stdio
 /// and loops forever; the preload routes piped child stdio through files.
+#[cfg(windows)]
 pub(crate) const NODE_PRELOAD_NAME: &str = "f2c-node-preload.js";
+#[cfg(windows)]
 pub(crate) const NODE_PRELOAD: &str = include_str!("node_preload.js");
 
 /// `NODE_OPTIONS` for lifecycle scripts on Windows. An AppContainer cannot
