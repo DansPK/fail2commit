@@ -1,4 +1,4 @@
-//! Re-review of the CR-010 approval relay (docs/verify/reviews/REREVIEW-2026-11-09-relay.md).
+//! Re-review of the CR-010 approval relay (docs/dev/verify/reviews/REREVIEW-2026-11-09-relay.md).
 //! RR-001..RR-003 are regression tests for the fixes (the reproductions were
 //! inverted); RR-004 stays a reproduction of accepted residual risk (CR-011).
 //! Synthetic values only.

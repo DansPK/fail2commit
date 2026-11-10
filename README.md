@@ -20,7 +20,7 @@ It is free, open source (Apache-2.0), written in Rust, and needs no account or c
 - An attack simulation (credential theft, persistence and lockfile tampering) was fully blocked, and the host stayed unchanged.
 - 516 tests on Windows and 502 on Linux pass.
 
-Evidence: [docs/verify/VERIFY-2026-11-09-release.md](docs/verify/VERIFY-2026-11-09-release.md).
+Evidence: [docs/dev/verify/VERIFY-2026-11-09-release.md](docs/dev/verify/VERIFY-2026-11-09-release.md).
 
 **Known limits:**
 - **The Windows binaries are not code-signed.** SmartScreen warns, and Defender has quarantined the CLI once as a false positive. You may need to allow it.
@@ -93,7 +93,7 @@ The full index is [docs/README.md](docs/README.md). The most used guides:
 | VS Code extension | [docs/vscode.md](docs/vscode.md) |
 | Self-hosted protected remote | [docs/server.md](docs/server.md) |
 | Architecture and trust boundaries | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Building a release | [docs/release.md](docs/release.md) |
+| Building a release | [docs/dev/release.md](docs/dev/release.md) |
 
 ## Build from source
 
@@ -108,15 +108,9 @@ The Windows tray app is `-p fail2commit-tray`. The release scripts are in `scrip
 
 ## Contributing
 
-Requirements, specs and tests are in [docs/requirements](docs/requirements/FRD.md), [docs/specs](docs/specs/) and [docs/tests](docs/tests/TEST-PLAN.md). The task board is [TODO.md](TODO.md).
-- Agents and contributors: start with [AGENTS.md](AGENTS.md).
-- Status rules: [docs/WORKFLOW.md](docs/WORKFLOW.md).
-- Fresh repository setup: [SETUP.md](SETUP.md).
-
-Use synthetic secrets and disposable repositories in tests, never real ones.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/dev/setup.md](docs/dev/setup.md). The roadmap is in [TODO.md](TODO.md). Requirements, specs, test plan and test evidence are under [docs/dev/](docs/dev/setup.md#project-records).
 
 ## License
 
 Copyright 2026 Nut Youlong. fail2commit is licensed under the [Apache License 2.0](LICENSE); see [NOTICE](NOTICE).
-Development files inherited from the project template stay under their [MIT license](LICENSE.template-MIT).
 Third-party notices for everything compiled into the release binaries are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

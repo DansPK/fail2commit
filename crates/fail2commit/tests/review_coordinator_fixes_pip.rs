@@ -1,7 +1,7 @@
 //! Independent review of the coordinator's fixes 8773c1b (relay), a8a0cc3 and
 //! 5ea0dd1 (pip layout denial). Every test fails when the attempt works; the
 //! failure message carries the CF-### id used in
-//! `docs/verify/reviews/REVIEW-2026-11-09-coordinator-fixes.md`. Disposable venvs, the
+//! `docs/dev/verify/reviews/REVIEW-2026-11-09-coordinator-fixes.md`. Disposable venvs, the
 //! loopback fixture index only. Product code is not modified.
 
 // The lab helpers mirror rereview2_pip.rs; not every one is used here.

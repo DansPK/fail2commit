@@ -1,7 +1,7 @@
 //! TC-004 / TC-008 interplay: lifecycle scripts go through the sandbox
 //! decision (FR-008) with npm's lifecycle context preserved. The sandbox is
 //! a double here; the real native build is Pending on T-007 (see
-//! docs/verify/VERIFY-2026-11-08-npm.md).
+//! docs/dev/verify/VERIFY-2026-11-08-npm.md).
 
 mod npm_support;
 

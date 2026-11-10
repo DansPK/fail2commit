@@ -2,7 +2,7 @@
 
 This document records the T-007b review, the controls the Windows backend enforces, and the
 dependency decision the coordinator has to make. It supersedes the 2026-11-08 text and covers the
-2026-11-09 fix pass for review findings S7B-001..013 (`docs/verify/reviews/REVIEW-2026-11-09-t007b.md`).
+2026-11-09 fix pass for review findings S7B-001..013 (`docs/dev/verify/reviews/REVIEW-2026-11-09-t007b.md`).
 
 ## 1. Dependency decision (S7B-009)
 
@@ -127,7 +127,7 @@ Verified on Windows NT `10.0.26200.0` with `rustc 1.99.1`, `cargo 1.99.1`, `-j 2
 `--test sandbox_windows_matrix --test review_t007b_paths --test review_t007b_tempdir
 --test review_t007b_systemroot` (6 passed / 1 ignored, 3 passed, 1 passed, 1 passed), plus
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -j 2 -- -D warnings`.
-Exact commands, exit codes and the tested SHA are in `docs/verify/reviews/FIX-T007B-SUMMARY.md`.
+Exact commands, exit codes and the tested SHA are in `docs/dev/verify/reviews/FIX-T007B-SUMMARY.md`.
 
 Qualification: grants are structurally confined to the stage root, and the hard-link regression
 compares the DACL of an outside file before and after the refusal with `icacls`, so "no real checkout,
@@ -138,7 +138,7 @@ network traffic), and the full staged MinGW GCC closure is still unavailable —
 11 871 files / 961 MB, and copying only `gcc.exe` would not be a legitimate toolchain test.
 ## Known limitation: user profile required
 
-The AppContainer backend calls `CreateAppContainerProfile`, which needs the user's registry hives (including the `_Classes` hive) to be loaded. In a batch or service logon without a loaded profile (for example a VMware Tools guest operation, a scheduled task without profile loading, or some CI runners) it fails with `HRESULT 0x80070002`; `probe()` then reports the backend unavailable and installs with scripts fail closed. Observed on a clean Windows 11 25H2 VM through VMware Tools (see docs/verify/VERIFY-2026-11-09-release.md section 5). Run guarded installs from an interactive session, or load the profile for the service account. In an interactive sign-in the backend is available with all controls verified on a clean Windows 11 25H2 VM and a clean Windows 10 IoT Enterprise LTSC 2021 VM (section 5b of the same report).
+The AppContainer backend calls `CreateAppContainerProfile`, which needs the user's registry hives (including the `_Classes` hive) to be loaded. In a batch or service logon without a loaded profile (for example a VMware Tools guest operation, a scheduled task without profile loading, or some CI runners) it fails with `HRESULT 0x80070002`; `probe()` then reports the backend unavailable and installs with scripts fail closed. Observed on a clean Windows 11 25H2 VM through VMware Tools (see docs/dev/verify/VERIFY-2026-11-09-release.md section 5). Run guarded installs from an interactive session, or load the profile for the service account. In an interactive sign-in the backend is available with all controls verified on a clean Windows 11 25H2 VM and a clean Windows 10 IoT Enterprise LTSC 2021 VM (section 5b of the same report).
 
 ## Node.js child processes inside the AppContainer (CR-014)
 

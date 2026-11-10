@@ -2,7 +2,7 @@
 //! binary against an offline registry and OSV stub, with lifecycle scripts run
 //! by the real platform sandbox (AppContainer on Windows, bubblewrap on Linux).
 //!
-//! Toolchain staged into the sandbox (docs/e2e.md): the host `node` binary and
+//! Toolchain staged into the sandbox (docs/dev/e2e.md): the host `node` binary and
 //! the npm tree are copied read-only into the job stage, plus `cmd.exe` on
 //! Windows. The "native build" is a staged node script that writes a build
 //! artifact; Linux additionally compiles C with the system `cc` when it is

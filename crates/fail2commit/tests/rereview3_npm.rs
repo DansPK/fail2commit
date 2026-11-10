@@ -2,7 +2,7 @@
 //! (FR-004, FR-006). Offline fixtures only; real npm 12.2.0 extracts every
 //! fixture. Every test asserts the *safe* behaviour. `control_*` tests pin
 //! behaviour that already holds; `rn3_*` tests are reproductions that fail
-//! until the finding is fixed. See docs/verify/reviews/REREVIEW3-2026-11-09-npm.md.
+//! until the finding is fixed. See docs/dev/verify/reviews/REREVIEW3-2026-11-09-npm.md.
 
 mod npm_support;
 

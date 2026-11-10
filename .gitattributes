@@ -1,5 +1,4 @@
-# Shell scripts and git hooks must keep LF or they break on Linux/macOS.
+# Shell scripts must keep LF or they break on Linux/macOS.
 *.sh text eol=lf
-.githooks/* text eol=lf
 # makepkg reads PKGBUILD with bash.
 packaging/arch/PKGBUILD text eol=lf

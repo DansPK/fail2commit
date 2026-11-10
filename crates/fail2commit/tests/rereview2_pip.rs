@@ -3,7 +3,7 @@
 //! Every test is an attempt to make the guard run code a wheel controls, or to
 //! install a layout the guard says it denies. A test fails when the attempt
 //! works; the failure message carries the RP2-### id used in
-//! `docs/verify/reviews/REREVIEW2-2026-11-09-pip.md`. State is disposable; the only
+//! `docs/dev/verify/reviews/REREVIEW2-2026-11-09-pip.md`. State is disposable; the only
 //! network is the loopback fixture index. Several tests are only meaningful on
 //! Windows (name aliasing); they pass trivially elsewhere and say so.
 

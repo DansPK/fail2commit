@@ -28,14 +28,3 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
-
-  scaffold:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Guard self-tests
-        run: |
-          python3 -m unittest discover -s .claude/hooks -p "test_*.py"
-          python3 -m unittest discover -s .codex/hooks -p "test_*.py"
-      - name: Traceability
-        run: python3 .claude/hooks/trace_check.py
