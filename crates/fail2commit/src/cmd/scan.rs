@@ -78,6 +78,13 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
             &local.scripts,
             &local.files,
         ));
+        let install = local.files.iter().map(|f| f.path.clone()).collect();
+        findings.extend(scan::code::scan_package(
+            &local.package,
+            dir,
+            &local.scripts,
+            &install,
+        ));
     }
 
     // Deny findings can never be approved away, so they also fail the command.
@@ -102,11 +109,20 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         .iter()
         .filter(|finding| matches!(finding.kind, FindingKind::Advisory | FindingKind::Malware))
         .count();
-    let message = if advisories == 0 {
+    let code = findings
+        .iter()
+        .filter(|finding| finding.kind == FindingKind::SuspiciousCode)
+        .count();
+    let mut message = if advisories == 0 {
         "no known advisories for the requested versions".to_string()
     } else {
         format!("{advisories} advisory finding(s) need one-time approval")
     };
+    if code > 0 {
+        message.push_str(&format!(
+            "; {code} suspicious-code warning(s): read them before you approve"
+        ));
+    }
     let data = serde_json::json!({
         "complete": complete,
         "packages": targets,

@@ -30,7 +30,7 @@ It is free, written in Rust, and needs no account or cloud service.
   - A self-hosted server hook enforces the same rules for pushes that skip local hooks.
 - **npm and pip install guard**
   - Resolves the exact packages first, and checks them against [OSV](https://osv.dev) (known vulnerabilities and the OpenSSF malicious-packages list).
-  - Scans their install scripts.
+  - Reads every package's code, without running it, and warns about code that behaves like known attacks: hidden (encoded) code, credential or token theft, download-and-run, data-drop addresses, persistence and CI backdoors.
   - Nothing from a package runs until you approve the plan, and a changed plan cancels the approval.
 - **Sandboxed build scripts**
   - Approved install scripts, and anything you run with `fail2commit run`, get no network, no access to your home directory and no access to your credentials.
@@ -56,7 +56,7 @@ It is free, written in Rust, and needs no account or cloud service.
 
 ## Project status
 
-**0.1.1 is a preview** for technical users and testers.
+**0.1.2 is a preview** for technical users and testers.
 
 **What has been tested:**
 - Clean Windows 10 and 11, Debian, and Arch Linux VMs.
@@ -66,7 +66,7 @@ It is free, written in Rust, and needs no account or cloud service.
 **Known limits** (being worked on, see the [roadmap](#roadmap)):
 - **The Windows binaries are not code-signed yet.** SmartScreen warns, and Defender may flag the CLI as a false positive.
 - **Some launchers bypass the guard:** `python -m pip`, programs that run `npm.cmd` by full path, and `pip` in a venv activated in cmd.exe. `fail2commit status` warns about the cases it can detect. Use `fail2commit npm ...` and `fail2commit pip ...` there.
-- **Only install time is protected.** Code that runs when a package is imported is not stopped. Run untrusted projects with `fail2commit run --input . -- npm test`.
+- **Only install time is isolated.** Package code that runs when your project imports it is scanned and you are warned, but it is not sandboxed. Run untrusted projects with `fail2commit run --input . -- npm test`.
 - **Only npm and pip are guarded**, on Windows and Linux.
 
 ## Installation
@@ -78,12 +78,12 @@ Download the file for your platform and `SHA256SUMS` from [GitHub Releases](http
 
 | Platform | File | Install |
 |---|---|---|
-| Windows 10/11 x64 | `fail2commit-0.1.1-setup.exe` | Run it as your normal user. It asks for administrator rights to guard the machine-wide npm and pip |
-| Debian / Ubuntu amd64 | `fail2commit_0.1.1_amd64.deb` | `sudo dpkg -i fail2commit_0.1.1_amd64.deb` |
-| Arch and Arch-based x86_64 | `fail2commit-0.1.1-1-x86_64.pkg.tar.zst` | `sudo pacman -U fail2commit-0.1.1-1-x86_64.pkg.tar.zst`, or `makepkg -si` with [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) |
-| Other Linux x86_64 | `fail2commit-0.1.1-linux-amd64` | Copy it onto your PATH |
-| From source | `fail2commit-0.1.1-src.tar.gz` | Offline build, with the crates vendored. See [docs/install.md](docs/install.md) |
-| VS Code | `fail2commit-0.1.1.vsix` | `code --install-extension fail2commit-0.1.1.vsix` |
+| Windows 10/11 x64 | `fail2commit-0.1.2-setup.exe` | Run it as your normal user. It asks for administrator rights to guard the machine-wide npm and pip |
+| Debian / Ubuntu amd64 | `fail2commit_0.1.2_amd64.deb` | `sudo dpkg -i fail2commit_0.1.2_amd64.deb` |
+| Arch and Arch-based x86_64 | `fail2commit-0.1.2-1-x86_64.pkg.tar.zst` | `sudo pacman -U fail2commit-0.1.2-1-x86_64.pkg.tar.zst`, or `makepkg -si` with [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) |
+| Other Linux x86_64 | `fail2commit-0.1.2-linux-amd64` | Copy it onto your PATH |
+| From source | `fail2commit-0.1.2-src.tar.gz` | Offline build, with the crates vendored. See [docs/install.md](docs/install.md) |
+| VS Code | `fail2commit-0.1.2.vsix` | `code --install-extension fail2commit-0.1.2.vsix` |
 
 On Linux the sandbox needs `bubblewrap`. Node.js/npm and Python are needed only for their own guards. Full instructions, including removal, are in [docs/install.md](docs/install.md).
 
@@ -128,6 +128,11 @@ Run `fail2commit help <command>` for all options. The guides are listed in the [
 ## Roadmap
 
 These items are planned, not promised, and each one starts with an approved requirement. The detailed plan, with the exit check for each item, is in [TODO.md](TODO.md#production-roadmap-proposed-not-yet-approved).
+
+### 0.1.3: signatures
+- [ ] Verify npm registry signatures and Sigstore provenance for every package before it installs; PyPI attestations next.
+- [ ] HTTPS-only, tamper-evident advisory data from OSV.
+- [ ] An offline copy of the OpenSSF malicious-packages list, pinned and hash-checked, so known malware is blocked without network.
 
 ### 0.2: close the gaps
 - [ ] Code-sign the Windows binaries and installer.

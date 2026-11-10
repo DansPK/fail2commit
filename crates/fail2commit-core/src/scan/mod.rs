@@ -26,6 +26,7 @@ use crate::redact;
 use crate::settings::AdvisorySettings;
 
 mod cache;
+pub mod code;
 mod osv;
 mod rules;
 
@@ -298,7 +299,7 @@ fn collect_package_findings(
             continue;
         }
         findings.push(
-            Finding::new(kind, action, "osv", summarize(&id, detail.as_ref()))
+            Finding::new(kind, action, "osv", summarize(&id, detail.as_ref(), pkg))
                 .target(target.clone())
                 .advisory(id),
         );
@@ -349,7 +350,9 @@ fn collect_package_findings(
 }
 
 /// One redacted, bounded evidence line. Advisory text is untrusted input.
-fn summarize(id: &str, detail: Option<&serde_json::Value>) -> String {
+/// `ID [severity], fixed in X: summary`. Severity and fix come first so the
+/// length bound can only cut the free-text summary.
+fn summarize(id: &str, detail: Option<&serde_json::Value>, pkg: &PackageId) -> String {
     let text = detail.and_then(|record| {
         ["summary", "details"]
             .iter()
@@ -357,11 +360,70 @@ fn summarize(id: &str, detail: Option<&serde_json::Value>) -> String {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     });
-    let raw = match text {
-        Some(text) => format!("{id}: {text}"),
-        None => id.to_string(),
-    };
+    let mut raw = id.to_string();
+    if let Some(severity) = detail.and_then(severity) {
+        raw.push_str(&format!(" [{severity}]"));
+    }
+    let fixed = detail.map(|d| fixed_versions(d, pkg)).unwrap_or_default();
+    if !fixed.is_empty() {
+        raw.push_str(&format!(", fixed in {}", fixed.join(", ")));
+    }
+    if let Some(text) = text {
+        raw.push_str(&format!(": {text}"));
+    }
     truncate(&redact::redact_url_credentials(&raw), MAX_EVIDENCE_CHARS)
+}
+
+/// GHSA-style `database_specific.severity`, if it is one of the known words.
+fn severity(record: &serde_json::Value) -> Option<String> {
+    let s = record
+        .get("database_specific")?
+        .get("severity")?
+        .as_str()?
+        .to_ascii_lowercase();
+    matches!(
+        s.as_str(),
+        "low" | "moderate" | "medium" | "high" | "critical"
+    )
+    .then_some(s)
+}
+
+/// Versions that fix this advisory for exactly this package (at most three).
+fn fixed_versions(record: &serde_json::Value, pkg: &PackageId) -> Vec<String> {
+    let norm = |name: &str| match pkg.ecosystem {
+        Ecosystem::PyPI => name.to_ascii_lowercase().replace(['_', '.'], "-"),
+        Ecosystem::Npm => name.to_string(),
+    };
+    let want = norm(&pkg.name);
+    let mut out: Vec<String> = Vec::new();
+    let affected = record.get("affected").and_then(|a| a.as_array());
+    for a in affected.into_iter().flatten() {
+        let Some(p) = a.get("package") else { continue };
+        let eco = p.get("ecosystem").and_then(|e| e.as_str()).unwrap_or("");
+        let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if !eco.eq_ignore_ascii_case(ecosystem_str(pkg.ecosystem)) || norm(name) != want {
+            continue;
+        }
+        let ranges = a.get("ranges").and_then(|r| r.as_array());
+        for event in ranges
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.get("events").and_then(|e| e.as_array()))
+            .flatten()
+        {
+            let Some(v) = event.get("fixed").and_then(|f| f.as_str()) else {
+                continue;
+            };
+            let ok = !v.is_empty()
+                && v.len() <= 64
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-+~".contains(c));
+            if ok && !out.iter().any(|o| o == v) && out.len() < 3 {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -481,6 +543,33 @@ mod tests {
             name: "demo".into(),
             version: "1.0.0".into(),
         }
+    }
+
+    #[test]
+    fn advisory_summary_leads_with_severity_and_fix() {
+        let record = serde_json::json!({
+            "summary": "Prototype pollution",
+            "database_specific": { "severity": "HIGH" },
+            "affected": [
+                { "package": { "ecosystem": "npm", "name": "other" },
+                  "ranges": [{ "events": [{ "introduced": "0" }, { "fixed": "9.9.9" }] }] },
+                { "package": { "ecosystem": "npm", "name": "demo" },
+                  "ranges": [{ "events": [{ "introduced": "0" }, { "fixed": "1.0.1" }] },
+                             { "events": [{ "introduced": "2.0.0" }, { "fixed": "2.0.3" }, { "fixed": "1.0.1" }] }] }
+            ]
+        });
+        assert_eq!(
+            summarize("GHSA-x", Some(&record), &pkg()),
+            "GHSA-x [high], fixed in 1.0.1, 2.0.3: Prototype pollution"
+        );
+        // Unknown severity words, hostile version strings and no detail degrade quietly.
+        let odd = serde_json::json!({
+            "database_specific": { "severity": "<b>urgent</b>" },
+            "affected": [{ "package": { "ecosystem": "npm", "name": "demo" },
+                           "ranges": [{ "events": [{ "fixed": "1.0.1; rm -rf /" }] }] }]
+        });
+        assert_eq!(summarize("GHSA-y", Some(&odd), &pkg()), "GHSA-y");
+        assert_eq!(summarize("GHSA-z", None, &pkg()), "GHSA-z");
     }
 
     #[test]

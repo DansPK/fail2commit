@@ -88,6 +88,9 @@ pub enum FindingKind {
     Malware,
     /// Lifecycle script with Git force-push evidence.
     SuspiciousScript,
+    /// Package code matching a malicious-code heuristic (CR-017); a warning
+    /// that needs approval, never a denial on its own.
+    SuspiciousCode,
     /// Artifact hash or plan mismatch.
     IntegrityMismatch,
     /// A scan or advisory lookup did not complete.
