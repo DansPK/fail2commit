@@ -180,6 +180,9 @@ pub fn advisory_settings(url: &str) -> AdvisorySettings {
         ttl_secs: 3600,
         cache_max_bytes: 8 * 1024 * 1024,
         timeout_secs: 5,
+        // Loopback OSV tests check OSV behaviour alone; P-110 tests opt in.
+        offline_malware: false,
+        ..Default::default()
     }
 }
 

@@ -15,6 +15,26 @@ pub struct Settings {
     pub limits: Limits,
     pub advisories: AdvisorySettings,
     pub approval: ApprovalSettings,
+    pub signatures: SignatureSettings,
+}
+
+/// CR-018 (P-108): npm registry signatures and Sigstore provenance.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignatureSettings {
+    /// Verify registry signatures for every artifact in an install plan.
+    pub verify: bool,
+    /// How long fetched registry signing keys are trusted before a refetch.
+    pub keys_ttl_secs: u64,
+}
+
+impl Default for SignatureSettings {
+    fn default() -> Self {
+        SignatureSettings {
+            verify: true,
+            keys_ttl_secs: 24 * 3600,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -48,6 +68,11 @@ pub struct AdvisorySettings {
     pub ttl_secs: u64,
     pub cache_max_bytes: u64,
     pub timeout_secs: u64,
+    /// CR-020 (P-110): consult the pinned offline OpenSSF malware list when
+    /// OSV cannot answer.
+    pub offline_malware: bool,
+    /// CR-020 (P-110): largest malware-list archive accepted.
+    pub malware_list_max_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -86,6 +111,8 @@ impl Default for AdvisorySettings {
             // T-012: ~34 B per clean entry; 16 MiB holds far more than any project needs.
             cache_max_bytes: 16 * 1024 * 1024,
             timeout_secs: 15,
+            offline_malware: true,
+            malware_list_max_bytes: 256 * 1024 * 1024,
         }
     }
 }
