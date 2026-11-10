@@ -91,6 +91,39 @@ When you run `npm install` or `npm ci` through fail2commit, every package in the
 
 Advisory findings lead with the severity and the versions that fix the problem, for example `GHSA-xxxx [high], fixed in 4.17.21: Prototype pollution in lodash`. Severity comes from the advisory's `database_specific.severity`. Fixed versions come from the `affected` ranges for exactly this package.
 
+## Offline malware list (CR-020)
+
+Known malware stays blocked when OSV cannot be reached. fail2commit can keep a local copy of the [OpenSSF malicious-packages](https://github.com/ossf/malicious-packages) list and check it whenever an OSV lookup fails.
+
+```text
+fail2commit malware-list update                  # download the pinned archive
+fail2commit malware-list update --file mp.tar.gz # import a copy (air-gapped machines)
+fail2commit malware-list status                  # commit, import date, counts, valid or not
+```
+
+**Pinned data.** The binary pins one commit of `ossf/malicious-packages` and the SHA-256 of its archive. `update` downloads `https://codeload.github.com/ossf/malicious-packages/tar.gz/<commit>`. It follows no redirects and reads at most `[advisories] malware_list_max_bytes` (default 256 MiB). With `--file` it reads a local archive instead. Either way, the archive's SHA-256 must equal the pinned value, or the update is rejected and the installed list is not replaced. A newer list needs a newer fail2commit build.
+
+Pinned for 0.1.3: commit `445b5efdb738cc8c4ba623dc7ab7016b6d609ebc` (main on 2026-11-10). Its archive is 47,496,163 bytes with SHA-256 `4b800102edef55aff59f47cc32d5e23a753a2b07c958fd1591df1b5244d000b7`, measured from one download of the URL above. It builds an index of about 12 MB: 223,167 npm and 11,993 PyPI listings.
+
+**GitHub archives are not guaranteed to be byte-stable.** If GitHub regenerates the archive with different compression, the download no longer matches the pin and `update` fails closed. Then fetch the archive for the pinned commit some other way, check its SHA-256 yourself, and import it with `--file`.
+
+**Parsing.** The archive is untrusted input even after its hash matches. fail2commit streams the `tar.gz` and reads only `osv/malicious/npm/**` and `osv/malicious/pypi/**` `.json` files. Nothing is extracted to disk. Limits:
+
+* 2,000,000 entries, 4 GiB unpacked and 2,000,000 listings. Past any of these the whole update is rejected.
+* Records over 4 MiB, malformed JSON and unsafe ids are skipped and counted.
+* Paths that contain `..` or are absolute never count as records.
+
+Each record gives one listing per affected package: the MAL id, plus either its exact `affected[].versions` or "all versions". A record with any `ranges` (for example "introduced 0", no fix), with no versions, or with more than 65,536 versions counts as all versions. Withdrawn records are left out. PyPI names are normalised (lowercase, and runs of `_`, `.` and `-` become one `-`). npm names are matched exactly. Versions are compared as exact strings.
+
+**Storage.** The index is written atomically to `<state dir>/malware-list/index.json`. Its header holds the commit, the archive SHA-256, the import time and the counts. The file starts with the SHA-256 of its body, so a damaged or edited index is detected on load and ignored. This tag is not a signature: anyone who can write your private state directory already runs as you.
+
+**Use.** When `[advisories] offline_malware` is on (the default) and the OSV lookup for a package failed (network down, or `offline = true`) with no cached answer:
+
+* A package and version in the index is a `malware` finding with action `deny` and source `openssf-offline`. Its evidence names the MAL id and the list's commit.
+* Each failed package still gets its `incomplete_scan` finding, because CVEs were not checked. Its evidence ends with one of `offline malware list: listed as malware`, `checked, no match`, `not installed`, `invalid, ignored` or `disabled`.
+
+When OSV answers, the list is not read. A missing or invalid list never blocks anything by itself. `status` reports an invalid list and exits with an integrity error.
+
 ## OSV client
 
 * Endpoint comes from trusted settings (`[advisories] osv_url`), which must be
