@@ -380,7 +380,7 @@ verify reports.
 ## Verification evidence
 
 All commands ran on Windows in this worktree
-(`C:\Users\nutyo\orca\workspaces\fail2commit\f2c-review-wave2`) with Cargo
+(`<workspace>\f2c-review-wave2`) with Cargo
 `-j 2`, disposable temp state and no network beyond loopback fixtures.
 
 | Command | Exit | Evidence |

@@ -9,7 +9,7 @@
 ## 1. Commands Run
 
 All commands ran from the worktree root
-`C:\Users\nutyo\orca\workspaces\fail2commit\f2c-t006-scan` unless noted.
+`<workspace>\f2c-t006-scan` unless noted.
 
 ### Windows 11 host (`x86_64-pc-windows-gnu`, Rust stable)
 
