@@ -6,7 +6,7 @@
 //! (bundled `tar` 7.5.22, `strip: 1`, links dropped, `.gitignore` renamed),
 //! probed on 2026-11-09. Tests named `control_*` document inputs that already
 //! behave safely; `rn2_*` tests are reproductions and fail until fixed.
-//! See docs/verify/REREVIEW2-2026-11-09-npm.md.
+//! See docs/verify/reviews/REREVIEW2-2026-11-09-npm.md.
 
 mod npm_support;
 

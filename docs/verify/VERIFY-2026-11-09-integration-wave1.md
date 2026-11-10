@@ -37,9 +37,9 @@ Branches in this wave: T-001 `9828da7`, T-002 `6f649d9`, T-003 `24e352c`, T-008 
 
 | Round | Report | Outcome |
 |---|---|---|
-| Review | `docs/verify/REVIEW-2026-11-09-wave1.md` | W1-001..W1-005 found (3 high) |
-| Re-review 1 | `docs/verify/REREVIEW-2026-11-09-wave1.md` | W1-002..005 fixed; W1-001 partial; R1-001..006 found |
-| Re-review 2 | `docs/verify/REREVIEW2-2026-11-09-git.md` | R1-001..003 fixed (class closed); R2-001..003 found |
+| Review | `docs/verify/reviews/REVIEW-2026-11-09-wave1.md` | W1-001..W1-005 found (3 high) |
+| Re-review 1 | `docs/verify/reviews/REREVIEW-2026-11-09-wave1.md` | W1-002..005 fixed; W1-001 partial; R1-001..006 found |
+| Re-review 2 | `docs/verify/reviews/REREVIEW2-2026-11-09-git.md` | R1-001..003 fixed (class closed); R2-001..003 found |
 | Fix | `5142237` | R2-001..003 fixed; the reviewer's reproductions `rereview2_git.rs` pass |
 
 Every reviewer reproduction (`review_wave1.rs`, `rereview_wave1.rs`, `rereview2_git.rs`) is a permanent regression test.

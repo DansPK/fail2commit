@@ -1,34 +1,46 @@
 ---
-name: Bug Report
-about: Report a problem with the skeleton template
+name: Bug report
+about: Something in fail2commit does not work as documented
 title: "[Bug] "
 labels: bug
 assignees: ''
 ---
 
-## Describe the Bug
+<!-- Security issue? Do not file it here. See SECURITY.md for private reporting. -->
+<!-- Use synthetic secrets and disposable repositories only. Remove tokens and private URLs from any output. -->
 
-A clear description of what the bug is.
+## What happened
 
-## Steps to Reproduce
+## What you expected
 
-1. Copy skeleton to new project
-2. ...
-3. ...
+## Steps to reproduce
 
-## Expected Behavior
-
-What you expected to happen.
-
-## Actual Behavior
-
-What actually happened.
+1.
+2.
+3.
 
 ## Environment
 
-- OS: [e.g., Windows 11, macOS 14, Ubuntu 24.04]
-- Claude Code version: [e.g., 1.0.0]
+- fail2commit version (`fail2commit --version`):
+- OS and version (for example Windows 11 24H2, Debian 13, Arch):
+- Shell (PowerShell, cmd, Git Bash, bash, zsh):
+- Command and package manager versions (for example `git --version`, `npm --version`, `pip --version`):
+- Installed with (setup.exe, .deb, pacman, binary, source):
 
-## Additional Context
+## Output
 
-Any other context, screenshots, or logs.
+<details><summary><code>fail2commit status</code></summary>
+
+```text
+
+```
+
+</details>
+
+<details><summary>Command output</summary>
+
+```text
+
+```
+
+</details>

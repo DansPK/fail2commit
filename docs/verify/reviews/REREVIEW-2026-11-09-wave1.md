@@ -3,7 +3,7 @@
 Date: 2026-11-09
 Candidate: `DansPK/f2c-int-wave1` @ `d163faa` (reviewed worktree branch `DansPK/f2c-rereview-wave1`)
 Fix diffs: `git diff 0a88dca..63389f4` (W1-001..003), `git show 61551a6` (W1-004/005)
-Earlier review: `docs/verify/REVIEW-2026-11-09-wave1.md`
+Earlier review: `docs/verify/reviews/REVIEW-2026-11-09-wave1.md`
 
 **Verdict: NOT ready to merge.** W1-002, W1-003, W1-004 and W1-005 are fixed. W1-001 is only partially fixed: the specific `refs/remotes/**` bypass is closed, but the same class (repository state that changes what the scanner sees) remains through replace refs, and through `secret-scan` and non-commit tips. Three new High findings (R1-001..R1-003) have failing reproductions in `crates/fail2commit/tests/rereview_wave1.rs`. No product code was changed.
 

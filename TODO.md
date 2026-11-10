@@ -1,7 +1,7 @@
 # fail2commit task board
 Coordinator owns this file and marks claims on the integration branch before dispatch. Workers use the claim in their task brief and do not edit this board. The coordinator may copy the claim into the worker baseline so edit guards see it.
 
-Integration branch: `DansPK/f2-commit-coordinator`. Release candidate built from `4559bab` (`DansPK/f2c-release-a026090`); evidence in `docs/verify/VERIFY-2026-11-09-release.md`. Change requests CR-001 to CR-012 are in `docs/change-requests.md`.
+Integration branch: `main` (one PR per change). Release candidate built from `2888aec` by the GitHub `release-candidate` workflow; evidence in `docs/verify/VERIFY-2026-11-09-release.md`. Change requests CR-001 to CR-012 are in `docs/change-requests.md`.
 
 **Concurrency limit:** run 3 workers in parallel by default, 4 only when CPU and RAM have headroom, with cargo `-j 2`; WSL/Docker is capped at 4 CPUs and 16 GB. If Codex runs out of usage, its task moves to Cline DeepSeek or Claude.
 

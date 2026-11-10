@@ -1,6 +1,6 @@
 ---
-name: Feature Request
-about: Suggest an improvement to the skeleton template
+name: Feature request
+about: Suggest an improvement or a new package manager to guard
 title: "[Feature] "
 labels: enhancement
 assignees: ''
@@ -8,16 +8,12 @@ assignees: ''
 
 ## Problem
 
-What problem does this solve? What's missing from the current skeleton?
+What are you trying to do, and what gets in the way?
 
-## Proposed Solution
+## Proposed change
 
-Describe the change you'd like to see.
+## Alternatives you considered
 
-## Alternatives Considered
+## Related roadmap item
 
-Any other approaches you've thought about.
-
-## Additional Context
-
-Examples, mockups, or references that help explain the request.
+Check the roadmap in TODO.md. If an existing item (for example P-301 pnpm) covers this, name it here.

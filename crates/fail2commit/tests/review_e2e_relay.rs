@@ -1,7 +1,7 @@
 //! Regression tests for the independent review of CR-009 (ER-001..ER-003) and
 //! its CR-010 redesign: the password never crosses the relay, the relay is
 //! single use and bounded, the token never reaches a chained hook, and only the
-//! Git hook is a relay client. See docs/verify/REVIEW-2026-11-09-e2e-relay.md.
+//! Git hook is a relay client. See docs/verify/reviews/REVIEW-2026-11-09-e2e-relay.md.
 
 mod e2e_support;
 

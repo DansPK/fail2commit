@@ -96,8 +96,8 @@ The dependency review used the resolved registry sources for `sandboxrs-windows-
 ## 7. Fix pass for review findings S7B-001..013 (2026-11-09)
 
 > **Branch:** `DansPK/f2c-fix-t007b` (this worktree); final SHA in
-> `docs/verify/FIX-T007B-SUMMARY.md`
-> **Findings addressed:** `docs/verify/REVIEW-2026-11-09-t007b.md` §2, S7B-001..013
+> `docs/verify/reviews/FIX-T007B-SUMMARY.md`
+> **Findings addressed:** `docs/verify/reviews/REVIEW-2026-11-09-t007b.md` §2, S7B-001..013
 > **Author:** T-007b fix pass (a different agent from the reviewer and the original author)
 
 Every finding was fixed rather than re-documented. Two findings changed the *product* contract and are

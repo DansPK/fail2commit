@@ -43,7 +43,7 @@ needed). Warm = median of N repeats (N = 20; scans 6). p95 over the same runs.
 | `scan` 500 pkgs, empty cache / warm median | 2606 / 43.7 ms | 213 / 5.8 ms |
 | Stub requests, cold / warm (500 pkgs) | 8 / 0 | 8 / 0 |
 | Advisory cache after 50 / 200 / 500 lookups | 1,700 / 6,800 / 17,000 B (50 / 200 / 500 files, 34 B each) | same |
-| Native build peak memory (sandbox) | Pending (T-007b, AppContainer backend not implemented) | 22,960 to 23,164 KB largest process (5 runs), gcc 0.04 s, 0.10 s wall incl. staging and export |
+| Native build peak memory (sandbox) | Not measured yet (the AppContainer backend has landed; re-run the Windows bench) | 22,960 to 23,164 KB largest process (5 runs), gcc 0.04 s, 0.10 s wall incl. staging and export |
 
 Notes on method and limits of the evidence:
 
@@ -62,12 +62,11 @@ Notes on method and limits of the evidence:
 
 ### Pending
 
-- Windows sandbox native-build memory: pending T-007b. `bench.py` probes
-  `sandbox status` and records `PENDING` while the backend reports
-  unavailable; re-run `scripts/bench/run.ps1 -SkipBuild` once T-007b lands
-  (the Windows leg needs a native toolchain the AppContainer job can use; add
-  a Windows fixture program to `bench.py` `native_build` at that point, because
-  the current one needs `/usr/bin/gcc` and python3).
+- Windows sandbox native-build memory: not measured yet. The AppContainer
+  backend has landed, but the Windows leg still needs a native fixture that the
+  AppContainer job can build: add one to `bench.py` `native_build` (the current
+  fixture needs `/usr/bin/gcc` and python3), then re-run
+  `scripts/bench/run.ps1 -SkipBuild`.
 - Peak memory of a realistic (not hello-world) native build on either OS.
 - `run` input staging cost (`artifact_max_bytes`, `graph_max_nodes` copy
   budget) and `job_timeout_secs` have no measurement.

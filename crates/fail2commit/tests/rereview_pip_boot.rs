@@ -3,7 +3,7 @@
 //! Every test here is an attempt to defeat the `-I -S` bootstrap
 //! (`pip::interp::BOOT`) or the `pip.startup` approval finding. A test fails
 //! when the attempt works; the failure message carries the RP-### id used in
-//! `docs/verify/REREVIEW-2026-11-09-pip.md`. All state is disposable and the
+//! `docs/verify/reviews/REREVIEW-2026-11-09-pip.md`. All state is disposable and the
 //! only network is the loopback fixture index.
 //!
 //! Fixed (FR-005): these are now regression tests that assert the secure
