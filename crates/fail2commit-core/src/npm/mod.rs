@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 pub use cmdline::{parse, Action, Request, Verb};
 pub use commit::CrashPoint;
+pub use signatures::{builtin_keys, forget as forget_signing_keys, PinnedKey, PinnedKeys};
 
 /// npm shim integration for `fail2commit setup`.
 pub fn integration() -> Option<Box<dyn Integration>> {
@@ -71,6 +72,9 @@ pub struct Deps<'a> {
     pub inspect: InspectFn<'a>,
     /// Test seam: simulate the process dying during commit.
     pub crash: Option<CrashPoint>,
+    /// Registries whose signing keys are built in (CR-018); production uses
+    /// [`builtin_keys`], tests pin their loopback registry.
+    pub pinned_keys: Vec<PinnedKeys>,
 }
 
 impl<'a> Deps<'a> {
@@ -88,6 +92,7 @@ impl<'a> Deps<'a> {
             }),
             inspect: Box::new(crate::scan::inspect_scripts),
             crash: None,
+            pinned_keys: builtin_keys(),
         }
     }
 }

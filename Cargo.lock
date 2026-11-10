@@ -388,6 +388,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "hex",
+ "hmac",
  "libc",
  "p256",
  "regex",

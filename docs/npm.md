@@ -131,48 +131,96 @@ CR-018 (P-108). Before any artifact in the plan is downloaded, the guard checks 
 signature on it. The npm registry signs each version with ECDSA P-256 over
 `<name>@<version>:<integrity>`, and so do mirrors that support signing.
 
-- **Keys.** The guard fetches `<registry>/-/npm/v1/keys` and caches the answer in the trusted
-  cache directory (`npm-signatures/`) for `signatures.keys_ttl_secs` (default 24 hours). The
-  answer may be at most 64 KiB and list at most 32 keys. Keys of a type other than
-  `ecdsa-sha2-nistp256` are ignored.
-- **Registry does not sign.** If the keys endpoint returns 404, the install gets one
-  `incomplete_scan` finding that needs approval: "registry X publishes no signing keys;
-  signatures not verified".
-- **Keys cannot be read.** Any other failure (a network error, another HTTP status, malformed
-  JSON, an empty key list, a bad key) is a `signature_invalid` deny. The check could not run, so
-  nothing in the plan counts as verified.
-- **Per package.** The guard reads `dist.signatures` for the exact `name@version` from the
-  abbreviated metadata (`Accept: application/vnd.npm.install-v1+json`). It falls back to the
-  full document when the abbreviated one has no signatures. It also uses the full document when
-  the signing key has an expiry, because only that document has the per-version publish `time`.
-  A metadata response may be at most 64 MiB. Up to 8 packages are checked at once. Redirects
-  are refused.
-- **A `signature_invalid` deny** happens for any of these:
+### Which keys are trusted
+
+- **registry.npmjs.org.** Only npm's public signing keys built into fail2commit count. They were
+  copied from `https://registry.npmjs.org/-/npm/v1/keys` on 2026-11-10. The registry's keys
+  endpoint is still read, but it can only choose among the built-in keys; a key it lists that
+  fail2commit does not ship is never trusted. An artifact signed only by an unknown key is a deny:
+  "signed with a key this fail2commit version does not know; update fail2commit". So when npm
+  rotates its keys, installs of newly signed packages are blocked until you update fail2commit.
+- **Any other registry: trust on first use.** The first key set the registry publishes is
+  recorded in the private state directory (`npm-signatures/`, one file per registry). Each record
+  carries an HMAC-SHA256 tag, keyed by a random per-user secret (`npm-signatures.key` in the same
+  directory). A record that was edited, copied from another registry, or whose secret is gone is
+  a deny. A later, different key set is a deny that names the registry and the command to
+  re-trust it:
+
+  ```sh
+  fail2commit signatures forget <registry-url>
+  ```
+
+  `forget` removes the record and prints what it removed; the next install records the keys the
+  registry serves then. Run it only when you know why the keys changed.
+- The keys endpoint is asked again once `signatures.keys_ttl_secs` (default 24 hours) has passed
+  since the record was last confirmed; before that, the record is used as it is. Nothing
+  security-relevant is cached untagged.
+
+### When the registry publishes no keys
+
+The keys endpoint returning 404 is:
+
+- a deny for registry.npmjs.org, and for any registry whose keys were recorded earlier ("now
+  publishes none", with the `forget` command);
+- for a registry never seen before, one `incomplete_scan` finding that needs approval: "registry X
+  publishes no signing keys; signatures not verified". The registry is then recorded as unsigned,
+  and later installs from it get the same approval finding ("recorded as unsigned on first use").
+  If it later starts serving keys, they are recorded and checked from then on.
+
+Any other failure of the keys endpoint (a network error, another HTTP status, malformed JSON, an
+empty key list, a bad key) is a `signature_invalid` deny. The check could not run, so nothing in
+the plan counts as verified.
+
+### Per package
+
+- The guard reads `dist.signatures` for the exact `name@version` from the abbreviated metadata
+  (`Accept: application/vnd.npm.install-v1+json`). It falls back to the full document when the
+  abbreviated one has no signatures, when the signing key has an expiry, or when the provenance
+  check needs publish times; only the full document has the per-version `time` map.
+- Metadata is streamed into typed structs that keep only `versions[*].dist` (integrity,
+  signatures, attestations) and `time`; the rest is skipped, so a large document is never held in
+  memory. One document may be at most 64 MiB (or `limits.artifact_max_bytes`, if smaller). Up to 8
+  packages are checked at once. Redirects are refused.
+- A document over that limit is an `incomplete_scan` finding that needs approval, not a deny: the
+  signature of that package was not checked, and nothing is known to be wrong with it.
+- A `signature_invalid` deny happens for any of these:
   - the version has no signature;
-  - no signature has a `keyid` matching a registry key;
+  - no signature has a `keyid` matching a trusted key;
   - the signature does not verify;
   - the metadata `dist.integrity` differs from the lockfile integrity;
   - the key had expired when the version was published, or the publish time is missing so expiry
     cannot be checked.
 
   A deny blocks the install before anything is downloaded, and nothing in the project changes.
-  As npm does, expiry is compared with the publish time. A key that has expired since then still
-  verifies the versions it signed earlier. On `registry.npmjs.org` that covers most packages
-  published before 2025-01-29.
-- **Provenance.** A version counts as having build provenance when its metadata has
-  `dist.attestations.provenance`. If this version has none but an earlier version of the same
-  package does (earlier by semver), the install gets a `provenance_missing` finding that needs
-  approval: "earlier versions were published with build provenance; this one was not (possible
-  hijacked account)". A package that never had provenance gets no finding.
-- **Turning it off.** `signatures.verify = false` in `settings.toml` skips all of the above, and
-  `fail2commit status` prints "npm registry signature checks are off".
+- **Key expiry uses the registry's publish time.** As npm does, a key's `expires` is compared with
+  the `time` the registry reports for the version, not with today's date. A key that expired since
+  then still verifies the versions it signed earlier; on registry.npmjs.org that covers most
+  packages published before 2025-01-29. The publish time comes from the same metadata as the
+  signature and is not itself signed, so a registry that serves a forged earlier time can make an
+  expired key count again. That needs the expired key's private part as well; the check stops a
+  tampered tarball or lockfile, not a registry that holds npm's old signing key.
 
-Limits:
+### Provenance
+
+A version counts as having build provenance when its metadata has `dist.attestations.provenance`.
+If this version has none but a version of the same package *published before it* had provenance,
+the install gets a `provenance_missing` finding that needs approval: "earlier versions were
+published with build provenance; this one was not (possible hijacked account)". "Before" is by the
+registry's `time` map, so a backport numbered below the first version with provenance but
+published after it also warns. Semver order is used only when a publish time is missing. A
+package that never had provenance gets no finding.
+
+### Turning it off
+
+`signatures.verify = false` in `settings.toml` skips all of the above, and `fail2commit status`
+prints "npm registry signature checks are off".
+
+### Limits
 
 - Sigstore provenance is **not verified**. The guard only reads whether provenance is present.
   It does not check the Fulcio certificate chain, the Rekor transparency-log entry, or which
   repository and workflow built the package.
-- The signing keys come from the same registry as the packages. The check catches a tampered
-  artifact, metadata or lockfile from a mirror, cache or proxy. It does not catch a registry
-  that has itself been compromised.
-- Prerelease tags are compared as whole strings when deciding which version is earlier.
+- For registries other than registry.npmjs.org, the first key set is trusted as served. A registry
+  that is already compromised the first time fail2commit sees it is not detected.
+- A registry recorded as unsigned stays unverified; each install from it needs approval.
+- Prerelease tags are compared as whole strings when semver decides which version is earlier.
