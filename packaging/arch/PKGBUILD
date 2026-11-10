@@ -8,7 +8,7 @@
 # scripts/release/build-arch.sh does the same in a clean archlinux container.
 
 pkgname=fail2commit
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='Guards Git pushes and npm/pip installs with explicit, operation-bound approval and a sandbox'
 arch=('x86_64')
