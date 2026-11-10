@@ -92,15 +92,25 @@ pub fn print_response(r: &Response, json: bool) {
         println!("{}", serde_json::to_string(r).expect("response serializes"));
         return;
     }
+    // Targets, locations and evidence can carry package-controlled text, so
+    // strip terminal control sequences before printing.
+    use fail2commit_core::approval::console::sanitize;
     for f in &r.findings {
         let target = f
             .target
             .as_deref()
-            .map(|t| format!(" [{t}]"))
+            .map(|t| format!(" [{}]", sanitize(t)))
+            .unwrap_or_default();
+        let location = f
+            .location
+            .as_deref()
+            .map(|l| format!(" at {}", sanitize(l)))
             .unwrap_or_default();
         eprintln!(
-            "fail2commit: {:?} {:?}{target}: {}",
-            f.action, f.kind, f.evidence
+            "fail2commit: {:?} {:?}{target}{location}: {}",
+            f.action,
+            f.kind,
+            sanitize(&f.evidence)
         );
     }
     if !r.message.is_empty() {

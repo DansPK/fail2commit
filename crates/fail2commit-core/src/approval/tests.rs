@@ -499,3 +499,21 @@ fn terminal_rendering_neutralizes_escapes() {
     assert!(text.contains("\\u{1b}") && !text.contains("tok@"));
     assert!(text.contains("\"approve\""));
 }
+
+#[test]
+fn terminal_rendering_shows_the_finding_location_sanitized() {
+    use crate::protocol::{Finding, FindingAction, FindingKind};
+    let mut r = request(false, 60);
+    r.findings = vec![Finding::new(
+        FindingKind::SuspiciousCode,
+        FindingAction::Approve,
+        "npm.code",
+        "runs hidden code",
+    )
+    .target("npm:p@1.0.0")
+    .location(format!("lib/{}[31mx.js:7", '\u{1b}'))];
+    let text = channels::render(&r);
+    assert!(text.contains("[npm:p@1.0.0] at lib/"), "{text}");
+    assert!(text.contains("x.js:7: runs hidden code"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+}

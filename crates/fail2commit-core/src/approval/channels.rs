@@ -64,12 +64,19 @@ pub(crate) fn render(req: &ApprovalRequest) -> String {
             .as_deref()
             .map(|t| format!(" [{}]", sanitize(t)))
             .unwrap_or_default();
+        // File and line come from package contents: untrusted, so sanitised.
+        let location = f
+            .location
+            .as_deref()
+            .map(|l| format!(" at {}", sanitize(l)))
+            .unwrap_or_default();
         s.push_str(&format!(
-            "  {:?} {:?} ({}){}: {}\n",
+            "  {:?} {:?} ({}){}{}: {}\n",
             f.action,
             f.kind,
             sanitize(&f.source),
             target,
+            location,
             sanitize(&f.evidence)
         ));
     }
