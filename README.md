@@ -77,6 +77,8 @@ Run `fail2commit help <command>` for the options.
 
 ## Documentation
 
+The full index is [docs/README.md](docs/README.md). The most used guides:
+
 | Topic | Document |
 |---|---|
 | Installing and removing | [docs/install.md](docs/install.md) |

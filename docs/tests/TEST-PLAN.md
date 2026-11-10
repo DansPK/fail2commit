@@ -1,5 +1,5 @@
 # MVP test plan
-All cases are planned. Use disposable repositories, synthetic credentials and package fixtures, and local test endpoints. Record exact commands, platform, version and results in a verification report.
+Results for each case are in the verify reports under `docs/verify/`; start with `VERIFY-2026-11-09-release.md`. Use disposable repositories, synthetic credentials and package fixtures, and local test endpoints. Record exact commands, platform, version and results in a verification report.
 | ID | Requirement | Expected evidence |
 |---|---|---|
 | TC-001 | FR-001 | Normal push passes. Forced refspecs, mirror rewrites and a deleted outgoing .env pause. |

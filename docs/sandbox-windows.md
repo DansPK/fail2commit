@@ -2,7 +2,7 @@
 
 This document records the T-007b review, the controls the Windows backend enforces, and the
 dependency decision the coordinator has to make. It supersedes the 2026-11-08 text and covers the
-2026-11-09 fix pass for review findings S7B-001..013 (`docs/verify/REVIEW-2026-11-09-t007b.md`).
+2026-11-09 fix pass for review findings S7B-001..013 (`docs/verify/reviews/REVIEW-2026-11-09-t007b.md`).
 
 ## 1. Dependency decision (S7B-009)
 
@@ -127,7 +127,7 @@ Verified on Windows NT `10.0.26200.0` with `rustc 1.99.1`, `cargo 1.99.1`, `-j 2
 `--test sandbox_windows_matrix --test review_t007b_paths --test review_t007b_tempdir
 --test review_t007b_systemroot` (6 passed / 1 ignored, 3 passed, 1 passed, 1 passed), plus
 `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -j 2 -- -D warnings`.
-Exact commands, exit codes and the tested SHA are in `docs/verify/FIX-T007B-SUMMARY.md`.
+Exact commands, exit codes and the tested SHA are in `docs/verify/reviews/FIX-T007B-SUMMARY.md`.
 
 Qualification: grants are structurally confined to the stage root, and the hard-link regression
 compares the DACL of an outside file before and after the refusal with `icacls`, so "no real checkout,

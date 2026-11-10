@@ -83,7 +83,7 @@ cargo test --workspace --no-fail-fast
 
 ## Update 2026-11-09: wave-1 review fixes W1-001..W1-003 (FR-001, FR-002)
 
-Source: `docs/verify/REVIEW-2026-11-09-wave1.md`. Branch `DansPK/f2c-fix-wave1-git`, based on `0a88dca`.
+Source: `docs/verify/reviews/REVIEW-2026-11-09-wave1.md`. Branch `DansPK/f2c-fix-wave1-git`, based on `0a88dca`.
 
 | Finding | Fix | Evidence |
 |---|---|---|
@@ -99,7 +99,7 @@ Real approval channels still need a console or tray run (Pending, see section 2)
 
 ## Update 2026-11-09 (2): re-review fixes R1-001, R1-002, R1-003, R1-005 (FR-001, FR-003)
 
-Source: `docs/verify/REREVIEW-2026-11-09-wave1.md`. Branch `DansPK/f2c-fix-rereview-git`, based on `d40f6f2`.
+Source: `docs/verify/reviews/REREVIEW-2026-11-09-wave1.md`. Branch `DansPK/f2c-fix-rereview-git`, based on `d40f6f2`.
 
 | Finding | Fix | Evidence (`rereview_wave1`) |
 |---|---|---|

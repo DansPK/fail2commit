@@ -1,7 +1,7 @@
 # Fix summary: T-007b Windows AppContainer review findings S7B-001..013
 
 > **Requirement:** FR-007 (SPEC-007, TC-007)
-> **Task brief:** `FIX-t007b.md` (fix pass for `docs/verify/REVIEW-2026-11-09-t007b.md`)
+> **Task brief:** `FIX-t007b.md` (fix pass for `docs/verify/reviews/REVIEW-2026-11-09-t007b.md`)
 > **Branch:** `DansPK/f2c-fix-t007b`
 > **Fix commit (tested tree; everything except this summary):** `a4ca8fbf17a1456c7d8c3b4e6ab0740dfe7425bc`
 > **Final branch tip:** print it with `git log -1 --format=%H`; the tip is the commit that adds this
