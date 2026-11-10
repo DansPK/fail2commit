@@ -7,7 +7,7 @@ shims; run `fail2commit setup` explicitly when you are ready to enable them.
 
 ## Windows x64 Setup.exe
 
-Run the signed `fail2commit-<version>-windows-x64-setup.exe` as the intended
+Run `fail2commit-<version>-setup.exe` (not yet code-signed; SmartScreen warns) as the intended
 desktop user, then run `fail2commit setup`. Use **Apps > Installed apps >
 fail2commit > Uninstall** to remove the application. Before removing the
 application, `fail2commit uninstall-integrations` removes only integration
