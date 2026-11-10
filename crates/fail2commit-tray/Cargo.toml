@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-fail2commit-core = { version = "0.1.2", path = "../fail2commit-core" }
+fail2commit-core = { version = "0.1.3", path = "../fail2commit-core" }
 serde_json = "1.0.154"
 
 [target."cfg(windows)".dependencies]

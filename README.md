@@ -56,7 +56,7 @@ It is free, written in Rust, and needs no account or cloud service.
 
 ## Project status
 
-**0.1.2 is a preview** for technical users and testers.
+**0.1.3 is a preview** for technical users and testers.
 
 **What has been tested:**
 - Clean Windows 10 and 11, Debian, and Arch Linux VMs.
@@ -78,12 +78,12 @@ Download the file for your platform and `SHA256SUMS` from [GitHub Releases](http
 
 | Platform | File | Install |
 |---|---|---|
-| Windows 10/11 x64 | `fail2commit-0.1.2-setup.exe` | Run it as your normal user. It asks for administrator rights to guard the machine-wide npm and pip |
-| Debian / Ubuntu amd64 | `fail2commit_0.1.2_amd64.deb` | `sudo dpkg -i fail2commit_0.1.2_amd64.deb` |
-| Arch and Arch-based x86_64 | `fail2commit-0.1.2-1-x86_64.pkg.tar.zst` | `sudo pacman -U fail2commit-0.1.2-1-x86_64.pkg.tar.zst`, or `makepkg -si` with [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) |
-| Other Linux x86_64 | `fail2commit-0.1.2-linux-amd64` | Copy it onto your PATH |
-| From source | `fail2commit-0.1.2-src.tar.gz` | Offline build, with the crates vendored. See [docs/install.md](docs/install.md) |
-| VS Code | `fail2commit-0.1.2.vsix` | `code --install-extension fail2commit-0.1.2.vsix` |
+| Windows 10/11 x64 | `fail2commit-0.1.3-setup.exe` | Run it as your normal user. It asks for administrator rights to guard the machine-wide npm and pip |
+| Debian / Ubuntu amd64 | `fail2commit_0.1.3_amd64.deb` | `sudo dpkg -i fail2commit_0.1.3_amd64.deb` |
+| Arch and Arch-based x86_64 | `fail2commit-0.1.3-1-x86_64.pkg.tar.zst` | `sudo pacman -U fail2commit-0.1.3-1-x86_64.pkg.tar.zst`, or `makepkg -si` with [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) |
+| Other Linux x86_64 | `fail2commit-0.1.3-linux-amd64` | Copy it onto your PATH |
+| From source | `fail2commit-0.1.3-src.tar.gz` | Offline build, with the crates vendored. See [docs/install.md](docs/install.md) |
+| VS Code | `fail2commit-0.1.3.vsix` | `code --install-extension fail2commit-0.1.3.vsix` |
 
 On Linux the sandbox needs `bubblewrap`. Node.js/npm and Python are needed only for their own guards. Full instructions, including removal, are in [docs/install.md](docs/install.md).
 
@@ -130,9 +130,9 @@ Run `fail2commit help <command>` for all options. The guides are listed in the [
 These items are planned, not promised, and each one starts with an approved requirement. The detailed plan, with the exit check for each item, is in [TODO.md](TODO.md#production-roadmap-proposed-not-yet-approved).
 
 ### 0.1.3: signatures
-- [ ] Verify npm registry signatures and Sigstore provenance for every package before it installs; PyPI attestations next.
-- [ ] HTTPS-only, tamper-evident advisory data from OSV.
-- [ ] An offline copy of the OpenSSF malicious-packages list, pinned and hash-checked, so known malware is blocked without network.
+- [x] Verify npm registry signatures before anything installs, with npm's signing keys built in and trust-on-first-use for other registries; warn when a version drops the build provenance earlier versions had. Full Sigstore bundle verification and PyPI attestations are next.
+- [x] HTTPS-only OSV with no redirects, and an HMAC-tagged advisory cache.
+- [x] `fail2commit malware-list update`: a pinned, hash-checked offline copy of the OpenSSF malicious-packages list, so known malware is blocked without network.
 
 ### 0.2: close the gaps
 - [ ] Code-sign the Windows binaries and installer.
