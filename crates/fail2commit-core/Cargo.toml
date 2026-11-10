@@ -22,6 +22,7 @@ ureq = "3.5.1"
 zeroize = "1.9.1"
 zip = { version = "9.4.2", default-features = false, features = ["deflate"] }
 tempfile = "3.27.0"
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.191"

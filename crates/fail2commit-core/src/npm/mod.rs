@@ -21,6 +21,7 @@ mod review;
 mod runner;
 mod scripts;
 mod shim;
+mod signatures;
 mod stage;
 pub use stage::sweep_stale;
 mod tree;
@@ -271,7 +272,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     // 3. Review the exact graph: verified tarballs, extracted by npm itself
     //    (scripts off) into the staging tree, reviewed from disk.
     let plan = lockfile::parse(&final_lock, &registry, deps.settings.limits.graph_max_nodes)?;
-    let mut reviewed = review::review(deps, &plan, &sd.join("tarballs"))?;
+    let mut reviewed = review::review(deps, &registry, &plan, &sd.join("tarballs"))?;
     apply::seed_cache(deps, &tc, &st, &reviewed)?;
     apply::npm_step(deps, &tc, &st, &proj_stage, &["ci"], &["--offline".into()])?;
     // Hashed before the review reads anything: a later difference is a change.

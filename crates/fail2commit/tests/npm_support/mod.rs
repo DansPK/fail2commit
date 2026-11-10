@@ -1,5 +1,6 @@
 //! Shared helpers for the npm tests (T-004): an offline loopback registry
-//! that serves packuments and tarballs built at test time, disposable
+//! that serves packuments and tarballs built at test time, signed (CR-018)
+//! with a P-256 key generated per registry, disposable
 //! project/home directories, and doubles for the collaborating areas.
 #![allow(dead_code)]
 
@@ -13,6 +14,9 @@ use fail2commit_core::policy::{script_decision, ScriptDecision, ScriptSituation}
 use fail2commit_core::protocol::{ApprovalRequest, Decision, Finding};
 use fail2commit_core::scan::{AdvisoryReport, PackageId, ScriptFile};
 use fail2commit_core::settings::Settings;
+use p256::ecdsa::signature::Signer as _;
+use p256::ecdsa::{Signature, SigningKey};
+use p256::pkcs8::EncodePublicKey as _;
 use sha2::Digest as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -43,7 +47,7 @@ pub fn tgz(files: &[(&str, &[u8])]) -> Vec<u8> {
     e.finish().unwrap()
 }
 
-fn sri(bytes: &[u8]) -> String {
+pub fn sri(bytes: &[u8]) -> String {
     format!(
         "sha512-{}",
         base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes))
@@ -66,6 +70,8 @@ pub struct Pkg {
     pub archive_version: Option<String>,
     /// Extra raw tar entries (hostile paths); written after package.json.
     pub raw_entries: Vec<(String, Vec<u8>)>,
+    /// Published with Sigstore build provenance (`dist.attestations`).
+    pub provenance: bool,
 }
 
 impl Pkg {
@@ -86,6 +92,10 @@ impl Pkg {
     }
     pub fn file(mut self, path: &str, body: &str) -> Pkg {
         self.files.push((path.into(), body.as_bytes().to_vec()));
+        self
+    }
+    pub fn provenance(mut self) -> Pkg {
+        self.provenance = true;
         self
     }
 
@@ -133,11 +143,37 @@ impl Pkg {
     }
 }
 
-#[derive(Default)]
+pub const KEYID: &str = "SHA256:loopback-test-key";
+
 struct RegState {
     packuments: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    /// Publish time per package and version (`time` map of the full doc).
+    times: BTreeMap<String, BTreeMap<String, String>>,
     tarballs: BTreeMap<String, Vec<u8>>,
+    /// Requests from npm and from the guard's tarball downloads.
     hits: Vec<String>,
+    /// Requests from the guard's signature check (keys and metadata).
+    sig_hits: Vec<String>,
+    signer: SigningKey,
+    key_expires: Option<String>,
+    /// Replaces the keys document: `(status line, body)`.
+    keys_response: Option<(String, Vec<u8>)>,
+}
+
+/// A fresh P-256 key from process randomness; no key material is stored.
+fn test_signer() -> SigningKey {
+    use std::hash::{BuildHasher, Hasher};
+    loop {
+        let mut h = sha2::Sha256::new();
+        for _ in 0..4 {
+            let mut x = std::collections::hash_map::RandomState::new().build_hasher();
+            x.write_u128(std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos());
+            h.update(x.finish().to_le_bytes());
+        }
+        if let Ok(k) = SigningKey::from_slice(&h.finalize()) {
+            return k;
+        }
+    }
 }
 
 pub struct Registry {
@@ -150,7 +186,16 @@ impl Registry {
     pub fn start() -> Registry {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let state = Arc::new(Mutex::new(RegState::default()));
+        let state = Arc::new(Mutex::new(RegState {
+            packuments: BTreeMap::new(),
+            times: BTreeMap::new(),
+            tarballs: BTreeMap::new(),
+            hits: vec![],
+            sig_hits: vec![],
+            signer: test_signer(),
+            key_expires: None,
+            keys_response: None,
+        }));
         let st = state.clone();
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
@@ -180,11 +225,35 @@ impl Registry {
         let file = format!("{}-{}.tgz", p.name.rsplit('/').next().unwrap(), p.version);
         let path = format!("/{}/-/{file}", p.name);
         let mut manifest = p.manifest(&p.version);
+        let integrity = sri(advertised);
+        let mut s = self.state.lock().unwrap();
+        let sig: Signature = s
+            .signer
+            .sign(format!("{}@{}:{integrity}", p.name, p.version).as_bytes());
         manifest["dist"] = serde_json::json!({
             "tarball": format!("{}{}", base.trim_end_matches('/'), path),
-            "integrity": sri(advertised),
+            "integrity": integrity,
+            "signatures": [{
+                "keyid": KEYID,
+                "sig": base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes()),
+            }],
         });
-        let mut s = self.state.lock().unwrap();
+        if p.provenance {
+            manifest["dist"]["attestations"] = serde_json::json!({
+                "url": format!("{}-/npm/v1/attestations/{}@{}", self.url, p.name, p.version),
+                "provenance": {"predicateType": "https://slsa.dev/provenance/v1"},
+            });
+        }
+        let n = s.times.values().map(BTreeMap::len).sum::<usize>();
+        s.times.entry(p.name.clone()).or_default().insert(
+            p.version.clone(),
+            format!(
+                "2026-01-01T{:02}:{:02}:{:02}.000Z",
+                n / 3600,
+                n / 60 % 60,
+                n % 60
+            ),
+        );
         s.packuments
             .entry(p.name.clone())
             .or_default()
@@ -227,6 +296,31 @@ impl Registry {
 "
     }
 
+    /// Change the published `dist` of `name@version` (tamper tests).
+    pub fn edit_dist(&self, name: &str, version: &str, f: impl FnOnce(&mut serde_json::Value)) {
+        let mut s = self.state.lock().unwrap();
+        f(&mut s
+            .packuments
+            .get_mut(name)
+            .unwrap()
+            .get_mut(version)
+            .unwrap()["dist"]);
+    }
+
+    /// Expiry of the signing key in the keys document (RFC 3339).
+    pub fn set_key_expires(&self, t: Option<&str>) {
+        self.state.lock().unwrap().key_expires = t.map(str::to_string);
+    }
+
+    /// Answer the keys endpoint with `status` (e.g. `404 Not Found`) and `body`.
+    pub fn set_keys_response(&self, status: &str, body: &[u8]) {
+        self.state.lock().unwrap().keys_response = Some((status.into(), body.to_vec()));
+    }
+
+    pub fn sig_hits(&self) -> Vec<String> {
+        self.state.lock().unwrap().sig_hits.clone()
+    }
+
     pub fn hits(&self) -> Vec<String> {
         self.state.lock().unwrap().hits.clone()
     }
@@ -252,11 +346,17 @@ fn serve(mut conn: TcpStream, st: Arc<Mutex<RegState>>) {
             Ok(n) => req.extend_from_slice(&buf[..n]),
         }
     }
-    let line = String::from_utf8_lossy(&req)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let text = String::from_utf8_lossy(&req).into_owned();
+    let line = text.lines().next().unwrap_or("").to_string();
+    let header = |name: &str| {
+        text.lines()
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let from_verifier = header("user-agent").starts_with("fail2commit-signatures/");
+    let corgi = header("accept").contains("application/vnd.npm.install-v1+json");
     let path = line
         .split_whitespace()
         .nth(1)
@@ -264,18 +364,43 @@ fn serve(mut conn: TcpStream, st: Arc<Mutex<RegState>>) {
         .replace("%2f", "/")
         .replace("%2F", "/");
     let mut s = st.lock().unwrap();
-    s.hits.push(path.clone());
-    let (status, ctype, body): (&str, &str, Vec<u8>) = if let Some(b) = s.tarballs.get(&path) {
+    if from_verifier {
+        s.sig_hits.push(path.clone());
+    } else {
+        s.hits.push(path.clone());
+    }
+    let keys_doc;
+    let (status, ctype, body): (&str, &str, Vec<u8>) = if path == "/-/npm/v1/keys" {
+        keys_doc = match &s.keys_response {
+            Some(r) => r.clone(),
+            None => {
+                let der = s.signer.verifying_key().to_public_key_der().unwrap();
+                let doc = serde_json::json!({"keys": [{
+                    "keyid": KEYID,
+                    "keytype": "ecdsa-sha2-nistp256",
+                    "scheme": "ecdsa-sha2-nistp256",
+                    "key": base64::engine::general_purpose::STANDARD.encode(der.as_bytes()),
+                    "expires": s.key_expires,
+                }]});
+                ("200 OK".to_string(), serde_json::to_vec(&doc).unwrap())
+            }
+        };
+        (keys_doc.0.as_str(), "application/json", keys_doc.1.clone())
+    } else if let Some(b) = s.tarballs.get(&path) {
         ("200 OK", "application/octet-stream", b.clone())
     } else if let Some(vers) = s.packuments.get(path.trim_start_matches('/')) {
         let name = path.trim_start_matches('/');
         let mut latest: Vec<&String> = vers.keys().collect();
         latest.sort();
-        let doc = serde_json::json!({
+        let mut doc = serde_json::json!({
             "name": name,
             "dist-tags": { "latest": latest.last().unwrap() },
             "versions": vers,
         });
+        // Like the real registry: the abbreviated document has no `time`.
+        if !corgi {
+            doc["time"] = serde_json::json!(s.times.get(name));
+        }
         (
             "200 OK",
             "application/json",
