@@ -5,32 +5,27 @@ Thanks for helping. Bug reports, test results on platforms we have not covered, 
 ## Before you start
 
 - For a security issue, follow [SECURITY.md](SECURITY.md) instead of opening an issue.
-- For a new feature or a change in behaviour, open an issue first. Behaviour is defined by approved requirements ([docs/requirements](docs/requirements/FRD.md)) and specs ([docs/specs](docs/specs/)). A change to either needs the maintainer's sign-off.
-- The task board and the roadmap are in [TODO.md](TODO.md).
+- For a new feature or a change in behaviour, open an issue first. Behaviour is defined by the approved [requirements](docs/dev/requirements/FRD.md) and [specs](docs/dev/specs/). A change to either needs the maintainer's sign-off and an entry in [change-requests.md](docs/dev/change-requests.md).
+- The roadmap and task board are in [TODO.md](TODO.md).
 
 ## Development setup
 
-See [SETUP.md](SETUP.md) to build, test, and enable the repository's own commit hooks.
+See [docs/dev/setup.md](docs/dev/setup.md) for the prerequisites, how to build and how to run the tests.
 
 ## Pull requests
 
-- **Cite an ID in every commit message**, for example `FR-004: ...`, `BUG-012: ...` or `CHORE-001: ...`. The commit-msg hook checks this.
-- **Add or update tests** for the behaviour you change. Security tests must use disposable repositories, synthetic secrets and local fixtures, never real credentials or live registries.
+- **Start each commit message with an ID:** the requirement, bug or chore it serves. For example `FR-004: ...`, `BUG-012: ...` or `CHORE-001: ...`.
+- **Add or update tests** for the behaviour you change. Security tests must use disposable repositories, synthetic secrets and local fixtures. Never use real credentials or live registries.
 - **Run the checks** before you push:
 
   ```sh
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets --locked -- -D warnings
   cargo test --workspace --locked
-  python .claude/hooks/trace_check.py
   ```
 
-- **Platform behaviour needs evidence from the real platform.** For a change to sandbox, PATH or installer behaviour, say in the PR which OS you tested on. Windows and Linux are both release gates (see [docs/tests/TEST-PLAN.md](docs/tests/TEST-PLAN.md)).
-- **Keep PRs focused**, one change per PR, and fill in the PR template.
-
-## AI coding agents
-
-[AGENTS.md](AGENTS.md) holds the rules for coding agents, which also apply to people. The hooks under `.claude/` and `.codex/` are development guards for this repository. They are not part of the product.
+- **Test platform behaviour on the real platform.** For a change to sandbox, PATH or installer behaviour, say in the PR which OS you tested on. Windows and Linux are both release gates (see [TEST-PLAN.md](docs/dev/tests/TEST-PLAN.md)). Record the evidence in a report under [docs/dev/verify/](docs/dev/verify/README.md).
+- **Keep each PR to one change**, and fill in the PR template.
 
 ## Code of conduct
 

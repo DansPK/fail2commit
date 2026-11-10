@@ -1,9 +1,7 @@
-# fail2commit task board
-Coordinator owns this file and marks claims on the integration branch before dispatch. Workers use the claim in their task brief and do not edit this board. The coordinator may copy the claim into the worker baseline so edit guards see it.
+# fail2commit task board and roadmap
+The MVP tasks below are done. The roadmap after them lists what is planned for 0.2 and later.
 
-Integration branch: `main` (one PR per change). Release candidate built from `2888aec` by the GitHub `release-candidate` workflow; evidence in `docs/verify/VERIFY-2026-11-09-release.md`. Change requests CR-001 to CR-012 are in `docs/change-requests.md`.
-
-**Concurrency limit:** run 3 workers in parallel by default, 4 only when CPU and RAM have headroom, with cargo `-j 2`; WSL/Docker is capped at 4 CPUs and 16 GB. If Codex runs out of usage, its task moves to Cline DeepSeek or Claude.
+Integration branch: `main` (one PR per change). Release `v0.1.0` (pre-release) built from `a9afcdf` by the GitHub `release-candidate` workflow; evidence in `docs/dev/verify/VERIFY-2026-11-09-release.md`. Change requests CR-001 to CR-012 are in `docs/dev/change-requests.md`.
 
 "Done" means implemented, independently security-reviewed until closed, merged, and passing the gate on both platforms. Requirement status stays `Approved` (not `Verified`) until the pending platform gates in the release report have evidence.
 
@@ -44,7 +42,7 @@ The MVP stops install-time attacks for npm and pip when the install goes through
 
 | ID | Task | Why | Exit | Depends on |
 |---|---|---|---|---|
-| P-201 | False-positive benchmark: install the top 500 npm and top 500 PyPI packages through the guard and record every prompt and deny | People switch off a guard that prompts on normal work; this is the number to drive down | Prompt rate and false-deny rate recorded in `docs/verify/`; 0 false denies on the corpus | - |
+| P-201 | False-positive benchmark: install the top 500 npm and top 500 PyPI packages through the guard and record every prompt and deny | People switch off a guard that prompts on normal work; this is the number to drive down | Prompt rate and false-deny rate recorded in `docs/dev/verify/`; 0 false denies on the corpus | - |
 | P-202 | Overhead budget: time the same installs with and without the guard (guarded esbuild took 26 s on Arch and 32 s on Windows; unguarded not yet measured) | Install speed decides adoption | Median overhead recorded, a target set in NFR-012 and met | P-201 |
 | P-203 | Review cache keyed by package integrity hash | Re-installs, CI runs and fresh clones rescan the same tarballs | A second install of an unchanged lockfile does no rescan and shows no prompt | - |
 | P-204 | Project approval file: approvals bound to the lockfile digest, which a team commits and reviews in a PR | One-time approvals repeat on every machine for every teammate (approval fatigue) | A teammate with the same lockfile gets no prompt; any lockfile change invalidates the approval | P-203 |

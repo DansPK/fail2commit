@@ -3,7 +3,7 @@
 //!
 //! Every test asserts the *safe* behaviour. They began as the reviewer's
 //! failing reproductions and now guard the fixes; tests marked "control"
-//! document what already held. See docs/verify/reviews/REREVIEW-2026-11-09-npmscan.md.
+//! document what already held. See docs/dev/verify/reviews/REREVIEW-2026-11-09-npmscan.md.
 
 mod npm_support;
 #[allow(dead_code)]

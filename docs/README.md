@@ -22,9 +22,9 @@
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Components and trust boundaries |
 | [sandbox-linux.md](sandbox-linux.md) | The bubblewrap and cgroup v2 sandbox |
 | [sandbox-windows.md](sandbox-windows.md) | The AppContainer sandbox |
-| [resources.md](resources.md) | CPU, memory and disk budgets, and how they are measured |
-| [e2e.md](e2e.md) | The end-to-end test harness |
-| [release.md](release.md) | Building and checking release packages |
+| [resources.md](dev/resources.md) | CPU, memory and disk budgets, and how they are measured |
+| [e2e.md](dev/e2e.md) | The end-to-end test harness |
+| [release.md](dev/release.md) | Building and checking release packages |
 
 ## Project records
 
@@ -32,10 +32,10 @@ These are the development records. You don't need them to use fail2commit.
 
 | Path | What it holds |
 |---|---|
-| [requirements/](requirements/) | Business, product and functional requirements (FR/NFR IDs) |
-| [specs/](specs/) | One technical spec per requirement |
-| [tests/TEST-PLAN.md](tests/TEST-PLAN.md) | Test cases and the release gates for each platform |
-| [traceability.md](traceability.md) | Requirement → spec → test → verify matrix |
-| [change-requests.md](change-requests.md) | Behaviour changes made during implementation |
-| [verify/](verify/README.md) | Test evidence and security reviews |
-| [WORKFLOW.md](WORKFLOW.md), [WRITING_STANDARD.md](WRITING_STANDARD.md), [agents/](agents/) | How the work is done, and the rules for coding agents |
+| [requirements/](dev/requirements/) | Business, product and functional requirements (FR/NFR IDs) |
+| [specs/](dev/specs/) | One technical spec per requirement |
+| [tests/TEST-PLAN.md](dev/tests/TEST-PLAN.md) | Test cases and the release gates for each platform |
+| [traceability.md](dev/traceability.md) | Requirement → spec → test → verify matrix |
+| [change-requests.md](dev/change-requests.md) | Behaviour changes made during implementation |
+| [verify/](dev/verify/README.md) | Test evidence and security reviews |
+| [setup.md](dev/setup.md) | Building and testing fail2commit yourself |

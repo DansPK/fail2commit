@@ -47,13 +47,13 @@ yarn-error.log*
 *.log
 logs/
 
-# Codex CLI local state
-# Keep .codex/config.toml (project config), ignore local state
-.codex/*.local
-.codex/history/
-
-# Agent plugin session state
-.claude/autoharness/
+# Local AI-agent tooling (hooks, skills, agent rules) is kept outside this
+# repository; never commit it here.
+.claude/
+.codex/
+.githooks/
+AGENTS.md
+CLAUDE.md
 
 # Packaged skills
 *.skill

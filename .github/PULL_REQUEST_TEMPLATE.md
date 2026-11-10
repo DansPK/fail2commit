@@ -1,26 +1,18 @@
 ## Summary
 
-Brief description of the change.
+What this changes, and why.
 
-## Traceability
+## Requirement
 
-- **Requirement IDs:** FR-### / BUG-### / CHORE-###
-- **Spec:** docs/specs/SPEC-###-*.md (or n/a for bug/chore)
-- **Test cases:** TC-###
-- **Verify report:** docs/verify/VERIFY-*.md
+- **ID:** FR-### / NFR-### / BUG-### / CHORE-###
+- **Spec / test cases:** docs/dev/specs/SPEC-###-*.md, TC-### (or n/a)
 
-## Changes
+## Testing
 
--
+- [ ] `cargo fmt`, `cargo clippy` and `cargo test --workspace --locked` pass
+- [ ] Tested on (OS and version):
+- [ ] For a platform behaviour change: evidence is in a report under `docs/dev/verify/`
 
-## Checklist
-
-- [ ] Tests for the linked TCs pass
-- [ ] `python .claude/hooks/trace_check.py` passes
-- [ ] `docs/traceability.md` and `TODO.md` updated
-- [ ] `DONE.md` entry added
-- [ ] No approved requirement changed without owner sign-off
-
-## Related Issues
+## Related issues
 
 Closes #

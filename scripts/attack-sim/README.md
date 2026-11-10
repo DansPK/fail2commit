@@ -25,6 +25,6 @@ block; nothing real is sent.
 - Windows: copy the files to `C:\f2c\atk`, install fail2commit, then run
   `attack_run.ps1` in the signed-in user's session.
 
-Expected results are recorded in `docs/verify/VERIFY-2026-11-09-release.md`
+Expected results are recorded in `docs/dev/verify/VERIFY-2026-11-09-release.md`
 (section 5e): with fail2commit every step is blocked and the host is
 byte-for-byte unchanged; the unguarded control succeeds at every step.

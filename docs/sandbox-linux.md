@@ -1,6 +1,6 @@
 # Linux sandbox (Bubblewrap) and Linux test harness
 
-> FR-007 · SPEC-007 · TC-007 · Task T-007a. Code: `crates/fail2commit-core/src/sandbox/{linux.rs,mod.rs}`, `crates/fail2commit/src/cmd/run.rs`. Evidence: `docs/verify/VERIFY-2026-11-08-sandbox-linux.md`.
+> FR-007 · SPEC-007 · TC-007 · Task T-007a. Code: `crates/fail2commit-core/src/sandbox/{linux.rs,mod.rs}`, `crates/fail2commit/src/cmd/run.rs`. Evidence: `docs/dev/verify/VERIFY-2026-11-08-sandbox-linux.md`.
 
 ## 1. How a job runs
 

@@ -1,5 +1,0 @@
-#!/bin/sh
-# Review staged protected paths without splitting filenames on whitespace.
-ROOT=$(git rev-parse --show-toplevel) || exit 1
-HOOKS="$ROOT/.claude/hooks"; [ -d "$HOOKS" ] || HOOKS="$ROOT/.codex/hooks"
-sh "$HOOKS/run.sh" protected_paths.py --staged
