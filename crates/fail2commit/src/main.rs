@@ -67,6 +67,8 @@ enum Command {
     Pip(cmd::pip::Args),
     /// Advisory and script checks for exact packages (T-006).
     Scan(cmd::scan::Args),
+    /// Offline OpenSSF malware list: update / status (CR-020).
+    MalwareList(cmd::malware_list::Args),
     /// Run a command in the sandbox with staged input (T-007).
     Run(cmd::run::Args),
     /// Sandbox on / off / status (T-008).
@@ -136,6 +138,7 @@ pub fn execute(cli: Cli, id: Option<String>) -> Response {
         Command::Npm(a) => cmd::npm::run(&ctx, a),
         Command::Pip(a) => cmd::pip::run(&ctx, a),
         Command::Scan(a) => cmd::scan::run(&ctx, a),
+        Command::MalwareList(a) => cmd::malware_list::run(&ctx, a),
         Command::Run(a) => cmd::run::run(&ctx, a),
         Command::Sandbox(a) => cmd::sandbox::run(&ctx, a),
         Command::MachineShims(a) => cmd::machine::run(&ctx, a),
