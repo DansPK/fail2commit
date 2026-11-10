@@ -14,6 +14,7 @@ pub mod scan;
 pub mod secrets;
 pub mod server;
 pub mod setup;
+pub mod signatures;
 
 use fail2commit_core::approval::ApprovalCtx;
 use fail2commit_core::approver::ApproverChoice;

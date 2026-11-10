@@ -145,6 +145,24 @@ impl Pkg {
 
 pub const KEYID: &str = "SHA256:loopback-test-key";
 
+impl RegState {
+    /// `dist.signatures` over npm's message, with the current key.
+    fn signatures(&self, name: &str, version: &str, integrity: &str) -> serde_json::Value {
+        let sig: Signature = self
+            .signer
+            .sign(format!("{name}@{version}:{integrity}").as_bytes());
+        serde_json::json!([{
+            "keyid": self.keyid,
+            "sig": base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes()),
+        }])
+    }
+
+    fn public_key(&self) -> String {
+        let der = self.signer.verifying_key().to_public_key_der().unwrap();
+        base64::engine::general_purpose::STANDARD.encode(der.as_bytes())
+    }
+}
+
 struct RegState {
     packuments: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     /// Publish time per package and version (`time` map of the full doc).
@@ -155,6 +173,7 @@ struct RegState {
     /// Requests from the guard's signature check (keys and metadata).
     sig_hits: Vec<String>,
     signer: SigningKey,
+    keyid: String,
     key_expires: Option<String>,
     /// Replaces the keys document: `(status line, body)`.
     keys_response: Option<(String, Vec<u8>)>,
@@ -193,6 +212,7 @@ impl Registry {
             hits: vec![],
             sig_hits: vec![],
             signer: test_signer(),
+            keyid: KEYID.into(),
             key_expires: None,
             keys_response: None,
         }));
@@ -227,16 +247,10 @@ impl Registry {
         let mut manifest = p.manifest(&p.version);
         let integrity = sri(advertised);
         let mut s = self.state.lock().unwrap();
-        let sig: Signature = s
-            .signer
-            .sign(format!("{}@{}:{integrity}", p.name, p.version).as_bytes());
         manifest["dist"] = serde_json::json!({
             "tarball": format!("{}{}", base.trim_end_matches('/'), path),
             "integrity": integrity,
-            "signatures": [{
-                "keyid": KEYID,
-                "sig": base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes()),
-            }],
+            "signatures": s.signatures(&p.name, &p.version, &integrity),
         });
         if p.provenance {
             manifest["dist"]["attestations"] = serde_json::json!({
@@ -307,6 +321,35 @@ impl Registry {
             .unwrap()["dist"]);
     }
 
+    /// This registry's current key, as if built into fail2commit like npm's.
+    pub fn pinned(&self) -> fail2commit_core::npm::PinnedKeys {
+        let s = self.state.lock().unwrap();
+        fail2commit_core::npm::PinnedKeys {
+            registry: self.url.clone(),
+            keys: vec![fail2commit_core::npm::PinnedKey {
+                keyid: s.keyid.clone(),
+                key: s.public_key(),
+                expires: s.key_expires.clone(),
+            }],
+        }
+    }
+
+    /// Switch to a fresh key under `keyid`, re-sign every published version
+    /// and serve the new key: a mirror that signs with its own key.
+    pub fn rotate_key(&self, keyid: &str) {
+        let mut s = self.state.lock().unwrap();
+        s.signer = test_signer();
+        s.keyid = keyid.into();
+        let mut packs = std::mem::take(&mut s.packuments);
+        for (name, vers) in packs.iter_mut() {
+            for (v, m) in vers.iter_mut() {
+                let integrity = m["dist"]["integrity"].as_str().unwrap().to_string();
+                m["dist"]["signatures"] = s.signatures(name, v, &integrity);
+            }
+        }
+        s.packuments = packs;
+    }
+
     /// Expiry of the signing key in the keys document (RFC 3339).
     pub fn set_key_expires(&self, t: Option<&str>) {
         self.state.lock().unwrap().key_expires = t.map(str::to_string);
@@ -315,6 +358,11 @@ impl Registry {
     /// Answer the keys endpoint with `status` (e.g. `404 Not Found`) and `body`.
     pub fn set_keys_response(&self, status: &str, body: &[u8]) {
         self.state.lock().unwrap().keys_response = Some((status.into(), body.to_vec()));
+    }
+
+    /// Serve the registry's real keys document again.
+    pub fn clear_keys_response(&self) {
+        self.state.lock().unwrap().keys_response = None;
     }
 
     pub fn sig_hits(&self) -> Vec<String> {
@@ -374,12 +422,11 @@ fn serve(mut conn: TcpStream, st: Arc<Mutex<RegState>>) {
         keys_doc = match &s.keys_response {
             Some(r) => r.clone(),
             None => {
-                let der = s.signer.verifying_key().to_public_key_der().unwrap();
                 let doc = serde_json::json!({"keys": [{
-                    "keyid": KEYID,
+                    "keyid": s.keyid,
                     "keytype": "ecdsa-sha2-nistp256",
                     "scheme": "ecdsa-sha2-nistp256",
-                    "key": base64::engine::general_purpose::STANDARD.encode(der.as_bytes()),
+                    "key": s.public_key(),
                     "expires": s.key_expires,
                 }]});
                 ("200 OK".to_string(), serde_json::to_vec(&doc).unwrap())
@@ -428,6 +475,8 @@ pub struct Env {
     pub paths: TrustedPaths,
     pub settings: Settings,
     pub project: PathBuf,
+    /// Built-in signing keys (CR-018): production's npm keys by default.
+    pub pinned_keys: Vec<fail2commit_core::npm::PinnedKeys>,
 }
 
 impl Env {
@@ -451,6 +500,7 @@ impl Env {
             paths,
             settings: Settings::default(),
             project,
+            pinned_keys: fail2commit_core::npm::builtin_keys(),
         }
     }
 
@@ -647,6 +697,7 @@ impl<'a> Run<'a> {
             advisories: Box::new(move |p| (b3.advisories)(p)),
             inspect: Box::new(move |p, s, f| (b4.inspect)(p, s, f)),
             crash: None,
+            pinned_keys: self.env.pinned_keys.clone(),
         }
     }
 }
