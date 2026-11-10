@@ -1,5 +1,7 @@
 # SPEC-006 — Package and script scanning
 
+> **CR-017:** npm package code is also checked against malicious-code heuristics (`suspicious_code`, approve). Advisory evidence leads with severity and the fixed-in version. See `docs/scan.md` → Malicious-code checks.
+
 FR-006 · TC-006 · Owner paths: advisory client, disk cache, rule engine and fixtures.
 
 Batch exact ecosystem/name/version lookups via OSV and include known-malware classification using OpenSSF data. Deduplicate advisory IDs and classify malware separately from CVEs. Use bounded disk cache, expiry, network timeouts and explicit offline/stale outcomes. Use synthetic advisories in CI. Advisory findings and incomplete scans can receive explicit one-time approval. Artifact hash mismatches and scripts flagged for force-push behavior are hard denials for that artifact or script path as appropriate. Allow script-free install where supported. Inspect package lifecycle entries and referenced local scripts without execution. Flag clear Git force forms, paths and lines with credentials redacted. Handle archive extraction defensively. Pattern checks are evidence, not an execution boundary. Runtime observations may supplement results when supported and must distinguish launched Git from generic network denial. Keep optional scanner integrations out of the hot path unless configured.

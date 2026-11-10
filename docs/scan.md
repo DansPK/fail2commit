@@ -57,6 +57,7 @@ completeness flag is surfaced through the `code` (`incomplete_scan`) and the
 | `advisory` | `approve` | `npm:name@ver` | CVE/GHSA-style advisory, `advisory_id` set. |
 | `malware` | `deny` | `npm:name@ver` | OSV `MAL-` id or an OpenSSF malicious-packages record (CR-003). |
 | `suspicious_script` | `deny` | `npm:name@ver` | `location` is `<script>:<line>` or `<file>:<line>`. |
+| `suspicious_code` | `approve` | `npm:name@ver` | Package code matched a malicious-code rule (CR-017). `location` is `<file>:<line>`; `evidence` says what the code does and whether it runs at install or when your project loads the package. |
 | `stale_data` | `approve` | `npm:name@ver` | Cached answer past its TTL was used. |
 | `incomplete_scan` | `approve` | `npm:name@ver` | No usable answer, or more than 128 advisory ids (the count of ordinary advisories dropped is in `evidence`). Every id up to 512 still has its record classified, so a malware record is never dropped, whatever its id case or prefix; treat the version as unreviewed. |
 | `incomplete_scan` | `deny` | `npm:name@ver` | More than 512 advisory ids: malware cannot be ruled out. |
@@ -65,6 +66,30 @@ completeness flag is surfaced through the `code` (`incomplete_scan`) and the
 Malware is deliberately a separate kind, and a hard denial: an operator may
 approve a vulnerability, but a known-malicious package cannot be approved away. Every `evidence` string is redacted (`redact::redact_url_credentials`) and
 length-bounded before it leaves the module.
+
+## Malicious-code checks (CR-017)
+
+When you run `npm install` or `npm ci` through fail2commit, every package in the install plan is also read as text and checked for code that behaves like known supply-chain attacks. Nothing is executed. Each match becomes a `suspicious_code` warning in the approval prompt: **approve** to continue the install, or **cancel** to install nothing. `fail2commit scan --dir <package>` runs the same checks on any package folder.
+
+| Rule | What it looks for |
+|---|---|
+| Hidden code | A decoded string being executed (`eval(Buffer.from(…,'base64'))`, `new Function(atob(…))`, long encoded `eval` literals). Base64 blobs are decoded and scanned again, two levels deep. |
+| Credential harvest | One file that names two or more credential stores: `.npmrc`, `.ssh`, `.aws`, `.git-credentials`, the GitHub CLI token, Docker or Kubernetes config, cloud credentials, browser logins, crypto wallets, `.pypirc`. |
+| Environment harvest | `JSON.stringify(process.env)`, or a search of the environment for `TOKEN`, `SECRET`, `PASSW`, `AWS_`, `GITHUB_` or `NPM_TOKEN`. |
+| Download and run | `curl`/`wget` piped to a shell or saved to a file, PowerShell `iwr`/`irm`/`DownloadString`, encoded PowerShell, `certutil`/`bitsadmin`/`mshta` downloads. |
+| Data-drop address | Discord webhooks, webhook.site, Pipedream, RequestBin, ngrok, interactsh/OAST, Burp Collaborator, transfer.sh and similar, or an `http(s)://` URL to a public IP address. |
+| Persistence | A file write next to a shell or startup file (`.bashrc`, `.zshrc`, LaunchAgents, the Windows Startup folder, autostart), a `Run` registry key, `crontab -`, `schtasks /create`, `systemctl --user enable`. |
+| CI backdoor | Writing files into `.github/workflows`. |
+
+**Install time or load time.** Lifecycle scripts and the files they run are *install-time* code: they run in the sandbox, and every rule applies. Other files are *runtime* code that runs when your project loads the package, outside the sandbox. In runtime code, download and persistence commands count only inside an `exec`/`spawn` call or next to a file write, and the package's own test files are skipped. Help text and helper scripts often mention these commands without running them.
+
+**Warnings, not blocks.** Heuristics have false positives, so a match always needs your approval and is never a hard denial. Known malware from OSV and OpenSSF stays a hard denial.
+
+**Limits.** Files over 16 MiB are skipped, reading stops at 64 MiB per package, and each package shows at most 8 warnings plus a count of the rest. A determined attacker can write code that none of these rules recognise. This check adds evidence to your decision; it does not make package code safe. Use `fail2commit run` for code you don't trust.
+
+## Advisory evidence
+
+Advisory findings lead with the severity and the versions that fix the problem, for example `GHSA-xxxx [high], fixed in 4.17.21: Prototype pollution in lodash`. Severity comes from the advisory's `database_specific.severity`. Fixed versions come from the `affected` ranges for exactly this package.
 
 ## OSV client
 

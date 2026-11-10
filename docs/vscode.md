@@ -47,7 +47,7 @@ The Source Control view runs plain `git push`; it does not go through this exten
 cd extensions/vscode
 npm ci
 npm test            # offline, uses a fake CLI
-npm run package     # compile + vsce package -> fail2commit-0.1.1.vsix (gitignored)
+npm run package     # compile + vsce package -> fail2commit-0.1.2.vsix (gitignored)
 ```
 
 An `@vscode/test-electron` smoke test is not included (it downloads VS Code); see the verify report.

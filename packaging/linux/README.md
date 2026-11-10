@@ -6,7 +6,7 @@ The Debian/Ubuntu amd64 package is described by `[package.metadata.deb]` in
 ```sh
 python3 scripts/release/notices.py
 scripts/release/build-deb.sh HEAD target/dist
-scripts/release/verify-deb.sh target/dist/fail2commit_0.1.1_amd64.deb
+scripts/release/verify-deb.sh target/dist/fail2commit_0.1.2_amd64.deb
 ```
 
 The package has no maintainer scripts. It installs the CLI and documentation

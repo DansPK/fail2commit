@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-fail2commit-core = { version = "0.1.1", path = "../fail2commit-core" }
+fail2commit-core = { version = "0.1.2", path = "../fail2commit-core" }
 serde_json = "1.0.154"
 
 [dev-dependencies]

@@ -1,7 +1,7 @@
 # fail2commit task board and roadmap
 The MVP tasks below are done. The roadmap after them lists what is planned for 0.2 and later.
 
-Integration branch: `main` (one PR per change). Latest release `v0.1.1` (pre-release; `v0.1.0` was built from `a9afcdf`) by the GitHub `release-candidate` workflow; evidence in `docs/dev/verify/VERIFY-2026-11-09-release.md`. Change requests CR-001 to CR-012 are in `docs/dev/change-requests.md`.
+Integration branch: `main` (one PR per change). Latest release `v0.1.2` (pre-release; `v0.1.0` was built from `a9afcdf`) by the GitHub `release-candidate` workflow; evidence in `docs/dev/verify/VERIFY-2026-11-09-release.md`. Change requests CR-001 to CR-012 are in `docs/dev/change-requests.md`.
 
 "Done" means implemented, independently security-reviewed until closed, merged, and passing the gate on both platforms. Requirement status stays `Approved` (not `Verified`) until the pending platform gates in the release report have evidence.
 
@@ -13,7 +13,7 @@ Integration branch: `main` (one PR per change). Latest release `v0.1.1` (pre-rel
 | T-003 | Enforce protected remote updates | FR-003, SPEC-003 | orca:claude-sonnet | done; GitHub rulesets pending | T-001, T-002 |
 | T-004 | Guard npm installs | FR-004, SPEC-004 | orca:claude-sonnet | done | T-006, T-007 |
 | T-005 | Guard pip installs | FR-005, SPEC-005 | orca:claude-sonnet | done | T-006, T-007 |
-| T-006 | Scan packages and scripts | FR-006, SPEC-006 | orca:cline-deepseek | done; live OSV smoke pending | CHORE-001 |
+| T-006 | Scan packages and scripts | FR-006, SPEC-006 | orca:cline-deepseek | done; malicious-code warnings and advisory severity/fix added (CR-017, 0.1.2); live OSV smoke pending | CHORE-001 |
 | T-007 | Isolate build scripts: T-007a Linux Bubblewrap, export, `run`, Linux test harness | FR-007, SPEC-007 | orca:claude-opus | done | CHORE-001 |
 | T-007 | Isolate build scripts: T-007b Windows AppContainer | FR-007, SPEC-007 | orca:codex, cline-deepseek | done; clean-VM interactive run passed on Windows 10 and 11; Defender false positive needs code signing; LPAC and staged MinGW build pending | CHORE-001 |
 | T-008 | Manage sandbox policy | FR-008, SPEC-008 | orca:claude-sonnet | done | T-007 |
@@ -31,6 +31,9 @@ The MVP stops install-time attacks for npm and pip when the install goes through
 | ID | Task | Why | Exit | Depends on |
 |---|---|---|---|---|
 | P-101 | Code-sign the Windows binaries and installer; submit the CLI to Microsoft as a false positive | Defender quarantined the unsigned CLI (`Behavior:Win32/DefenseEvasion.A!ml`), which blocks the Windows release | Signed installer passes SmartScreen and Defender on clean Windows 10 and 11 VMs, including the attack simulation | owner: certificate |
+| P-108 | Verify npm registry signatures (ECDSA keys from the registry) and Sigstore provenance for every package in the plan, as `npm audit signatures` does; PyPI attestations (PEP 740) next | A hijacked maintainer account or a tampered mirror ships bytes the registry never signed, or drops the provenance an earlier version had | An invalid or missing registry signature is a deny; provenance that disappeared since the previous version is a warning; tests with a tampered fixture registry | owner request, 0.1.3 |
+| P-109 | Harden the advisory connection: HTTPS-only OSV by default (HTTP only to loopback), strict TLS, and a tamper-evident advisory cache | Advisory data decides what gets blocked; it must not be swappable in transit or on disk | A non-HTTPS OSV URL is refused; an edited cache entry is detected and refetched | owner request, 0.1.3 |
+| P-110 | Offline malware list: the OpenSSF malicious-packages data, pinned to a verified GitHub commit and checked by hash, used when OSV is unreachable | Known malware should stay blocked without network | With the network off, a package from the list is denied; a modified list is rejected | owner request, 0.1.3 |
 | P-102 | Low-friction defaults that every launcher reads: `setup` sets npm `script-shell` to a fail2commit wrapper that runs dependency install scripts in the sandbox and passes the project's own scripts through; and pip `only-binary = :all:` in the user pip config (release age is P-105). Each is recorded and undone by uninstall; `status` warns when one is removed or the package manager is too old | `npm.cmd`, nvm, IDEs and CI scripts read the user config but skip the shims. `ignore-scripts=true` was considered and rejected: it breaks native modules and npm `pre`/`post` hooks | Attack simulation run with bare `npm.cmd`, nvm's npm and `python -m pip` runs no package code outside the sandbox; `npm test` and `npm run` behave unchanged | - |
 | P-103 | cmd.exe `doskey` macros through the per-user cmd AutoRun key | cmd has no shell functions, so a venv in cmd bypasses the guard (CR-015) | `venv\Scripts\activate.bat`, then `pip install`, is guarded | - |
 | P-104 | Registry gate: the user's npm `registry=` and pip `index-url` point at a fail2commit loopback service that reviews before serving; grows from the existing wheel-only pip proxy (`pip/proxy.rs`) | Closes `python -m pip`, IDEs and every other launcher that reads the standard config files | Attack simulation through `python -m pip` and `npm.cmd` is blocked; with the service stopped, installs fail closed | P-102 |

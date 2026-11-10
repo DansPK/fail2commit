@@ -550,12 +550,21 @@ pub fn review(
                 .location(name.clone()),
             );
         }
+        let all = [r.scripts.clone(), r.chained.clone()].concat();
         if !r.scripts.is_empty() {
-            let all = [r.scripts.clone(), r.chained.clone()].concat();
             reviewed
                 .findings
                 .extend((deps.inspect)(&id, &all, &r.files));
         }
+        // CR-017: every package's own code, not only packages with scripts;
+        // code that runs on `require()` is outside install-time isolation.
+        let install: BTreeSet<String> = r.files.iter().map(|f| f.path.clone()).collect();
+        reviewed.findings.extend(crate::scan::code::scan_package(
+            &id,
+            &tree.join(&rp.plan.path),
+            if r.scripts.is_empty() { &[] } else { &all },
+            &install,
+        ));
         rp.scripts = r.scripts;
         rp.inputs = r.inputs;
         rp.absent = r.absent;
