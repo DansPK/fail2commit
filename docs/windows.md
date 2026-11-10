@@ -61,7 +61,7 @@ Name: `\\.\pipe\fail2commit-approval-<your user SID>`. Protections:
 ## Building the installer
 
 ```powershell
-powershell -File packaging\windows\build.ps1 -Version 0.1.0
+powershell -File packaging\windows\build.ps1 -Version 0.1.1
 ```
 
 `build.ps1` builds the release binaries, stages them under `target\dist\stage`, and runs `makensis`. It uses `-Makensis <path>`, else a portable NSIS under `target\nsis\nsis-*`, else `makensis` on PATH. A portable NSIS can be unpacked from the official SourceForge zip without installing anything; the hash used for the recorded build is in `docs/dev/verify/VERIFY-2026-11-08-windows-tray.md`.

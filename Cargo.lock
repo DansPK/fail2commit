@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "fail2commit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "clap",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "fail2commit-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "base64",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "fail2commit-tray"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fail2commit-core",
  "serde_json",

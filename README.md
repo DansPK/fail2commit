@@ -11,9 +11,9 @@ fail2commit stops supply-chain attacks and leaked secrets at the developer's mac
 
 It is free, open source (Apache-2.0), written in Rust, and needs no account or cloud service.
 
-## Status: 0.1.0 preview
+## Status: 0.1.1 preview
 
-0.1.0 is for technical users and testers. It is not yet a general release.
+0.1.1 is for technical users and testers. It is not yet a general release.
 
 **What has been tested:**
 - Windows 10 and 11, Debian, and Arch Linux VMs.
@@ -37,11 +37,11 @@ Download the file for your platform and `SHA256SUMS` from [GitHub Releases](http
 
 | Platform | File | Install |
 |---|---|---|
-| Windows 10/11 x64 | `fail2commit-0.1.0-setup.exe` | Run it as your normal user; it asks for administrator rights to guard the machine-wide npm and pip |
-| Debian / Ubuntu amd64 | `fail2commit_0.1.0_amd64.deb` | `sudo dpkg -i fail2commit_0.1.0_amd64.deb` |
-| Arch and Arch-based x86_64 | `fail2commit-0.1.0-1-x86_64.pkg.tar.zst` | `sudo pacman -U fail2commit-0.1.0-1-x86_64.pkg.tar.zst`, or `makepkg -si` with [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) |
-| Other Linux x86_64 | `fail2commit-0.1.0-linux-amd64` or `fail2commit-0.1.0-src.tar.gz` | Copy the binary onto your PATH, or build offline from the source archive |
-| VS Code | `fail2commit-0.1.0.vsix` | `code --install-extension fail2commit-0.1.0.vsix` |
+| Windows 10/11 x64 | `fail2commit-0.1.1-setup.exe` | Run it as your normal user; it asks for administrator rights to guard the machine-wide npm and pip |
+| Debian / Ubuntu amd64 | `fail2commit_0.1.1_amd64.deb` | `sudo dpkg -i fail2commit_0.1.1_amd64.deb` |
+| Arch and Arch-based x86_64 | `fail2commit-0.1.1-1-x86_64.pkg.tar.zst` | `sudo pacman -U fail2commit-0.1.1-1-x86_64.pkg.tar.zst`, or `makepkg -si` with [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) |
+| Other Linux x86_64 | `fail2commit-0.1.1-linux-amd64` or `fail2commit-0.1.1-src.tar.gz` | Copy the binary onto your PATH, or build offline from the source archive |
+| VS Code | `fail2commit-0.1.1.vsix` | `code --install-extension fail2commit-0.1.1.vsix` |
 
 On Linux the sandbox needs `bubblewrap`. Node.js/npm and Python are needed only for their guards.
 

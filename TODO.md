@@ -1,7 +1,7 @@
 # fail2commit task board and roadmap
 The MVP tasks below are done. The roadmap after them lists what is planned for 0.2 and later.
 
-Integration branch: `main` (one PR per change). Release `v0.1.0` (pre-release) built from `a9afcdf` by the GitHub `release-candidate` workflow; evidence in `docs/dev/verify/VERIFY-2026-11-09-release.md`. Change requests CR-001 to CR-012 are in `docs/dev/change-requests.md`.
+Integration branch: `main` (one PR per change). Latest release `v0.1.1` (pre-release; `v0.1.0` was built from `a9afcdf`) by the GitHub `release-candidate` workflow; evidence in `docs/dev/verify/VERIFY-2026-11-09-release.md`. Change requests CR-001 to CR-012 are in `docs/dev/change-requests.md`.
 
 "Done" means implemented, independently security-reviewed until closed, merged, and passing the gate on both platforms. Requirement status stays `Approved` (not `Verified`) until the pending platform gates in the release report have evidence.
 
