@@ -5,12 +5,15 @@
 //! `GET {osv_url}/v1/vulns/{id}`. Everything is bounded: one agent carrying the
 //! configured timeout, chunked batches, a capped page loop, a strict advisory-id
 //! charset (ids arrive from the network and are placed in a URL path) and an
-//! `http`/`https` only endpoint check so trusted settings cannot turn the scan
-//! into a local file read.
+//! endpoint check (CR-019): `https://` to any host, `http://` only to a
+//! loopback address. TLS uses rustls with the bundled webpki roots and full
+//! certificate verification, and no redirect is followed.
 
 use super::{ecosystem_str, PackageId};
 use crate::settings::AdvisorySettings;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 /// OSV accepts up to 1000 queries per batch; stay far below that so one request
 /// and one response stay small.
@@ -47,15 +50,22 @@ pub struct Client {
 }
 
 impl Client {
-    /// `None` when `osv_url` is not an `http(s)` endpoint or carries userinfo.
-    /// The caller then treats every lookup as incomplete instead of talking to
-    /// something else.
+    /// `None` when `osv_url` fails [`normalize_base_url`]. The caller then
+    /// treats every lookup as incomplete instead of talking to something else.
     pub fn new(settings: &AdvisorySettings) -> Option<Client> {
         let base = normalize_base_url(&settings.osv_url)?;
+        let tls = TlsConfig::builder()
+            .provider(TlsProvider::Rustls)
+            .root_certs(RootCerts::WebPki)
+            .disable_verification(false)
+            .build();
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(
                 settings.timeout_secs.clamp(1, 300),
             )))
+            .tls_config(tls)
+            // A 3xx comes back as a response and is rejected by `body_text`.
+            .max_redirects(0)
             .build()
             .into();
         Some(Client { agent, base })
@@ -100,15 +110,12 @@ impl Client {
                 .collect();
             let body = serde_json::to_string(&serde_json::json!({ "queries": queries }))
                 .map_err(|_| ())?;
-            let text = self
-                .agent
-                .post(&url)
-                .content_type("application/json")
-                .send(body.as_str())
-                .map_err(|_| ())?
-                .body_mut()
-                .read_to_string()
-                .map_err(|_| ())?;
+            let text = body_text(
+                self.agent
+                    .post(&url)
+                    .content_type("application/json")
+                    .send(body.as_str()),
+            )?;
             let parsed: BatchResponse = serde_json::from_str(&text).map_err(|_| ())?;
             if parsed.results.len() != pending.len() {
                 return Err(());
@@ -142,37 +149,88 @@ impl Client {
             return Err(());
         }
         let url = format!("{}/v1/vulns/{id}", self.base);
-        let text = self
-            .agent
-            .get(&url)
-            .call()
-            .map_err(|_| ())?
-            .body_mut()
-            .read_to_string()
-            .map_err(|_| ())?;
+        let text = body_text(self.agent.get(&url).call())?;
         serde_json::from_str(&text).map_err(|_| ())
     }
 }
 
-/// Trim and validate a configured endpoint.
+/// Body of a 2xx response. Anything else, a 3xx included, is a failed lookup.
+fn body_text(
+    response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<String, ()> {
+    let mut response = response.map_err(|_| ())?;
+    if !response.status().is_success() {
+        return Err(());
+    }
+    response.body_mut().read_to_string().map_err(|_| ())
+}
+
+/// Trim and validate a configured endpoint: `https://` to any host, or
+/// `http://` to `localhost`, `127.0.0.0/8` or `[::1]`. No userinfo, query,
+/// fragment, backslash or percent-encoded host, so the host checked here is
+/// the host a URL parser connects to. Returns the URL with a lowercase scheme.
 pub fn normalize_base_url(url: &str) -> Option<String> {
     let trimmed = url.trim().trim_end_matches('/');
     if trimmed.is_empty() || trimmed.chars().count() > MAX_URL_CHARS {
         return None;
     }
-    if trimmed.chars().any(char::is_whitespace) {
+    // '@' also keeps credentials away from an advisory service.
+    if trimmed
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | '\\' | '?' | '#'))
+    {
         return None;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return None;
+    let (scheme, rest) = trimmed.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split('/').next().unwrap_or_default();
+    let loopback = host_is_loopback(authority)?;
+    match scheme.as_str() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => return None,
     }
-    let after_scheme = &trimmed[trimmed.find("//")? + 2..];
-    if after_scheme.is_empty() || after_scheme.contains('@') {
-        // fail2commit never sends credentials to an advisory service.
-        return None;
+    Some(format!("{scheme}://{rest}"))
+}
+
+/// Whether a `host[:port]` authority names a loopback address; `None` when it
+/// is not a well-formed host. Only exact forms count: `127.1`, `0x7f.0.0.1`,
+/// `localhost.` and IPv4-mapped IPv6 are not treated as loopback.
+fn host_is_loopback(authority: &str) -> Option<bool> {
+    let (loopback, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let (inside, after) = rest.split_once(']')?;
+            let ip: Ipv6Addr = inside.parse().ok()?;
+            let port = match after {
+                "" => None,
+                _ => Some(after.strip_prefix(':')?),
+            };
+            (ip.is_loopback(), port)
+        }
+        None => {
+            let (host, port) = match authority.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            if host.is_empty()
+                || !host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+            {
+                return None;
+            }
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback());
+            (loopback, port)
+        }
+    };
+    if let Some(port) = port {
+        if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        port.parse::<u16>().ok()?;
     }
-    Some(trimmed.to_string())
+    Some(loopback)
 }
 
 /// Advisory ids we are willing to place in a URL path.
@@ -240,24 +298,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoint_must_be_http_and_credential_free() {
-        assert_eq!(
-            normalize_base_url("https://api.osv.dev/").as_deref(),
-            Some("https://api.osv.dev")
-        );
-        assert_eq!(
-            normalize_base_url(" http://127.0.0.1:8080 ").as_deref(),
-            Some("http://127.0.0.1:8080")
-        );
+    fn endpoint_is_https_or_loopback_http() {
+        for (input, want) in [
+            ("https://api.osv.dev/", "https://api.osv.dev"),
+            ("HTTPS://API.OSV.DEV", "https://API.OSV.DEV"),
+            ("https://api.osv.dev.", "https://api.osv.dev."),
+            (
+                "https://mirror.example:8443/osv/",
+                "https://mirror.example:8443/osv",
+            ),
+            ("https://[2001:db8::1]:443", "https://[2001:db8::1]:443"),
+            (" http://127.0.0.1:8080 ", "http://127.0.0.1:8080"),
+            ("http://127.9.8.7", "http://127.9.8.7"),
+            ("HTTP://LOCALHOST:9", "http://LOCALHOST:9"),
+            ("http://localhost/osv", "http://localhost/osv"),
+            ("http://[::1]:8080", "http://[::1]:8080"),
+            ("http://[0:0:0:0:0:0:0:1]", "http://[0:0:0:0:0:0:0:1]"),
+        ] {
+            assert_eq!(normalize_base_url(input).as_deref(), Some(want), "{input}");
+        }
         for bad in [
+            // Plain HTTP off loopback, never silently upgraded or downgraded.
+            "http://api.osv.dev",
+            "http://10.0.0.1",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+            "http://localhost.",
+            "http://127.0.0.1.",
+            "http://127.1",
+            "http://0x7f.0.0.1",
+            "http://2130706433",
+            "http://[::ffff:127.0.0.1]",
+            "http://[::2]",
+            // Authority tricks a URL parser reads differently.
+            "http://localhost@evil.example",
+            "http://evil.example@127.0.0.1",
+            "https://user:tok@example.test",
+            "http://localhost%2eevil.example",
+            "http://127.0.0.1\\@evil.example",
+            "http://localhost#@evil.example",
+            "http://localhost?@evil.example",
+            "http://[::1%25lo]",
+            "http://[::1]evil",
+            "http://127.0.0.1:",
+            "http://127.0.0.1:99999",
+            "http://127.0.0.1:80:80",
+            "http://",
+            "https:///v1",
+            // Other schemes and malformed input.
             "file:///etc/passwd",
             "ftp://example.test",
-            "https://user:tok@example.test",
+            "httpx://127.0.0.1",
+            "//127.0.0.1",
             "https://api.osv.dev /v1",
+            "https://api.osv\t.dev",
             "",
         ] {
             assert!(normalize_base_url(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn agent_verifies_tls_and_follows_no_redirects() {
+        let client = Client::new(&AdvisorySettings::default()).expect("default endpoint");
+        let config = client.agent.config();
+        assert_eq!(config.max_redirects(), 0);
+        let tls = config.tls_config();
+        assert!(!tls.disable_verification());
+        assert_eq!(tls.provider(), TlsProvider::Rustls);
+        assert!(matches!(tls.root_certs(), RootCerts::WebPki));
+        assert!(
+            !config.https_only(),
+            "loopback http stays possible for tests"
+        );
+        assert!(normalize_base_url(&AdvisorySettings::default().osv_url)
+            .is_some_and(|url| url.starts_with("https://")));
     }
 
     #[test]

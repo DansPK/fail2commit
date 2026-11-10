@@ -93,12 +93,24 @@ Advisory findings lead with the severity and the versions that fix the problem, 
 
 ## OSV client
 
-* Endpoint comes from trusted settings (`[advisories] osv_url`), which must be
-  `http://` or `https://` and must not carry userinfo. Anything else makes every
-  lookup incomplete instead of redirecting the scan at another scheme (for
-  example `file://`).
+* Endpoint comes from trusted settings (`[advisories] osv_url`). It must be
+  `https://` to any host, or `http://` only to a loopback host: `localhost`, an
+  address in `127.0.0.0/8`, or `[::1]` (CR-019). Plain HTTP is never used for
+  anything else, and nothing is upgraded or downgraded for you.
+* The check refuses anything a URL parser could read as a different host:
+  userinfo (`@`), `?`, `#`, `\`, `%` in the host, control characters, and
+  malformed ports. Only exact loopback forms count, so
+  `http://127.0.0.1.evil.example`, `http://localhost.`, `http://127.1` and
+  `http://[::ffff:127.0.0.1]` are refused. The scheme may be any case.
+* A refused endpoint makes every lookup incomplete; the scan never reports
+  clean and never talks to another scheme (for example `file://`).
 * One `ureq` agent per call carries `settings.timeout_secs` as a global timeout
   (clamped to 1..=300 s).
+* TLS is rustls with the bundled webpki roots and full certificate and host
+  verification; `disable_verification` is pinned to `false`. A unit test
+  asserts this agent configuration so a later change cannot turn it off quietly.
+* Redirects are not followed (`max_redirects = 0`). A 3xx, like any non-2xx
+  status, is a failed lookup.
 * Batches are chunked to 64 queries, and each query follows `next_page_token`
   for at most 32 pages; a mismatch or a runaway page loop is a failed lookup,
   never a partial "clean" answer.
@@ -109,24 +121,39 @@ Advisory findings lead with the severity and the versions that fix the problem, 
 
 ## Bounded disk cache
 
-`<cache_dir>/osv/<sha256(key)>.json`, one entry per key:
+`<cache_dir>/osv/<sha256(key)>.json`, one entry per key: a tag line, then the
+JSON envelope.
 
-```json
-{ "stored_at": 1762560000, "data": ["GHSA-...", "CVE-..."] }
+```text
+f2c-hmac1:<64 hex chars>
+{"stored_at":1762560000,"data":["GHSA-...","CVE-..."]}
 ```
 
 * Keys are namespaced (`v1:batch:<eco>:<name>@<version>`, `v1:vuln:<id>`) and
   hashed, so untrusted package names never become file names.
+* The tag is HMAC-SHA256 over the file name and the exact envelope bytes
+  (CR-019). Covering the file name means a valid entry copied over another
+  package's file does not verify.
+* The HMAC key is 32 random bytes in `<state_dir>/osv-cache.key`, created on
+  first use with the same owner-only permissions as other private state files
+  (mode `0600` on Unix). It is never stored in the cache directory.
+* An entry whose tag is missing or wrong is a cache miss: it is refetched when
+  online and reported as an incomplete scan when offline. Entries written by
+  0.1.2 and earlier have no tag, so they are refetched once. Deleting the key
+  file only makes every entry refetch.
 * Writes go through `fsutil::atomic_write` (temp file, fsync, rename) inside a
   private directory; a crash leaves the old or the new file.
 * `ttl_secs` decides freshness. A fresh entry answers without touching the
   network.
-* `cache_max_bytes` caps the whole directory: entries larger than the budget are
-  not written, and the oldest modification times are evicted until the directory
-  fits. A pathological `cache_max_bytes` therefore degrades to "no cache", not to
-  unbounded growth.
-* Cache content is untrusted: malformed JSON, a wrong shape or an oversized file
-  is a cache miss.
+* `cache_max_bytes` caps the whole directory, tag line included: entries larger
+  than the budget are not written, and the oldest modification times are
+  evicted until the directory fits. A pathological `cache_max_bytes` therefore
+  degrades to "no cache", not to unbounded growth.
+* Cache content is untrusted: malformed JSON, a wrong shape, an oversized file
+  or a tag that does not verify is a cache miss.
+* The tag proves an entry was written by this user's fail2commit. It does not
+  stop someone who can write the cache from putting back an older tagged copy
+  of the same entry; the TTL limits how long such a copy is used.
 
 ### Offline and failure semantics
 
