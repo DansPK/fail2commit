@@ -2,7 +2,7 @@
   "name": "fail2commit",
   "displayName": "fail2commit",
   "description": "Guarded Git push, npm and pip installs through the fail2commit CLI.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "fail2commit",
   "icon": "media/logo.png",
   "license": "Apache-2.0",
