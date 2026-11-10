@@ -195,22 +195,28 @@ fn read_handle(args: &[String]) -> bool {
         None => return false,
     };
     let handle = raw as *mut core::ffi::c_void;
-    let mut byte = [0u8; 1];
+    let mut buf = [0u8; 64];
     let mut read = 0u32;
     // SAFETY: ReadFile validates the untrusted numeric handle in the child
-    // handle table. The one-byte output buffer and count pointer are valid.
+    // handle table. The output buffer and count pointer are valid.
     let ok = unsafe {
         ReadFile(
             handle,
-            byte.as_mut_ptr().cast(),
-            1,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
             &mut read,
             std::ptr::null_mut(),
         )
     };
     if ok != 0 {
-        eprintln!("the inherited handle was readable");
-        return false;
+        // The same number can name one of the child's own handles (its stdio
+        // pipes or the NUL device); only the canary's bytes prove a leak.
+        if buf[..read as usize].starts_with(b"synthetic-secret-value") {
+            eprintln!("the inherited handle was readable");
+            return false;
+        }
+        eprintln!("handle number names another of the child's own handles; no canary bytes");
+        return true;
     }
     // SAFETY: read immediately after the failing call.
     let error = unsafe { GetLastError() } as i32;
