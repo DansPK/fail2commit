@@ -1,8 +1,9 @@
 //! Review phase (SPEC-004): download every artifact ourselves, verify its
 //! integrity, inspect the archive, and collect script/advisory findings.
 
+use super::config::Registry;
 use super::lockfile::{verify_sri, Plan, PlanPkg};
-use super::{archive, Deps};
+use super::{archive, signatures, Deps};
 use crate::protocol::{Finding, FindingAction, FindingKind};
 use crate::scan::{Ecosystem, PackageId};
 use crate::{Error, Result};
@@ -119,9 +120,17 @@ fn fetch_one(
     Ok(file)
 }
 
-/// Download and verify the whole graph. Script inspection happens later on
-/// the extracted tree (`tree::review`); advisory lookup in the caller.
-pub fn review(deps: &Deps<'_>, plan: &Plan, dir: &Path) -> Result<Reviewed> {
+/// Verify registry signatures (CR-018), then download and verify the whole
+/// graph. Script inspection happens later on the extracted tree
+/// (`tree::review`); advisory lookup in the caller.
+pub fn review(deps: &Deps<'_>, registry: &Registry, plan: &Plan, dir: &Path) -> Result<Reviewed> {
+    let findings = signatures::check(deps, registry, plan);
+    if findings.iter().any(|f| f.action == FindingAction::Deny) {
+        return Err(
+            Error::rejected("install blocked by policy; nothing was changed")
+                .with_findings(findings),
+        );
+    }
     std::fs::create_dir_all(dir)?;
     let uniq = unique(plan);
     let limits = &deps.settings.limits;
@@ -184,8 +193,5 @@ pub fn review(deps: &Deps<'_>, plan: &Plan, dir: &Path) -> Result<Reviewed> {
             })
         })
         .collect();
-    Ok(Reviewed {
-        pkgs,
-        findings: vec![],
-    })
+    Ok(Reviewed { pkgs, findings })
 }

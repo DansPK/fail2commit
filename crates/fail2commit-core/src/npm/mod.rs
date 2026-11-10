@@ -21,6 +21,7 @@ mod review;
 mod runner;
 mod scripts;
 mod shim;
+mod signatures;
 mod stage;
 pub use stage::sweep_stale;
 mod tree;
@@ -46,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 pub use cmdline::{parse, Action, Request, Verb};
 pub use commit::CrashPoint;
+pub use signatures::{builtin_keys, forget as forget_signing_keys, PinnedKey, PinnedKeys};
 
 /// npm shim integration for `fail2commit setup`.
 pub fn integration() -> Option<Box<dyn Integration>> {
@@ -70,6 +72,9 @@ pub struct Deps<'a> {
     pub inspect: InspectFn<'a>,
     /// Test seam: simulate the process dying during commit.
     pub crash: Option<CrashPoint>,
+    /// Registries whose signing keys are built in (CR-018); production uses
+    /// [`builtin_keys`], tests pin their loopback registry.
+    pub pinned_keys: Vec<PinnedKeys>,
 }
 
 impl<'a> Deps<'a> {
@@ -87,6 +92,7 @@ impl<'a> Deps<'a> {
             }),
             inspect: Box::new(crate::scan::inspect_scripts),
             crash: None,
+            pinned_keys: builtin_keys(),
         }
     }
 }
@@ -271,7 +277,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     // 3. Review the exact graph: verified tarballs, extracted by npm itself
     //    (scripts off) into the staging tree, reviewed from disk.
     let plan = lockfile::parse(&final_lock, &registry, deps.settings.limits.graph_max_nodes)?;
-    let mut reviewed = review::review(deps, &plan, &sd.join("tarballs"))?;
+    let mut reviewed = review::review(deps, &registry, &plan, &sd.join("tarballs"))?;
     apply::seed_cache(deps, &tc, &st, &reviewed)?;
     apply::npm_step(deps, &tc, &st, &proj_stage, &["ci"], &["--offline".into()])?;
     // Hashed before the review reads anything: a later difference is a change.

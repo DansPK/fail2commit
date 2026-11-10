@@ -27,6 +27,7 @@ use crate::settings::AdvisorySettings;
 
 mod cache;
 pub mod code;
+pub mod malware_list;
 mod osv;
 mod rules;
 
@@ -197,11 +198,15 @@ pub fn check_advisories(
         }
     }
 
+    // CR-020: the offline list is read only when some OSV lookup failed.
+    let offline_list = (settings.offline_malware && lookups.iter().any(|l| l.failed))
+        .then(|| malware_list::load(paths));
     for (index, pkg) in pkgs.iter().enumerate() {
         complete &= collect_package_findings(
             &root,
             settings,
             client.as_ref(),
+            offline_list.as_ref(),
             pkg,
             &lookups[index],
             &mut findings,
@@ -217,18 +222,23 @@ fn collect_package_findings(
     root: &std::path::Path,
     settings: &AdvisorySettings,
     client: Option<&osv::Client>,
+    offline_list: Option<&malware_list::State>,
     pkg: &PackageId,
     lookup: &Lookup,
     findings: &mut Vec<Finding>,
 ) -> bool {
     let target = pkg.display();
     if lookup.failed {
+        let (malware, note) = malware_list::offline_check(offline_list, pkg, &target);
+        findings.extend(malware);
         findings.push(
             Finding::new(
                 FindingKind::IncompleteScan,
                 FindingAction::Approve,
                 "osv",
-                format!("advisory lookup did not complete for {target}; version is unreviewed"),
+                format!(
+                    "advisory lookup did not complete for {target}; version is unreviewed; {note}"
+                ),
             )
             .target(target),
         );

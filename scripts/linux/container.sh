@@ -21,6 +21,12 @@ cd "$(dirname "$0")/../.."
 echo "rustc: $(rustc --version)"
 
 if [ "$CHECK" = 1 ]; then
+  # The npm and pip tests need node/npm and python3 with venv; rust:1 has neither.
+  if ! command -v npm >/dev/null 2>&1 || ! python3 -c 'import ensurepip, venv' >/dev/null 2>&1; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends nodejs npm python3 python3-venv python3-pip >/dev/null
+  fi
+  echo "node: $(node --version) npm: $(npm --version) python: $(python3 --version)"
   rustup component add rustfmt clippy
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets -- -D warnings

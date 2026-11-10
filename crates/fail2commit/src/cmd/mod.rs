@@ -4,6 +4,7 @@ pub mod api;
 pub mod git;
 pub mod hook;
 pub mod machine;
+pub mod malware_list;
 pub mod npm;
 pub mod password;
 pub mod pip;
@@ -13,6 +14,7 @@ pub mod scan;
 pub mod secrets;
 pub mod server;
 pub mod setup;
+pub mod signatures;
 
 use fail2commit_core::approval::ApprovalCtx;
 use fail2commit_core::approver::ApproverChoice;

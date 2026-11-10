@@ -91,6 +91,12 @@ pub enum FindingKind {
     /// Package code matching a malicious-code heuristic (CR-017); a warning
     /// that needs approval, never a denial on its own.
     SuspiciousCode,
+    /// Registry signature missing, unverifiable or invalid for the exact
+    /// artifact (CR-018, P-108); a denial.
+    SignatureInvalid,
+    /// Build provenance absent although an earlier version of the same
+    /// package had it (CR-018, P-108); a warning that needs approval.
+    ProvenanceMissing,
     /// Artifact hash or plan mismatch.
     IntegrityMismatch,
     /// A scan or advisory lookup did not complete.
