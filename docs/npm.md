@@ -124,3 +124,55 @@ structured arguments (on Linux it follows the real `npm` launcher or standard in
 - Windows (RN3-002): bare and relative command paths also try the PATHEXT extensions (`.com .exe .bat .cmd .vbs .vbe .js .jse .wsf .wsh .msc .ps1` plus the host PATHEXT); every candidate that exists is read. A candidate that is a PE/ELF/Mach-O image or contains NUL is an `incomplete_scan` `deny`.
 - Local command paths (FR-004, FR-006): a command word with a path separator (`./later.sh`, `.\x`), or the script argument of an interpreter (`node later.js`, `sh ./x`), must have at least one existing candidate on disk at review time; otherwise it is an `incomplete_scan` `deny` naming the path, so a file created by an earlier script can never run unreviewed. Bare PATH commands (`node`, `sh`, `echo`) and other arguments are unaffected. Candidates of such paths that are absent at review (for example `./setup` ahead of an existing `setup.js`) are re-checked before every script; one that has appeared fails the install and nothing is committed.
 - Not covered: a new nested `package.json` inside a package directory counts as build output.
+
+## Registry signatures and provenance
+
+CR-018 (P-108). Before any artifact in the plan is downloaded, the guard checks the registry's
+signature on it. The npm registry signs each version with ECDSA P-256 over
+`<name>@<version>:<integrity>`, and so do mirrors that support signing.
+
+- **Keys.** The guard fetches `<registry>/-/npm/v1/keys` and caches the answer in the trusted
+  cache directory (`npm-signatures/`) for `signatures.keys_ttl_secs` (default 24 hours). The
+  answer may be at most 64 KiB and list at most 32 keys. Keys of a type other than
+  `ecdsa-sha2-nistp256` are ignored.
+- **Registry does not sign.** If the keys endpoint returns 404, the install gets one
+  `incomplete_scan` finding that needs approval: "registry X publishes no signing keys;
+  signatures not verified".
+- **Keys cannot be read.** Any other failure (a network error, another HTTP status, malformed
+  JSON, an empty key list, a bad key) is a `signature_invalid` deny. The check could not run, so
+  nothing in the plan counts as verified.
+- **Per package.** The guard reads `dist.signatures` for the exact `name@version` from the
+  abbreviated metadata (`Accept: application/vnd.npm.install-v1+json`). It falls back to the
+  full document when the abbreviated one has no signatures. It also uses the full document when
+  the signing key has an expiry, because only that document has the per-version publish `time`.
+  A metadata response may be at most 64 MiB. Up to 8 packages are checked at once. Redirects
+  are refused.
+- **A `signature_invalid` deny** happens for any of these:
+  - the version has no signature;
+  - no signature has a `keyid` matching a registry key;
+  - the signature does not verify;
+  - the metadata `dist.integrity` differs from the lockfile integrity;
+  - the key had expired when the version was published, or the publish time is missing so expiry
+    cannot be checked.
+
+  A deny blocks the install before anything is downloaded, and nothing in the project changes.
+  As npm does, expiry is compared with the publish time. A key that has expired since then still
+  verifies the versions it signed earlier. On `registry.npmjs.org` that covers most packages
+  published before 2025-01-29.
+- **Provenance.** A version counts as having build provenance when its metadata has
+  `dist.attestations.provenance`. If this version has none but an earlier version of the same
+  package does (earlier by semver), the install gets a `provenance_missing` finding that needs
+  approval: "earlier versions were published with build provenance; this one was not (possible
+  hijacked account)". A package that never had provenance gets no finding.
+- **Turning it off.** `signatures.verify = false` in `settings.toml` skips all of the above, and
+  `fail2commit status` prints "npm registry signature checks are off".
+
+Limits:
+
+- Sigstore provenance is **not verified**. The guard only reads whether provenance is present.
+  It does not check the Fulcio certificate chain, the Rekor transparency-log entry, or which
+  repository and workflow built the package.
+- The signing keys come from the same registry as the packages. The check catches a tampered
+  artifact, metadata or lockfile from a mirror, cache or proxy. It does not catch a registry
+  that has itself been compromised.
+- Prerelease tags are compared as whole strings when deciding which version is earlier.

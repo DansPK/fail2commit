@@ -171,6 +171,12 @@ pub fn status(ctx: &Ctx) -> CmdResult {
             "unavailable"
         }
     );
+    if !ctx.settings.signatures.verify {
+        // CR-018: an opted-out security check must stay visible.
+        text.push_str(
+            "\nwarning: npm registry signature checks are off (signatures.verify = false)",
+        );
+    }
     for (tool, file) in &unguarded {
         let shim = ctx.paths.bin_dir.join(if cfg!(windows) {
             format!("{tool}.exe")
@@ -202,6 +208,7 @@ pub fn status(ctx: &Ctx) -> CmdResult {
             "cache_max_bytes": ctx.settings.advisories.cache_max_bytes,
             "timeout_secs": ctx.settings.advisories.timeout_secs,
         },
+        "signatures": ctx.settings.signatures,
         "sandbox": {
             "enabled": ctx.settings.sandbox.enabled,
             "backend": probe.backend,
