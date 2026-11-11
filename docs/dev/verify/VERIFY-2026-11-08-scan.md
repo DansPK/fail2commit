@@ -96,7 +96,7 @@ exit 0
    `T: DeserializeOwned`.
 3. Fixed during this task: the suspicious fixture placed the `execSync` call on line 6
    while the test asserted line 5; the fixture now matches the asserted line.
-4. **Out of T-006 scope, still open — needs a coordinator decision (candidate BUG):**
+4. **Out of T-006 scope at this SHA — already fixed on the integration branch.**
    `cargo test --workspace` fails on Linux only, in `crates/fail2commit/src/main.rs`
    (`tests::shims_route_to_subcommands`, line 176):
 
@@ -111,6 +111,8 @@ exit 0
    the Windows-style shim name `C:\b\NPM.exe` never maps to the `npm` subcommand. The
    file is frozen and coordinator-owned; T-006 did not modify it
    (`git diff HEAD -- crates/fail2commit/src/main.rs` is empty). It passes on Windows.
+   The coordinator confirmed the fix landed on the integration branch, so this row is
+   expected to clear when T-006 is integrated and was not re-opened here.
 
 ## 5. Verdict
 

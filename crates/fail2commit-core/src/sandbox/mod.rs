@@ -544,5 +544,4 @@ mod tests {
         assert_eq!(err.code, ResultCode::IsolationUnavailable);
         assert!(!to.exists());
     }
-
 }
