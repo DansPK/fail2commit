@@ -41,7 +41,11 @@ Your data in `%LOCALAPPDATA%\fail2commit` and `%APPDATA%\fail2commit` (settings,
 & "$env:LOCALAPPDATA\Programs\fail2commit\uninstall.exe" /S /PURGE
 ```
 
-Empty folders that setup created (`Documents\PowerShell`, `Documents\WindowsPowerShell`) are removed. Two leftovers belong to Windows and NSIS, not fail2commit: the empty `%LOCALAPPDATA%\Programs` folder, and the uninstaller's temporary copy in `%TEMP%`, which Windows clears later.
+Empty folders that setup created (`Documents\PowerShell`, `Documents\WindowsPowerShell`) are removed; a setup made by 0.1.3 or earlier did not record that, so after an upgrade from those versions an empty `Documents\PowerShell` may stay. If `fail2commit.exe` was deleted by hand, the uninstaller rolls back with the copy in the shim folder instead.
+
+Leftovers that belong to Windows or NSIS, not fail2commit: the empty `%LOCALAPPDATA%\Programs` folder, the uninstaller's temporary copy in `%TEMP%` (Windows clears it later), Explorer's record of the tray icon (`HKCU\Control Panel\NotifyIconSettings` and a cached icon in `%TEMP%`), and its Start Menu shortcut history.
+
+If you declined the administrator prompt for the machine-wide shims, run the command the uninstaller shows, as administrator. The running copy cannot delete itself, so Windows deletes it and `C:\Program Files\fail2commit` at the next restart.
 
 ## The tray
 

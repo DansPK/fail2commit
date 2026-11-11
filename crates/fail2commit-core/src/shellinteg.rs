@@ -106,8 +106,12 @@ fn block(flavor: Flavor, exe: &Path) -> String {
     match flavor {
         Flavor::Posix => {
             let e = sh_quote(&exe.replace('\\', "/"));
+            // CR-021: if fail2commit was removed without uninstall-integrations,
+            // fall back to the real command instead of "not found".
             for (f, sub) in [("pip", "pip"), ("pip3", "pip"), ("npm", "npm")] {
-                b.push_str(&format!("{f}() {{ {e} {sub} \"$@\"; }}\n"));
+                b.push_str(&format!(
+                    "{f}() {{ if [ -x {e} ]; then {e} {sub} \"$@\"; else command {f} \"$@\"; fi; }}\n"
+                ));
             }
         }
         Flavor::PowerShell => {
@@ -175,7 +179,7 @@ impl Integration for ShellIntegration {
                 if let Some(parent) = file.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                crate::fsutil::atomic_write(&file, text.as_bytes())?;
+                crate::fsutil::write_user_file(&file, text.as_bytes())?;
             }
             changes.push(OwnedChange {
                 integration: ID.into(),
@@ -203,7 +207,7 @@ impl Integration for ShellIntegration {
                     }
                 }
             } else {
-                crate::fsutil::atomic_write(file, text.as_bytes())?;
+                crate::fsutil::write_user_file(file, text.as_bytes())?;
             }
         }
         Ok(())
@@ -251,7 +255,9 @@ mod tests {
         let mut again = strip_block(&text);
         again.push_str(&block(Flavor::Posix, exe));
         assert_eq!(again.matches(BEGIN).count(), 1);
-        assert!(again.contains("pip() { '/opt/it'\\''s dir/fail2commit' pip \"$@\"; }"));
+        assert!(again.contains(
+            "pip() { if [ -x '/opt/it'\\''s dir/fail2commit' ]; then '/opt/it'\\''s dir/fail2commit' pip \"$@\"; else command pip \"$@\"; fi; }"
+        ));
         assert_eq!(
             strip_block(&again).trim_end(),
             "alias ll='ls -l'\nexport A=1"

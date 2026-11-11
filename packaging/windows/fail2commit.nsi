@@ -154,17 +154,26 @@ Section "Uninstall"
   !insertmacro StopTray
 
   ; Roll back what `fail2commit setup` recorded (hooks, shims, startup value).
-  ${If} ${FileExists} "$INSTDIR\fail2commit.exe"
+  ; If fail2commit.exe was deleted, use a temporary copy of the one setup put
+  ; in the shim folder (a copy, because the rollback deletes that folder).
+  StrCpy $R5 "$INSTDIR\fail2commit.exe"
+  ${IfNot} ${FileExists} $R5
+  ${AndIf} ${FileExists} "$LOCALAPPDATA\fail2commit\bin\fail2commit.exe"
+    InitPluginsDir
+    CopyFiles /SILENT "$LOCALAPPDATA\fail2commit\bin\fail2commit.exe" "$PLUGINSDIR\fail2commit.exe"
+    StrCpy $R5 "$PLUGINSDIR\fail2commit.exe"
+  ${EndIf}
+  ${If} ${FileExists} $R5
     DetailPrint "Running fail2commit uninstall-integrations"
-    nsExec::ExecToLog '"$INSTDIR\fail2commit.exe" uninstall-integrations'
+    nsExec::ExecToLog '"$R5" uninstall-integrations'
     Pop $0
     ; Machine-wide shims (CR-013) need administrator rights to remove.
-    nsExec::ExecToLog '"$INSTDIR\fail2commit.exe" machine-shims status'
+    nsExec::ExecToLog '"$R5" machine-shims status'
     Pop $0
     ${If} $0 == 0
       DetailPrint "Asking for administrator rights: fail2commit machine-shims uninstall"
-      ExecShellWait "runas" "$INSTDIR\fail2commit.exe" "machine-shims uninstall" SW_HIDE
-      nsExec::ExecToLog '"$INSTDIR\fail2commit.exe" machine-shims status'
+      ExecShellWait "runas" "$R5" "machine-shims uninstall" SW_HIDE
+      nsExec::ExecToLog '"$R5" machine-shims status'
       Pop $0
       ${If} $0 == 0
         MessageBox MB_OK|MB_ICONEXCLAMATION "The machine-wide npm/pip shims are still installed (administrator rights declined).$\r$\n$\r$\nOpen a terminal as administrator and run:$\r$\n    $\"%ProgramFiles%\fail2commit\shims\fail2commit.exe$\" machine-shims uninstall" /SD IDOK

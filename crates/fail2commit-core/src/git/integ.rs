@@ -104,7 +104,7 @@ impl PathEditor for ProfileEditor {
         if let Some(parent) = self.file.parent() {
             fs::create_dir_all(parent)?;
         }
-        crate::fsutil::atomic_write(&self.file, text.as_bytes())?;
+        crate::fsutil::write_user_file(&self.file, text.as_bytes())?;
         Ok(json!({ "editor": "profile", "file": self.file, "existed": existed }))
     }
 
@@ -120,7 +120,7 @@ impl PathEditor for ProfileEditor {
         if text.trim().is_empty() && !existed {
             fs::remove_file(&self.file)?;
         } else {
-            crate::fsutil::atomic_write(&self.file, text.as_bytes())?;
+            crate::fsutil::write_user_file(&self.file, text.as_bytes())?;
         }
         Ok(())
     }
@@ -327,7 +327,13 @@ HERE=$(cd "$(dirname "$0")" && pwd -P) || exit 1
 tmp=$(mktemp "${{TMPDIR:-/tmp}}/f2c-prepush.XXXXXX") || exit 1
 trap 'rm -f "$tmp"' EXIT HUP INT TERM
 cat > "$tmp" || exit 1
-"$F2C" hook pre-push "$@" < "$tmp" || exit $?
+# CR-021: fail2commit removed without `uninstall-integrations` (dpkg -r): say
+# so and let Git work, instead of failing every push on a missing binary.
+if [ -x "$F2C" ]; then
+  "$F2C" hook pre-push "$@" < "$tmp" || exit $?
+else
+  echo "fail2commit is not installed any more, so this push was not checked. To remove this leftover hook: git config --global --unset core.hooksPath" >&2
+fi
 # CR-010: the approval relay capability is for the hook above, never for the chain.
 unset FAIL2COMMIT_APPROVAL_RELAY
 # Chain what would have run without us: the repository's own hooksPath, else
@@ -574,5 +580,21 @@ mod tests {
     fn script_quotes_exe_with_spaces_and_quotes() {
         let s = hook_script(Path::new("C:\\My Dir\\it's\\f2c.exe"));
         assert!(s.contains("F2C='C:/My Dir/it'\\''s/f2c.exe'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_lets_git_work_when_fail2commit_was_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let hook = d.path().join("pre-push");
+        fs::write(&hook, hook_script(&d.path().join("gone/fail2commit"))).unwrap();
+        let out = std::process::Command::new("sh")
+            .arg(&hook)
+            .current_dir(d.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not installed any more"));
     }
 }

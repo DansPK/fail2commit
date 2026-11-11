@@ -37,6 +37,35 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> crate::Result<()> {
     Ok(())
 }
 
+/// Rewrite a file the user owns (a shell startup file) atomically, but leave it
+/// as the user had it: a symlink is followed and its target rewritten, the
+/// mode is kept, and the folder's permissions are not touched (it may be $HOME).
+pub fn write_user_file(path: &Path, bytes: &[u8]) -> crate::Result<()> {
+    let target = if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::canonicalize(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let dir = target
+        .parent()
+        .ok_or_else(|| crate::Error::internal("user file has no parent"))?;
+    let mut tmp = tempfile::Builder::new().prefix(".f2c-").tempfile_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    let perms = fs::metadata(&target).map(|m| m.permissions());
+    #[cfg(unix)]
+    let perms = perms.or_else(|_| {
+        use std::os::unix::fs::PermissionsExt;
+        Ok::<_, std::io::Error>(fs::Permissions::from_mode(0o644))
+    });
+    if let Ok(p) = perms {
+        tmp.as_file().set_permissions(p)?;
+    }
+    tmp.persist(&target)
+        .map_err(|e| crate::Error::from(e.error))?;
+    Ok(())
+}
+
 /// Hold an exclusive advisory lock on `<path>.lock` while `f` runs.
 pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
     let mut lock_path = path.as_os_str().to_owned();
@@ -116,5 +145,32 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"two");
         assert!(read_bounded(&p, 2).is_err());
         assert_eq!(read_bounded(&p, 3).unwrap(), b"two");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_file_keeps_symlink_mode_and_folder_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        fs::create_dir_all(home.join("dotfiles")).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o750)).unwrap();
+        let real = home.join("dotfiles/bashrc");
+        fs::write(&real, b"old").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = home.join(".bashrc");
+        symlink(&real, &link).unwrap();
+        write_user_file(&link, b"new").unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&real).unwrap(), b"new");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&real), 0o640);
+        assert_eq!(mode(&home), 0o750);
+        let fresh = home.join(".profile");
+        write_user_file(&fresh, b"x").unwrap();
+        assert_eq!(mode(&fresh), 0o644);
     }
 }

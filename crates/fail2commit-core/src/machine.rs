@@ -123,13 +123,22 @@ pub fn uninstall() -> Result<Value> {
                 left.push(p);
             }
         }
+        let mut at_restart = false;
         if left.is_empty() {
             let _ = std::fs::remove_dir(&dir);
             if let Some(parent) = dir.parent() {
                 let _ = std::fs::remove_dir(parent); // only when empty
             }
+        } else {
+            // The running copy (the uninstaller's recovery command runs the shim
+            // itself) cannot delete itself: Windows deletes it, then the folders
+            // once empty, at the next restart.
+            at_restart = left.iter().all(|p| delete_at_restart(p));
+            for d in [Some(dir.as_path()), dir.parent()].into_iter().flatten() {
+                delete_at_restart(d);
+            }
         }
-        Ok(json!({ "dir": dir, "left_in_place": left }))
+        Ok(json!({ "dir": dir, "left_in_place": left, "delete_at_restart": at_restart }))
     }
     #[cfg(not(windows))]
     {
@@ -187,6 +196,17 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
     }
+}
+
+/// Ask Windows to delete `p` at the next restart (administrators only).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn delete_at_restart(p: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    let w: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: `w` is a NUL-terminated UTF-16 path; a null target means delete.
+    unsafe { MoveFileExW(w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) != 0 }
 }
 
 #[cfg(test)]
