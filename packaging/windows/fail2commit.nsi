@@ -15,6 +15,7 @@
 Unicode true
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 
 !ifndef VERSION
   !define VERSION "0.0.0"
@@ -191,6 +192,29 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\fail2commit\fail2commit tray.lnk"
   RMDir "$SMPROGRAMS\fail2commit"
   DeleteRegKey HKCU "${UNINST_KEY}"
-  ; %LOCALAPPDATA%\fail2commit (password verifiers, settings, caches) is user
-  ; data and is kept; docs\windows.md says how to remove it.
+
+  ; User data (settings, password verifier, approvals, caches, signing-key
+  ; records, the offline malware list) is kept unless the user asks: a
+  ; question in the GUI (default No), or /PURGE for a silent uninstall.
+  StrCpy $R2 0
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/PURGE" $R1
+  ${IfNot} ${Errors}
+    StrCpy $R2 1
+  ${ElseIfNot} ${Silent}
+    ${If} ${Cmd} `MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "Also delete your fail2commit settings and data?$\r$\n$\r$\nThis removes your approval password, settings, caches and the offline malware list from:$\r$\n    $LOCALAPPDATA\fail2commit$\r$\n    $APPDATA\fail2commit$\r$\n$\r$\nChoose No to keep them for a later reinstall." IDYES`
+      StrCpy $R2 1
+    ${EndIf}
+  ${EndIf}
+  ${If} $R2 == 1
+    DetailPrint "Deleting fail2commit user data"
+    RMDir /r "$LOCALAPPDATA\fail2commit"
+    RMDir /r "$APPDATA\fail2commit"
+  ${Else}
+    ; Folders that hold nothing are removed either way (RMDir without /r
+    ; deletes only empty folders).
+    RMDir "$LOCALAPPDATA\fail2commit\bin"
+    RMDir "$APPDATA\fail2commit"
+  ${EndIf}
 SectionEnd
