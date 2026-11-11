@@ -597,7 +597,7 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     let truncated = budget.lock().unwrap_or_else(|e| e.into_inner()).truncated;
-    let mut report = monitor.finish();
+    let mut report = monitor.finish(&job_object);
     if truncated {
         report.push(ActivityKind::Limit, "output");
     }
@@ -672,7 +672,7 @@ fn wait_for_tree(
     }
     // The job is exited or already terminated: a bait opener blocked on an
     // unacknowledged break can only finish dying once the oplock is gone.
-    monitor.release_bait();
+    monitor.release_bait(job_object);
     job_object.wait_empty(Instant::now() + CLEANUP_GRACE)?;
     if job_object.active_processes()? != 0 {
         return Err(crate::Error::isolation_unavailable(
@@ -721,10 +721,17 @@ impl Monitor {
         baseline: Option<u64>,
     ) -> crate::Result<Monitor> {
         let bait_files = bait.map(|b| b.files.clone()).unwrap_or_default();
-        let oplocks = bait_files
-            .iter()
-            .map(|(path, rel)| watch::Oplock::request(path, rel.clone(), job_object))
-            .collect::<crate::Result<Vec<_>>>()?;
+        let mut oplocks = Vec::with_capacity(bait_files.len());
+        for (path, rel) in &bait_files {
+            match watch::Oplock::request(path, rel.clone(), job_object) {
+                Ok(oplock) => oplocks.push(oplock),
+                Err(error) => {
+                    // Confirmed closes, so a failed setup leaks no buffers.
+                    watch::release_all(&mut oplocks, job_object);
+                    return Err(error);
+                }
+            }
+        }
         let disk = match (job.limits.disk_bytes, baseline) {
             (Some(limit), Some(base)) => {
                 Some(watch::DiskWatch::start(work_dir.to_path_buf(), base, limit))
@@ -770,6 +777,9 @@ impl Monitor {
                 )));
             }
             self.rearmed[i] = true;
+            // This request already completed its break; the replacement below
+            // then only has to close it.
+            self.oplocks[i].mark_completed();
             let (path, rel) = self.bait_files[i].clone();
             // Replacing drops the old holder, which releases the other opener.
             self.oplocks[i] = watch::Oplock::request(&path, rel, job_object)?;
@@ -779,14 +789,16 @@ impl Monitor {
 
     fn on_event(&mut self, event: &ffi::PortEvent) -> Flow {
         if event.key == ffi::BAIT_KEY {
-            let Some(rel) = self
+            let Some(i) = self
                 .oplocks
                 .iter()
-                .find(|o| o.overlapped_addr() == event.value)
-                .map(|o| o.rel.clone())
+                .position(|o| o.overlapped_addr() == event.value)
             else {
                 return Flow::Continue;
             };
+            // The break completed this request: releasing it only has to close.
+            self.oplocks[i].mark_completed();
+            let rel = self.oplocks[i].rel.clone();
             self.push(ActivityKind::Bait, &rel);
             return Flow::Stop;
         }
@@ -861,15 +873,17 @@ impl Monitor {
         Ok(stop)
     }
 
-    /// Releases every bait oplock. Only called once the job is exited or
-    /// terminated, so no job code reads a bait file afterwards.
-    fn release_bait(&mut self) {
+    /// Releases every bait oplock, confirming each close on the job port. Only
+    /// called once the job is exited or terminated, so no job code reads a bait
+    /// file afterwards.
+    fn release_bait(&mut self, job_object: &ffi::Job) {
+        watch::release_all(&mut self.oplocks, job_object);
         self.oplocks.clear();
     }
 
-    fn finish(mut self) -> ActivityReport {
+    fn finish(mut self, job_object: &ffi::Job) -> ActivityReport {
         // Oplocks first: the ACL revoke reopens the bait files.
-        self.release_bait();
+        self.release_bait(job_object);
         self.disk.take();
         std::mem::take(&mut self.report)
     }
@@ -1905,6 +1919,18 @@ mod tests {
         assert!(report.controls.iter().all(|(_, verified)| *verified));
     }
 
+    /// The probe control `bait-oplock-detection` in isolation: a break must
+    /// reach the job port, and an oplock nobody broke must release when its
+    /// holder closes. The second half is the one that catches a release waiting
+    /// on a signal a completion port never writes (`OVERLAPPED::Internal` stays
+    /// `STATUS_PENDING` until the packet is dequeued).
+    #[test]
+    fn the_oplock_self_test_releases_a_broken_and_an_idle_oplock() {
+        let stage = test_stage("oplock-self-test-");
+        let (_read_only, work) = stage_dirs(stage.path());
+        watch::self_test_oplock(&work).expect("bait oplock self test");
+    }
+
     #[test]
     fn a_second_probe_reuses_a_short_lived_positive_verdict() {
         let first = Instant::now();
@@ -2124,7 +2150,7 @@ mod tests {
         for _ in 0..(crate::isolation::MAX_ACTIVITY + 50) {
             monitor.push(ActivityKind::Process, &long);
         }
-        let report = monitor.finish();
+        let report = monitor.finish(&job_object);
         assert_eq!(report.events.len(), crate::isolation::MAX_ACTIVITY);
         assert!(report.truncated);
         assert!(report

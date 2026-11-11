@@ -31,6 +31,43 @@
 <!--  -->
 <!-- **Why it's invisible:** Explanation of silent failure mode -->
 
+## A completion port reports status in the packet, never in `OVERLAPPED::Internal`
+
+**Problem:** the bait-oplock release polled `OVERLAPPED::Internal` for five seconds after closing the holder and then reported "not released". The probe self-test therefore failed on the Windows 11 host (`bait oplock self test failed (... idle oplock released: false)`), so the AppContainer backend reported itself unavailable and the whole Windows sandbox was closed.
+
+**Root Cause:** the oplock handle is bound to the job's completion port. For such a handle the I/O manager queues the completion packet and leaves `Internal` at `STATUS_PENDING` until that packet is dequeued with `GetQueuedCompletionStatus`; only then does `Internal` receive the status (`0x216` for the cancelled request). `HasOverlappedIoCompleted` and `GetOverlappedResult` are documented as unreliable for port-bound handles for the same reason.
+
+**Correct Pattern:** track completion per request: a break packet that the wait loop already dequeued marks the request complete, and any other request is confirmed by closing the holder and waiting for its packet on the job port.
+
+```rust
+// pending request: close, then wait for its packet
+self.handle.take();
+while Instant::now() < deadline {
+    if let Some(e) = job.next_event(slice) {
+        if e.key == ffi::BAIT_KEY && e.value == self.overlapped_addr() {
+            return true;
+        }
+    }
+}
+```
+
+**Wrong Pattern:**
+
+```rust
+self.handle.take();
+while unsafe { internal.read_volatile() } == STATUS_PENDING {
+    // never leaves STATUS_PENDING while the packet sits in the port queue
+    thread::sleep(Duration::from_millis(1));
+}
+```
+
+**Prevention Checklist:**
+- With a completion port, read completion from the port, not from the `OVERLAPPED`.
+- Reproduce Win32 behaviour with a standalone probe (PowerShell `Add-Type` + P/Invoke is enough) before blaming the host or the file system.
+- Keep a probe control that exercises the *unbroken* close path; the break path hides this bug because the break itself completes the request.
+
+**Why it's invisible:** the same code works without a completion port, and the break path always works, so only a request that nobody breaks exposes it - and the product then fails closed, which looks like an environment limitation.
+
 ## Windows PowerShell 5.1 corrupts UTF-8 files on read-modify-write
 
 **Problem:** `Get-Content -Raw` followed by `Set-Content -Encoding utf8` turned `–` into `â€“` in TODO.md and added a BOM.

@@ -73,6 +73,9 @@ pub(super) struct Oplock {
     state: Box<OplockState>,
     /// The bait file relative to the bait home, for the report.
     pub(super) rel: String,
+    /// Set once this request's completion was dequeued (its break arrived).
+    /// The request no longer pends, so closing the holder needs no wait.
+    completed: bool,
 }
 
 impl Oplock {
@@ -131,6 +134,7 @@ impl Oplock {
             handle: Some(handle),
             state,
             rel,
+            completed: false,
         };
         if ok != 0 || err != ERROR_IO_PENDING {
             // Completing at once means no oplock is held (refused or already
@@ -149,50 +153,133 @@ impl Oplock {
     }
 }
 
-/// NTSTATUS the kernel keeps in `OVERLAPPED::Internal` while a request runs.
-const STATUS_PENDING: usize = 0x103;
 /// How long a released oplock request may take to complete.
 const RELEASE_WAIT: Duration = Duration::from_secs(5);
+/// Longest single port wait while a released request completes.
+const RELEASE_POLL_MS: u32 = 25;
+
+/// A request state that no kernel request ever referenced.
+#[allow(unsafe_code)]
+fn idle_state() -> Box<OplockState> {
+    Box::new(OplockState {
+        // SAFETY: all-zero is a valid OVERLAPPED.
+        ov: unsafe { std::mem::zeroed() },
+        out: OplockOutput::default(),
+    })
+}
 
 impl Oplock {
+    /// Record that this request's completion was dequeued (its break arrived).
+    pub(super) fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+
     /// Closes the holder, which releases the oplock (and any opener waiting on
-    /// its break) and completes the pending request. A cancel-then-wait-forever
-    /// drop is not used: bait jobs hung in it on the Win11 VM. `false` means
-    /// the request did not finish within
-    /// [`RELEASE_WAIT`]; its buffers are then leaked, never freed under the
-    /// kernel.
-    #[allow(unsafe_code)]
-    pub(super) fn release(&mut self) -> bool {
-        if self.handle.take().is_none() {
+    /// its break). `true` means the request needs no further wait: it already
+    /// completed, so its packet was dequeued earlier.
+    fn close(&mut self) -> bool {
+        self.handle.take().is_none() || self.completed
+    }
+
+    /// The request did not complete: its buffers are kept for the kernel,
+    /// which may still write into them.
+    fn abandon(&mut self) {
+        let state = std::mem::replace(&mut self.state, idle_state());
+        Box::leak(state);
+    }
+
+    /// Closes one holder and waits for its completion packet on the job port.
+    ///
+    /// Completion is read from the port, never from `OVERLAPPED::Internal`: for
+    /// a handle bound to a completion port the I/O manager queues the
+    /// completion packet and leaves `Internal` at `STATUS_PENDING` until that
+    /// packet is dequeued (measured on the Windows 11 26200 host). Polling
+    /// `Internal` alone therefore never finishes, which made the probe
+    /// self-test fail its idle-oplock check and report the backend as
+    /// unavailable. A cancel-then-wait-forever drop is not used either: bait
+    /// jobs hung in it on the Win11 VM.
+    ///
+    /// A packet that belongs to another request is dropped here; callers with
+    /// several holders release them with [`release_all`], which matches every
+    /// packet to its own request. `false` means the request did not finish
+    /// within [`RELEASE_WAIT`].
+    pub(super) fn release(&mut self, job: &Job) -> bool {
+        if self.close() {
             return true;
         }
         let deadline = std::time::Instant::now() + RELEASE_WAIT;
-        let internal = std::ptr::addr_of!(self.state.ov.Internal);
-        // SAFETY: the kernel writes the final status to this field once; a
-        // volatile read of an aligned usize is the documented way to poll it
-        // (HasOverlappedIoCompleted).
-        while unsafe { internal.read_volatile() } == STATUS_PENDING {
-            if std::time::Instant::now() >= deadline {
-                let state = std::mem::replace(
-                    &mut self.state,
-                    Box::new(OplockState {
-                        // SAFETY: all-zero is a valid OVERLAPPED.
-                        ov: unsafe { std::mem::zeroed() },
-                        out: OplockOutput::default(),
-                    }),
-                );
-                Box::leak(state);
-                return false;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
             }
-            thread::sleep(Duration::from_millis(1));
+            let slice = left.min(Duration::from_millis(u64::from(RELEASE_POLL_MS)));
+            let Some(event) = job.next_event(slice.as_millis() as u32) else {
+                continue;
+            };
+            if event.key == ffi::BAIT_KEY && event.value == self.overlapped_addr() {
+                self.completed = true;
+                return true;
+            }
         }
-        true
+        self.abandon();
+        false
+    }
+}
+
+/// Close every holder, then wait at most [`RELEASE_WAIT`] in total for the
+/// completion packet of each request that was still pending.
+///
+/// Every holder is closed before the first wait starts, so a packet cannot be
+/// queued for a sibling that has not been closed yet, and each packet is matched
+/// to its own request by `OVERLAPPED` address. Callers use this only once the
+/// job has exited or been terminated: a packet that is not a bait completion is
+/// then dropped, because the later waits poll the job's own accounting rather
+/// than its notifications.
+pub(super) fn release_all(oplocks: &mut [Oplock], job: &Job) {
+    let mut pending: Vec<usize> = Vec::new();
+    for (i, oplock) in oplocks.iter_mut().enumerate() {
+        if !oplock.close() {
+            pending.push(i);
+        }
+    }
+    let deadline = std::time::Instant::now() + RELEASE_WAIT;
+    while !pending.is_empty() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let slice = left.min(Duration::from_millis(u64::from(RELEASE_POLL_MS)));
+        let Some(event) = job.next_event(slice.as_millis() as u32) else {
+            continue;
+        };
+        if event.key != ffi::BAIT_KEY {
+            continue;
+        }
+        let matched = pending
+            .iter()
+            .position(|&i| oplocks[i].overlapped_addr() == event.value);
+        if let Some(pos) = matched {
+            let index = pending.remove(pos);
+            oplocks[index].mark_completed();
+        }
+    }
+    for index in pending {
+        oplocks[index].abandon();
     }
 }
 
 impl Drop for Oplock {
     fn drop(&mut self) {
-        let _ = self.release();
+        // Without the job port a close cannot be confirmed, so a request that
+        // may still be pending keeps its buffers: the kernel could write into
+        // them. Every normal path releases first (`release`/`release_all`),
+        // which leaves no handle behind and nothing the kernel still
+        // references.
+        if self.handle.take().is_some() && !self.completed {
+            let state = std::mem::replace(&mut self.state, idle_state());
+            Box::leak(state);
+        }
     }
 }
 
@@ -203,7 +290,7 @@ pub(super) fn self_test_oplock(dir: &Path) -> crate::Result<()> {
     let path = dir.join("oplock-self-test.txt");
     std::fs::write(&path, b"oplock self test")?;
     let job = Job::new(1, 16 * 1024 * 1024)?;
-    let lock = Oplock::request(&path, "oplock-self-test.txt".into(), &job)?;
+    let mut lock = Oplock::request(&path, "oplock-self-test.txt".into(), &job)?;
     let reader_path = path.clone();
     let reader = thread::spawn(move || std::fs::read(reader_path).is_ok());
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -211,27 +298,33 @@ pub(super) fn self_test_oplock(dir: &Path) -> crate::Result<()> {
     while std::time::Instant::now() < deadline {
         if let Some(e) = job.next_event(25) {
             if e.key == ffi::BAIT_KEY && e.value == lock.overlapped_addr() {
+                lock.mark_completed();
                 broke = true;
                 break;
             }
         }
     }
-    drop(lock);
+    // The broken holder releases its blocked reader as it closes; the request
+    // already completed above, so this only has to confirm the close.
+    let broken_released = lock.release(&job);
     let read_ok = reader.join().unwrap_or(false);
     let _ = std::fs::remove_file(&path);
     // An oplock nobody broke must also release promptly (every bait file of a
-    // clean job ends this way).
+    // clean job ends this way). Its completion is the only evidence the close
+    // worked, so this is the case that catches a release that waits on the
+    // wrong signal.
     let idle_path = dir.join("oplock-self-test-idle.txt");
     std::fs::write(&idle_path, b"oplock self test")?;
     let mut idle = Oplock::request(&idle_path, "oplock-self-test-idle.txt".into(), &job)?;
-    let idle_released = idle.release();
+    let idle_released = idle.release(&job);
     drop(idle);
     let _ = std::fs::remove_file(&idle_path);
-    if broke && read_ok && idle_released {
+    if broke && read_ok && broken_released && idle_released {
         Ok(())
     } else {
         Err(crate::Error::isolation_unavailable(format!(
-            "bait oplock self test failed (break delivered: {broke}, reader finished: {read_ok}, idle oplock released: {idle_released})"
+            "bait oplock self test failed (break delivered: {broke}, reader finished: {read_ok}, \
+             broken oplock released: {broken_released}, idle oplock released: {idle_released})"
         )))
     }
 }

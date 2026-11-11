@@ -256,12 +256,36 @@ fn hostile_script_cannot_reach_network_home_or_checkout() {
         &n.project,
         &["--json", "--approver", "none", "npm", "install", "hostile"],
     );
-    assert_eq!(
-        r.code, 0,
-        "{}
-{}",
-        r.stdout, r.stderr
-    );
+    // SPEC-014 section 1: the Windows backend stops a job at its first
+    // connection to a non-public destination, so the script is killed at
+    // `net.connect(127.0.0.1)` and never writes its report. Bubblewrap leaves
+    // the network unshared, so on Linux the script finishes and reports the
+    // refusal itself. Both outcomes have to prove that nothing escaped.
+    if cfg!(target_os = "windows") {
+        assert_ne!(r.code, 0, "{}\n{}\n{}", r.stdout, r.stderr, r.json);
+        let message = r.json["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("nothing was installed"),
+            "unexpected failure: {message}"
+        );
+        assert!(
+            !n.project
+                .join("node_modules/hostile/build/report.json")
+                .exists(),
+            "the stopped job still wrote its report"
+        );
+        assert!(canary.is_file(), "the home canary disappeared");
+        assert_eq!(std::fs::read(&checkout_file).unwrap(), before_checkout);
+        assert!(!outside.exists(), "package wrote outside its stage");
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            baseline,
+            "the loopback listener saw a connection from the sandbox"
+        );
+        assert!(n.stage_leftovers().is_empty(), "{:?}", n.stage_leftovers());
+        return;
+    }
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
     let report: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(n.project.join("node_modules/hostile/build/report.json")).unwrap(),
     )

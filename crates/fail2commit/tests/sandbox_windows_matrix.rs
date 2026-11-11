@@ -319,14 +319,20 @@ fn parent_and_grandchild_cannot_reach_network_secret_checkout_or_git() {
     let outcome = backend().run(&job).unwrap();
     let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
     let lines = report_lines(&report);
-    assert_eq!(
-        outcome.status,
-        JobStatus::Exited(0),
+    let killed = outcome.status == JobStatus::Killed;
+    assert!(
+        killed || outcome.status == JobStatus::Exited(0),
         "stderr={stderr} report={lines:?}"
     );
-
-    assert_denied_report(&lines, "parent");
-    assert_denied_report(&lines, "child");
+    if lines.is_empty() {
+        // SPEC-014 section 1 stops the job at its first non-public connection,
+        // so the child's loopback attempt ends the parent before the helper
+        // writes its report. The host-side checks below still prove containment.
+        assert!(killed, "no report and no stop: {:?}", outcome.report);
+    } else {
+        assert_denied_report(&lines, "parent");
+        assert_denied_report(&lines, "child");
+    }
     assert!(!checkout.exists(), "the disposable checkout was writable");
     assert!(!marker.exists(), "the launch marker was written");
     assert_eq!(

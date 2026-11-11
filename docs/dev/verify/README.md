@@ -20,6 +20,7 @@ Each report records the exact commands, exit codes and the tested commit. A skip
 | Package and script scanning | [VERIFY-2026-11-08-scan.md](VERIFY-2026-11-08-scan.md) |
 | Linux sandbox | [VERIFY-2026-11-08-sandbox-linux.md](VERIFY-2026-11-08-sandbox-linux.md) |
 | Windows sandbox | [VERIFY-2026-11-08-sandbox-windows.md](VERIFY-2026-11-08-sandbox-windows.md) |
+| Windows sandbox 0.1.4 bait-oplock release | [VERIFY-2026-11-12-oplock-release.md](VERIFY-2026-11-12-oplock-release.md) |
 | Sandbox policy | [VERIFY-2026-11-08-sandbox-policy.md](VERIFY-2026-11-08-sandbox-policy.md) |
 | Windows tray and installer | [VERIFY-2026-11-08-windows-tray.md](VERIFY-2026-11-08-windows-tray.md) |
 | VS Code | [VERIFY-2026-11-08-vscode.md](VERIFY-2026-11-08-vscode.md) |

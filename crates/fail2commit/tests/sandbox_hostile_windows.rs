@@ -155,6 +155,17 @@ fn answer(out: &JobOutcome, label: &str) -> String {
     })
 }
 
+/// The connect never reached `target`: either the helper reported a denial, or
+/// the backend stopped the job at the non-public destination (SPEC-014 section
+/// 1), which is the stronger outcome and kills the helper before it can answer.
+fn connect_refused(out: &JobOutcome, target: &str) -> bool {
+    let refused = entries(out, ActivityKind::NetRefused);
+    (out.status == JobStatus::Killed && !refused.is_empty())
+        || answers(out)
+            .get(&format!("connect:{target}"))
+            .is_some_and(|a| denied(a))
+}
+
 fn entries(out: &JobOutcome, kind: ActivityKind) -> Vec<String> {
     out.report
         .events
@@ -707,8 +718,9 @@ fn hb032_hb035_loopback_and_local_names_are_refused() {
         let out = run(&spec(&st, &actions, mode, false));
         for t in &targets {
             assert!(
-                denied(&answer(&out, &format!("connect:{t}"))),
-                "{t} reachable in {mode:?}"
+                connect_refused(&out, t),
+                "{t} reachable in {mode:?}: {:?}",
+                out.report
             );
         }
     }
@@ -753,10 +765,7 @@ fn hb033_lan_and_gateway_are_refused() {
     }
     let out = run(&spec(&st, &actions, NetworkMode::Internet, false));
     for t in &targets {
-        assert!(
-            denied(&answer(&out, &format!("connect:{t}"))),
-            "{t} reachable"
-        );
+        assert!(connect_refused(&out, t), "{t} reachable: {:?}", out.report);
     }
 }
 
@@ -851,7 +860,6 @@ fn hb020_reading_the_bait_npmrc_stops_the_job() {
 
 #[test]
 fn hb021_every_bait_file_trips() {
-    let st = stage();
     for rel in [
         ".ssh/id_ed25519",
         ".git-credentials",
@@ -860,6 +868,9 @@ fn hb021_every_bait_file_trips() {
         ".pypirc",
         ".config/gh/hosts.yml",
     ] {
+        // A fresh stage per run: the bait home is placed in the work dir and a
+        // job may never overwrite bait a previous run left there (SPEC-014 2.1).
+        let st = stage();
         let out = run(&spec(&st, &["read-bait", rel], NetworkMode::None, true));
         assert_eq!(out.status, JobStatus::Killed, "{rel}: {:?}", out.report);
         let bait = entries(&out, ActivityKind::Bait);

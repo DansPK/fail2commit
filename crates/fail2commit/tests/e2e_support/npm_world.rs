@@ -79,13 +79,18 @@ impl NpmWorld {
         }
     }
 
-    /// Files left behind in the sandbox stage root (must be none).
+    /// Per-job stage directories left behind in the sandbox stage root (must be
+    /// none). The backend's own state in that root is not a leftover: the
+    /// profile record directory (SPEC-014 section 6) and a pending revoke record
+    /// (S7B-006) are expected entries, not residue of one job.
     pub fn stage_leftovers(&self) -> Vec<String> {
+        const STATE: [&str; 2] = ["profile-records", "pending-revoke.json"];
         let root = self.w.paths.cache_dir.join("sandbox-stage");
         match std::fs::read_dir(&root) {
             Ok(rd) => rd
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| !STATE.contains(&name.as_str()))
                 .collect(),
             // No stage root yet is "nothing left"; any other failure is not.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
