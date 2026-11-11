@@ -3,9 +3,13 @@
 //! `windows.rs`: T-007b (sandboxrs-windows AppContainer).
 //!
 //! Frozen API: [`platform_backend`], [`run_job`]. Coordinator-owned and frozen
-//! for 0.1.4: [`bait`] (FR-024) and [`netpolicy`] (FR-023).
+//! for 0.1.4: [`bait`] (FR-024) and [`netpolicy`] (FR-023). [`report_findings`]
+//! turns an FR-026 activity report into findings.
 
-use crate::isolation::{JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend};
+use crate::isolation::{
+    ActivityKind, ActivityReport, JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend,
+};
+use crate::protocol::{Finding, FindingAction, FindingKind};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -21,6 +25,55 @@ mod windows;
 /// (`Bubblewrap::with_bwrap`) or force the rlimit-only path.
 #[cfg(target_os = "linux")]
 pub use linux::Bubblewrap;
+
+/// Entry point of the `f2c-sandbox-relay` binary: the in-sandbox TCP to Unix relay that gives
+/// `sandbox.network = internet` its only network path (SPEC-013 §4).
+#[cfg(target_os = "linux")]
+pub use linux::relay_main;
+
+/// FR-026 / FR-024: turn an activity report into findings. A bait touch is a `Deny` that no
+/// approval can lift; everything else is informational. Entries are untrusted and bounded, and
+/// their detail is never a secret value (the backends record destinations, paths and limits only).
+pub fn report_findings(report: &ActivityReport) -> Vec<Finding> {
+    let mut out: Vec<Finding> = Vec::new();
+    let mut seen: Vec<(ActivityKind, String)> = Vec::new();
+    for e in report.events.iter().take(crate::isolation::MAX_ACTIVITY) {
+        if seen.iter().any(|(k, d)| *k == e.kind && d == &e.detail) {
+            continue;
+        }
+        seen.push((e.kind, e.detail.clone()));
+        let evidence = format!("{}: {}", kind_name(e.kind), e.detail);
+        let finding = if e.kind == ActivityKind::Bait {
+            Finding::new(
+                FindingKind::BaitTouched,
+                FindingAction::Deny,
+                "sandbox.bait",
+                evidence,
+            )
+        } else {
+            Finding::new(
+                FindingKind::RiskSignal,
+                FindingAction::Info,
+                "sandbox.activity",
+                evidence,
+            )
+        };
+        out.push(finding);
+    }
+    out
+}
+
+fn kind_name(k: ActivityKind) -> &'static str {
+    match k {
+        ActivityKind::FileDenied => "file_denied",
+        ActivityKind::NetAllowed => "net_allowed",
+        ActivityKind::NetRefused => "net_refused",
+        ActivityKind::Process => "process",
+        ActivityKind::Bait => "bait",
+        ActivityKind::Limit => "limit",
+        ActivityKind::Blocked => "blocked",
+    }
+}
 
 /// The backend for this platform. Unsupported platforms get a backend whose
 /// probe reports unavailable, so callers fail closed.
@@ -537,5 +590,42 @@ mod tests {
         let err = run_job(&Unavailable, &job(&work, &to, &["dist"])).unwrap_err();
         assert_eq!(err.code, ResultCode::IsolationUnavailable);
         assert!(!to.exists());
+    }
+
+    /// TC-026-1: bait is a `Deny`, everything else is `Info`, duplicates collapse.
+    #[test]
+    fn report_findings_maps_bait_to_deny() {
+        let mut report = ActivityReport::default();
+        report.push(ActivityKind::Bait, "home/.npmrc");
+        report.push(ActivityKind::NetAllowed, "registry.npmjs.org:443");
+        report.push(ActivityKind::NetAllowed, "registry.npmjs.org:443");
+        report.push(ActivityKind::Limit, "disk");
+        let findings = report_findings(&report);
+        assert_eq!(findings.len(), 3, "{findings:?}");
+        assert_eq!(findings[0].kind, FindingKind::BaitTouched);
+        assert_eq!(findings[0].action, FindingAction::Deny);
+        assert_eq!(findings[0].source, "sandbox.bait");
+        assert_eq!(findings[0].evidence, "bait: home/.npmrc");
+        for f in &findings[1..] {
+            assert_eq!(f.kind, FindingKind::RiskSignal);
+            assert_eq!(f.action, FindingAction::Info);
+            assert_eq!(f.source, "sandbox.activity");
+        }
+        assert!(findings[0].evidence.contains("home/.npmrc"));
+        assert_eq!(report_findings(&ActivityReport::default()), Vec::new());
+    }
+
+    #[test]
+    fn report_findings_is_bounded_by_the_report() {
+        let mut report = ActivityReport::default();
+        for i in 0..(crate::isolation::MAX_ACTIVITY + 50) {
+            report.push(ActivityKind::NetRefused, format!("host{i}:443"));
+        }
+        assert!(report.truncated);
+        assert_eq!(report.events.len(), crate::isolation::MAX_ACTIVITY);
+        assert_eq!(
+            report_findings(&report).len(),
+            crate::isolation::MAX_ACTIVITY
+        );
     }
 }

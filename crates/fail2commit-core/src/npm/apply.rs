@@ -491,6 +491,7 @@ pub fn run_scripts(
         let env = lifecycle_env(tc, tree, &l);
         let cwd = tree.join(&l.path);
         let label = format!("{}@{} {}", l.name, l.version, l.event);
+        let mut findings: Vec<Finding> = Vec::new();
         let (status, tail) = if let Some(stage) = &stage {
             let job = JobSpec {
                 program,
@@ -502,10 +503,12 @@ pub fn run_scripts(
                 exports: vec![],
                 export_to: None,
                 limits: JobLimits::from_settings(&deps.settings.limits),
-                network: crate::isolation::NetworkMode::None,
-                bait: false,
+                network: deps.settings.sandbox.network,
+                bait: true,
             };
             let out = crate::sandbox::run_job(deps.backend, &job)?;
+            // FR-024/FR-026: a bait touch denies the install; other activity is informational.
+            findings = crate::sandbox::report_findings(&out.report);
             let tail = runner::tail(&[out.stderr.as_slice(), out.stdout.as_slice()].concat());
             (out.status, tail)
         } else {
@@ -549,9 +552,18 @@ pub fn run_scripts(
             } else {
                 tail
             };
-            return Err(Error::internal(format!(
-                "lifecycle script {why} ({label}); nothing was installed: {tail}"
-            )));
+            let message =
+                format!("lifecycle script {why} ({label}); nothing was installed: {tail}");
+            // A bait touch is a hard denial (FR-024): it can never be approved away.
+            let denied = findings
+                .iter()
+                .any(|f| f.action == crate::protocol::FindingAction::Deny);
+            let err = if denied {
+                Error::rejected(message)
+            } else {
+                Error::internal(message)
+            };
+            return Err(err.with_findings(findings));
         }
         ran.push(label);
     }

@@ -1,29 +1,55 @@
-//! Bubblewrap backend (T-007a; FR-007, SPEC-007). Design, threat notes and
-//! evidence: docs/sandbox-linux.md.
+//! Bubblewrap backend (T-007a; FR-007, SPEC-007; 0.1.4: SPEC-013).
+//!
+//! Design, threat notes and evidence: docs/sandbox-linux.md. 0.1.4 adds FR-023 (public-internet
+//! only, through an egress proxy), FR-024 (bait credentials and their watchers), FR-026 (activity
+//! report) and the containment rows of FR-020 that bwrap alone cannot cover (seccomp deny-list,
+//! disk meter).
 //!
 //! One job is:
 //! `[systemd-run --user --scope -p TasksMax= -p MemoryMax= --] bwrap <policy>
-//!  -- bash -c WRAPPER f2c-sandbox <nproc|-> <as_kb|-> <program> <args...>`
+//!  -- bash -c WRAPPER f2c-sandbox <limits> <relay> <setpriv> <filter> <program> <args...>`
 //!
-//! The wrapper runs inside the new user namespace, so RLIMIT_NPROC counts only
-//! sandbox processes (set on the outer bwrap it would count every host process
-//! of the user). It then writes a launch marker to fd 4, closes it and execs
-//! the program. No marker means setup failed and nothing was launched.
+//! The wrapper runs inside the new user namespace, so RLIMIT_NPROC counts only sandbox processes
+//! (set on the outer bwrap it would count every host process of the user). It then writes a launch
+//! marker to fd 4, closes it and execs the program. No marker means setup failed and nothing was
+//! launched.
+//!
+//! 0.1.4 keeps `--unshare-all` in both network modes: the sandbox has no route to anything, so
+//! `internet` is the egress proxy reached through the relay bound at `/f2c`, and `none` has no
+//! socket at all.
 
 // pre_exec fd placement and kill(2) need libc; each block has a SAFETY note.
 #![allow(unsafe_code)]
 
-use crate::isolation::{JobLimits, JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend};
+mod baitwatch;
+mod proxy;
+mod relay;
+mod seccomp;
+
+pub use proxy::Watch;
+
+/// Entry point for the `f2c-sandbox-relay` binary (SPEC-013 §4; FR-023).
+pub fn relay_main() -> std::io::Result<()> {
+    relay::main_from_args()
+}
+
+use crate::isolation::{
+    ActivityKind, ActivityReport, JobLimits, JobOutcome, JobSpec, JobStatus, NetworkMode,
+    ProbeReport, SandboxBackend,
+};
+use crate::sandbox::bait::BaitSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,6 +58,7 @@ use std::time::{Duration, Instant};
 const BWRAP_PATHS: [&str; 2] = ["/usr/bin/bwrap", "/usr/local/bin/bwrap"];
 const BASH_PATHS: [&str; 2] = ["/usr/bin/bash", "/bin/bash"];
 const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+const SETPRIV_PATHS: [&str; 2] = ["/usr/bin/setpriv", "/bin/setpriv"];
 
 /// Read-only system trees toolchains need (symlinks on merged-/usr systems).
 const SYSTEM_DIRS: [&str; 7] = [
@@ -61,10 +88,33 @@ const DENY_INSIDE: [&str; 6] = ["/run", "/var/run", "/proc", "/sys", "/dev", "/e
 const STATUS_FD: i32 = 3;
 const MARKER_FD: i32 = 4;
 
-/// `$1` nproc, `$2` address-space KiB (`-` = not set), then the program.
+/// `$1` nproc, `$2` address-space KiB, `$3` file-size KiB, `$4` relay program (`-` for none),
+/// `$5` relay socket, `$6` reserved, `$7` relay ready file, `$8` setpriv (`-` for none),
+/// `$9` seccomp filter file, then the program and its arguments.
+///
+/// The relay is started before the launch marker so a job never runs without its only network path
+/// (fail closed). The marker is written immediately before each `exec`, so a missing marker means
+/// setup failed and nothing from the job was executed.
 const WRAPPER: &str = r#"if [ "$1" != - ]; then ulimit -S -H -u "$1" || exit 125; fi
 if [ "$2" != - ]; then ulimit -S -H -v "$2" || exit 125; fi
-shift 2
+if [ "$3" != - ]; then ulimit -S -H -f "$3" || exit 125; fi
+if [ "$4" != - ]; then
+  "$4" --socket "$5" --ready "$7" >/dev/null 2>&1 &
+  n=0
+  while [ ! -e "$7" ]; do n=$((n + 1)); if [ "$n" -gt 100 ]; then exit 125; fi; sleep 0.05; done
+  p=$(cat "$7" 2>/dev/null)
+  if [ -z "$p" ]; then exit 125; fi
+  export HTTP_PROXY="http://127.0.0.1:$p" HTTPS_PROXY="http://127.0.0.1:$p" ALL_PROXY="http://127.0.0.1:$p" NO_PROXY=
+  export http_proxy="$HTTP_PROXY" https_proxy="$HTTP_PROXY" all_proxy="$HTTP_PROXY" no_proxy=
+  export npm_config_proxy="$HTTP_PROXY" npm_config_https_proxy="$HTTP_PROXY"
+fi
+if [ "$8" != - ]; then
+  sp=$8; fl=$9; shift 9
+  printf L >&4 || exit 125
+  exec 4>&-
+  exec "$sp" --seccomp-filter "$fl" --no-new-privs -- "$@"
+fi
+shift 9
 printf L >&4 || exit 125
 exec 4>&-
 exec "$@""#;
@@ -102,6 +152,8 @@ struct Probed {
 struct Tools {
     bwrap: PathBuf,
     bash: PathBuf,
+    /// Applies the seccomp deny-list inside the sandbox (SPEC-013 §6).
+    setpriv: PathBuf,
     scope: Option<Scope>,
 }
 
@@ -149,10 +201,15 @@ impl Bubblewrap {
             .iter()
             .find_map(|p| trusted_exe(Path::new(p)).ok());
         controls.push(("wrapper_shell".into(), bash.is_some()));
-        let (Some(bwrap), Some(bash)) = (bwrap, bash) else {
+        let setpriv = SETPRIV_PATHS
+            .iter()
+            .find_map(|p| trusted_exe(Path::new(p)).ok());
+        controls.push(("seccomp_wrapper".into(), setpriv.is_some()));
+        let (Some(bwrap), Some(bash), Some(setpriv)) = (bwrap, bash, setpriv) else {
             return unavailable(
                 controls,
-                "no root-owned, non-writable bwrap and bash in /usr/bin or /usr/local/bin".into(),
+                "no root-owned, non-writable bwrap, bash and setpriv in /usr/bin, /usr/local/bin or /bin"
+                    .into(),
             );
         };
         let scope = if self.cgroup {
@@ -160,7 +217,12 @@ impl Bubblewrap {
         } else {
             None
         };
-        let tools = Tools { bwrap, bash, scope };
+        let tools = Tools {
+            bwrap,
+            bash,
+            setpriv,
+            scope,
+        };
         let mut unexpected = String::new();
         match self_test(&tools, &mut unexpected) {
             Ok(list) => controls.extend(list),
@@ -294,9 +356,147 @@ fn no_nul(s: &std::ffi::OsStr) -> bool {
     !s.as_bytes().contains(&0)
 }
 
+/// Sandbox path of the job's control directory (SPEC-013 §3).
+const CTL_MOUNT: &str = "/f2c";
+
+/// Everything one job needs outside its own tree: the control directory (relay, seccomp filter,
+/// egress socket, bait home) and the watchers that fill the FR-026 report.
+struct JobCtl {
+    dir: tempfile::TempDir,
+    /// Effective environment: `job.env` with the fake home and the bait variables applied.
+    env: Vec<(OsString, OsString)>,
+    relay: Option<PathBuf>,
+    /// Sandbox path of the seccomp filter, or `-` when none was written.
+    filter: String,
+    watch: Arc<Watch>,
+    egress: Option<proxy::Egress>,
+    bait_watcher: Option<baitwatch::BaitWatcher>,
+    meter_stop: Arc<AtomicBool>,
+    meter: Option<thread::JoinHandle<()>>,
+}
+
+impl JobCtl {
+    fn create(job: &JobSpec) -> crate::Result<JobCtl> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let watch = Arc::new(Watch::default());
+        // seccomp: mandatory containment (SPEC-013 §6).
+        let filter_host = root.join("seccomp.bpf");
+        seccomp::write_filter(&filter_host)?;
+        // Bait home: the job's HOME, never inside the verified/exported tree.
+        let mut bait_set = None;
+        let mut bait_watcher = None;
+        let mut env: Vec<(OsString, OsString)> = job.env.clone();
+        let mut home = None;
+        if job.bait {
+            let set = BaitSet::generate()?;
+            let bait_home = root.join("home");
+            fs::create_dir(&bait_home)?;
+            let files = set.write_into(&bait_home)?;
+            env.retain(|(k, _)| k != "HOME");
+            env.push(("HOME".into(), format!("{CTL_MOUNT}/home").into()));
+            for (k, v) in &set.env {
+                env.retain(|(name, _)| name != k.as_str());
+                env.push((k.as_str().into(), v.as_str().into()));
+            }
+            bait_watcher = Some(baitwatch::BaitWatcher::start(
+                &bait_home,
+                &files,
+                Arc::clone(&watch),
+            )?);
+            bait_set = Some(Arc::new(set));
+            home = Some(bait_home);
+        }
+        // Network: `internet` is the egress proxy behind the relay; `none` is no path at all.
+        let mut relay = None;
+        let mut egress = None;
+        if job.network == NetworkMode::Internet {
+            let program = relay::locate().ok_or_else(|| {
+                crate::Error::isolation_unavailable(
+                    "sandbox network: no f2c-sandbox-relay next to the executable (FR-023)",
+                )
+            })?;
+            let staged = root.join("relay");
+            fs::copy(&program, &staged)?;
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o555))?;
+            egress = Some(proxy::start(&root, Arc::clone(&watch), bait_set.clone())?);
+            relay = Some(PathBuf::from(format!("{CTL_MOUNT}/relay")));
+        }
+        let metered: Vec<PathBuf> = std::iter::once(job.work_dir.clone())
+            .chain(home.clone())
+            .collect();
+        let meter_stop = Arc::new(AtomicBool::new(false));
+        let meter = job
+            .limits
+            .disk_bytes
+            .map(|limit| meter_thread(metered, limit, Arc::clone(&watch), meter_stop.clone()));
+        Ok(JobCtl {
+            dir,
+            env,
+            relay,
+            filter: format!("{CTL_MOUNT}/seccomp.bpf"),
+            watch,
+            egress,
+            bait_watcher,
+            meter_stop,
+            meter,
+        })
+    }
+}
+
+impl Drop for JobCtl {
+    fn drop(&mut self) {
+        self.meter_stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.meter.take() {
+            let _ = t.join();
+        }
+        drop(self.egress.take());
+        drop(self.bait_watcher.take());
+        let _ = &self.dir;
+    }
+}
+
+/// Sample the stage and the bait home; stop the job when it writes past `limit`.
+fn meter_thread(
+    paths: Vec<PathBuf>,
+    limit: u64,
+    watch: Arc<Watch>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+            let used: u64 = paths.iter().map(|p| tree_bytes(p)).sum();
+            if used > limit {
+                watch.trip(ActivityKind::Limit, format!("disk {used} > {limit} bytes"));
+                return;
+            }
+        }
+    })
+}
+
+/// Bytes below `root`, not following links and never failing the job on an I/O error.
+fn tree_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else if md.is_file() {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
 /// Validate the job and build the bwrap argument list. Errors here happen
 /// before anything is launched.
-fn policy_args(tools: &Tools, job: &JobSpec) -> crate::Result<Vec<OsString>> {
+fn policy_args(tools: &Tools, job: &JobSpec, ctl: &JobCtl) -> crate::Result<Vec<OsString>> {
     let home = home_dir();
     let work = bindable(&job.work_dir, home.as_deref())?;
     let ro = job
@@ -345,7 +545,7 @@ fn policy_args(tools: &Tools, job: &JobSpec) -> crate::Result<Vec<OsString>> {
         "ALL".as_ref(),
         "--clearenv".as_ref(),
     ]);
-    for (k, v) in &job.env {
+    for (k, v) in &ctl.env {
         push(&["--setenv".as_ref(), k, v]);
     }
     for d in SYSTEM_DIRS {
@@ -373,6 +573,12 @@ fn policy_args(tools: &Tools, job: &JobSpec) -> crate::Result<Vec<OsString>> {
         push(&["--ro-bind".as_ref(), r.as_os_str(), r.as_os_str()]);
     }
     push(&["--bind".as_ref(), work.as_os_str(), work.as_os_str()]);
+    // The job's control directory: relay, seccomp filter, egress socket and the bait home.
+    push(&[
+        "--bind".as_ref(),
+        ctl.dir.path().as_os_str(),
+        CTL_MOUNT.as_ref(),
+    ]);
     push(&["--chdir".as_ref(), cwd.as_os_str()]);
     push(&["--json-status-fd".as_ref(), "3".as_ref()]);
     let nproc = job
@@ -385,6 +591,15 @@ fn policy_args(tools: &Tools, job: &JobSpec) -> crate::Result<Vec<OsString>> {
         (None, Some(b)) => (b / 1024).max(1).to_string(),
         _ => "-".to_string(),
     };
+    // RLIMIT_FSIZE (1024-byte blocks) bounds one file; the meter bounds the whole stage.
+    let fsize_kib = job
+        .limits
+        .disk_bytes
+        .map_or("-".to_string(), |b| (b / 1024).max(1).to_string());
+    let relay = ctl
+        .relay
+        .as_ref()
+        .map_or_else(|| "-".to_string(), |p| p.display().to_string());
     push(&[
         "--".as_ref(),
         tools.bash.as_os_str(),
@@ -393,6 +608,13 @@ fn policy_args(tools: &Tools, job: &JobSpec) -> crate::Result<Vec<OsString>> {
         "f2c-sandbox".as_ref(),
         nproc.as_ref(),
         as_kib.as_ref(),
+        fsize_kib.as_ref(),
+        relay.as_ref(),
+        format!("{CTL_MOUNT}/egress.sock").as_ref(),
+        "-".as_ref(),
+        format!("{CTL_MOUNT}/ready").as_ref(),
+        tools.setpriv.as_os_str(),
+        ctl.filter.as_ref(),
         job.program.as_os_str(),
     ]);
     for arg in &job.args {
@@ -429,7 +651,15 @@ fn scope_command(scope: &Scope, limits: &JobLimits) -> Command {
 /// `host_env` is extra environment for the bwrap process itself (probe
 /// canary); `--clearenv` must keep it out of the sandbox.
 fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Result<JobOutcome> {
-    let args = policy_args(tools, job)?;
+    let ctl = JobCtl::create(job)?;
+    let args = policy_args(tools, job, &ctl)?;
+    ctl.watch.record(
+        ActivityKind::Process,
+        job.program
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "program".into()),
+    );
     let (status_r, status_w) = std::io::pipe()?;
     let (mark_r, mark_w) = std::io::pipe()?;
     let mut cmd = match &tools.scope {
@@ -476,9 +706,15 @@ fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Re
 
     let deadline = Instant::now() + job.limits.timeout;
     let mut timed_out = false;
+    let mut tripped = false;
     let waited = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Ok(st),
+            Ok(None) if ctl.watch.tripped() => {
+                // A bait touch or a hard limit: stop the job now (FR-024, FR-020).
+                tripped = true;
+                break kill_tree(&mut child, &init_pid);
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
                 timed_out = true;
@@ -501,8 +737,20 @@ fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Re
             first_line(&stderr)
         )));
     }
+    let mut report: ActivityReport = ctl.watch.take_report();
+    if timed_out {
+        report.push(ActivityKind::Limit, "timeout");
+    }
+    if t1 || t2 {
+        report.push(ActivityKind::Limit, "output");
+    }
+    if status.signal() == Some(libc::SIGXFSZ) {
+        report.push(ActivityKind::Limit, "disk");
+    }
     let status = if timed_out {
         JobStatus::TimedOut
+    } else if tripped {
+        JobStatus::Killed
     } else {
         status.code().map_or(JobStatus::Killed, JobStatus::Exited)
     };
@@ -512,7 +760,7 @@ fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Re
         stderr,
         truncated: t1 || t2,
         exported: Vec::new(),
-        report: Default::default(),
+        report,
     })
 }
 
@@ -756,7 +1004,7 @@ fn self_test(tools: &Tools, diagnostic: &mut String) -> crate::Result<Vec<(Strin
             .into_iter()
             .filter(|e| {
                 e != &top
-                    && !["etc", "proc", "dev", "tmp"].contains(&e.as_str())
+                    && !["etc", "proc", "dev", "tmp", "f2c"].contains(&e.as_str())
                     && !SYSTEM_DIRS.iter().any(|d| d.trim_start_matches('/') == e)
             })
             .map(|e| format!("/{e}")),

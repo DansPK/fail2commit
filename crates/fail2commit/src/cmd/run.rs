@@ -88,8 +88,8 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         exports: args.exports.clone(),
         export_to: to.clone(),
         limits: JobLimits::from_settings(limits),
-        network: fail2commit_core::isolation::NetworkMode::None,
-        bait: false,
+        network: ctx.settings.sandbox.network,
+        bait: true,
     };
     let outcome = sandbox::run_job(backend.as_ref(), &job)?;
 
@@ -122,7 +122,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
     }
     Ok(Outcome {
         message,
-        findings: Vec::new(),
+        findings: sandbox::report_findings(&outcome.report),
         tool_exit: Some(code),
         data: serde_json::json!({
             "backend": probe.backend,
@@ -131,6 +131,8 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
             "truncated": outcome.truncated,
             "stdout": stdout,
             "stderr": stderr,
+            "network": ctx.settings.sandbox.network,
+            "activity": outcome.report,
             "exported": outcome
                 .exported
                 .iter()
