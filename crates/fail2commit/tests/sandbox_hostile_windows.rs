@@ -208,11 +208,17 @@ fn recorded_profiles() -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Race-free against jobs of tests running in parallel: the backend writes a
+/// profile's record before creating it and deletes it after removing it, so a
+/// profile seen both before and after the record read is covered by a record
+/// at that read unless it really leaked.
 fn assert_no_profile_leak(baseline: &BTreeSet<String>) {
+    let before = sandbox_profiles();
     let records = recorded_profiles();
-    let leaked: Vec<_> = sandbox_profiles()
-        .into_iter()
-        .filter(|p| !baseline.contains(p) && !records.contains(p))
+    let after = sandbox_profiles();
+    let leaked: Vec<_> = before
+        .intersection(&after)
+        .filter(|p| !baseline.contains(*p) && !records.contains(*p))
         .collect();
     assert!(
         leaked.is_empty(),

@@ -670,6 +670,9 @@ fn wait_for_tree(
         monitor.report.push(ActivityKind::Limit, "time");
         decided = Some(JobStatus::TimedOut);
     }
+    // The job is exited or already terminated: a bait opener blocked on an
+    // unacknowledged break can only finish dying once the oplock is gone.
+    monitor.release_bait();
     job_object.wait_empty(Instant::now() + CLEANUP_GRACE)?;
     if job_object.active_processes()? != 0 {
         return Err(crate::Error::isolation_unavailable(
@@ -858,9 +861,15 @@ impl Monitor {
         Ok(stop)
     }
 
+    /// Releases every bait oplock. Only called once the job is exited or
+    /// terminated, so no job code reads a bait file afterwards.
+    fn release_bait(&mut self) {
+        self.oplocks.clear();
+    }
+
     fn finish(mut self) -> ActivityReport {
         // Oplocks first: the ACL revoke reopens the bait files.
-        self.oplocks.clear();
+        self.release_bait();
         self.disk.take();
         std::mem::take(&mut self.report)
     }
@@ -2093,7 +2102,11 @@ mod tests {
             .iter()
             .all(|(p, _)| path_under(p, &work) && p.is_file()));
 
-        // A bait key the job already sets is a duplicate: refused.
+        // A bait key the job already sets is a duplicate: refused. A fresh
+        // stage, since the default home above already holds bait.
+        let stage = test_stage("bait-dup-");
+        let (_read_only, work) = stage_dirs(stage.path());
+        let work = work.canonicalize().unwrap();
         let mut env: Vec<(OsString, OsString)> = vec![("NPM_TOKEN".into(), "x".into())];
         place_bait(&work, &mut env).unwrap();
         let error = environment_block(&env, &work, &work).unwrap_err();

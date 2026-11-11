@@ -26,9 +26,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows_sys::Win32::System::IO::{
-    CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED,
-};
+use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 
 /// winioctl.h; the Ioctl feature is not enabled for this crate.
 const FSCTL_REQUEST_OPLOCK: u32 = 0x0009_0240;
@@ -70,7 +68,8 @@ struct OplockState {
 /// port under [`ffi::BAIT_KEY`] and is never acknowledged, so the opener stays
 /// blocked until the job is terminated.
 pub(super) struct Oplock {
-    handle: OwnedHandle,
+    /// `None` once released.
+    handle: Option<OwnedHandle>,
     state: Box<OplockState>,
     /// The bait file relative to the bait home, for the report.
     pub(super) rel: String,
@@ -128,7 +127,11 @@ impl Oplock {
         };
         // SAFETY: read immediately after the call.
         let err = unsafe { GetLastError() };
-        let oplock = Oplock { handle, state, rel };
+        let oplock = Oplock {
+            handle: Some(handle),
+            state,
+            rel,
+        };
         if ok != 0 || err != ERROR_IO_PENDING {
             // Completing at once means no oplock is held (refused or already
             // broken); Drop still waits for nothing.
@@ -146,18 +149,50 @@ impl Oplock {
     }
 }
 
-impl Drop for Oplock {
+/// NTSTATUS the kernel keeps in `OVERLAPPED::Internal` while a request runs.
+const STATUS_PENDING: usize = 0x103;
+/// How long a released oplock request may take to complete.
+const RELEASE_WAIT: Duration = Duration::from_secs(5);
+
+impl Oplock {
+    /// Closes the holder, which releases the oplock (and any opener waiting on
+    /// its break) and completes the pending request. A cancel-then-wait-forever
+    /// drop is not used: bait jobs hung in it on the Win11 VM. `false` means
+    /// the request did not finish within
+    /// [`RELEASE_WAIT`]; its buffers are then leaked, never freed under the
+    /// kernel.
     #[allow(unsafe_code)]
-    fn drop(&mut self) {
-        let h = self.handle.as_raw_handle() as HANDLE;
-        let mut n = 0u32;
-        // SAFETY: cancel our own request, then wait until the kernel is done
-        // with the boxed OVERLAPPED/output before they are freed. Both calls
-        // are no-ops when the request already completed.
-        unsafe {
-            CancelIoEx(h, &self.state.ov);
-            GetOverlappedResult(h, &self.state.ov, &mut n, 1);
+    pub(super) fn release(&mut self) -> bool {
+        if self.handle.take().is_none() {
+            return true;
         }
+        let deadline = std::time::Instant::now() + RELEASE_WAIT;
+        let internal = std::ptr::addr_of!(self.state.ov.Internal);
+        // SAFETY: the kernel writes the final status to this field once; a
+        // volatile read of an aligned usize is the documented way to poll it
+        // (HasOverlappedIoCompleted).
+        while unsafe { internal.read_volatile() } == STATUS_PENDING {
+            if std::time::Instant::now() >= deadline {
+                let state = std::mem::replace(
+                    &mut self.state,
+                    Box::new(OplockState {
+                        // SAFETY: all-zero is a valid OVERLAPPED.
+                        ov: unsafe { std::mem::zeroed() },
+                        out: OplockOutput::default(),
+                    }),
+                );
+                Box::leak(state);
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+}
+
+impl Drop for Oplock {
+    fn drop(&mut self) {
+        let _ = self.release();
     }
 }
 
@@ -184,11 +219,19 @@ pub(super) fn self_test_oplock(dir: &Path) -> crate::Result<()> {
     drop(lock);
     let read_ok = reader.join().unwrap_or(false);
     let _ = std::fs::remove_file(&path);
-    if broke && read_ok {
+    // An oplock nobody broke must also release promptly (every bait file of a
+    // clean job ends this way).
+    let idle_path = dir.join("oplock-self-test-idle.txt");
+    std::fs::write(&idle_path, b"oplock self test")?;
+    let mut idle = Oplock::request(&idle_path, "oplock-self-test-idle.txt".into(), &job)?;
+    let idle_released = idle.release();
+    drop(idle);
+    let _ = std::fs::remove_file(&idle_path);
+    if broke && read_ok && idle_released {
         Ok(())
     } else {
         Err(crate::Error::isolation_unavailable(format!(
-            "bait oplock self test failed (break delivered: {broke}, reader finished: {read_ok})"
+            "bait oplock self test failed (break delivered: {broke}, reader finished: {read_ok}, idle oplock released: {idle_released})"
         )))
     }
 }
