@@ -113,12 +113,9 @@ two passes is caught by the grant-time check on the handle that receives the ACE
 * Measured on the verified host: **cold probe about 4.1 s** (dominated by the timeout it has to
   measure), **cached probe 0.4-0.5 ms**.
 
-## 8. LPAC determination
+## 8. LPAC determination (updated for 0.1.4, SPEC-014 section 4)
 
-`rappct 0.13.3` can request LPAC, but the pinned dependency's AppContainer path never selects it and
-this backend does not set `PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY`. Runtime token
-inspection requires `TokenIsLessPrivilegedAppContainer == false`; an unexpected LPAC token fails
-closed. No LPAC claim is made.
+Jobs run in a normal (not less-privileged) AppContainer. LPAC removes the `ALL APPLICATION PACKAGES` group, and `C:\Program Files` / `C:\Program Files (x86)` grant read only to that group (checked with `icacls` on the development host). MSVC, which node-gyp and Python extension builds need, lives there and is not staged, so LPAC would break native builds. The token check still refuses an unexpected LPAC token. HB-066 is therefore a default-mode known limit (section 10); hardened mode (FR-027) is where LPAC belongs.
 
 ## 9. Test scope, evidence and pending items
 
@@ -152,3 +149,35 @@ Still unsupported: writing to an asynchronous child's stdin (the child gets `ign
 
 Microsoft Defender's machine-learning behaviour monitor can classify the unsigned `fail2commit.exe` as `Behavior:Win32/DefenseEvasion.A!ml` when the sandboxed child behaves like an attack, for example reading a secret file or opening network connections that the sandbox then denies. The executable is then quarantined and its hash blocked. Benign workloads were not flagged. Signed release binaries and a false-positive submission to Microsoft are required before a Windows release; fail2commit does not add antivirus exclusions.
 
+
+## 10. 0.1.4 additions (SPEC-014: FR-020, FR-023, FR-024, FR-026)
+
+Default mode needs no administrator rights and changes nothing system-wide. Design and test cases: `docs/dev/specs/SPEC-014-sandbox-windows-0.1.4.md`.
+
+| Area | What the backend does |
+|---|---|
+| Network (`sandbox.network`) | `none`: zero capabilities, as before. `internet`: exactly the `internetClient` capability, read back from the child token on every run. Windows refuses loopback, the host's own subnets and inbound connections. While the job runs, the TCP tables are read every 25 ms: a public destination is a `net_allowed` entry; a non-public destination or a listening socket stops the job (`Killed`, `net_refused`). |
+| Bait (FR-024) | Fake credentials in the job's own home (`USERPROFILE`, default `<work_dir>\.f2c-home`) and token variables. Each bait file holds an exclusive oplock. Any data or delete open breaks it, the opener is held, the job is terminated, and a `bait` entry names the file. `stat` and directory listings do not trip it. |
+| Disk (HB-053) | Job write accounting plus a background size scan of `work_dir`; growth above `limits.job_disk_mb` kills the job (`limit` "disk"). |
+| Mitigations | Root process: extension points disabled, no remote images, non-system fonts blocked; read back before resume. |
+| Crash cleanup | An owner record per profile in `<stage root>\profile-records`; the next run deletes profiles of dead owners. |
+| Report (FR-026) | `process`, `net_allowed`, `net_refused`, `bait` and `limit` entries, at most 200, details cut to 512 characters. |
+
+### Not observable on Windows without hardened mode (FR-026)
+
+* `file_denied`: refused file opens (needs object-access auditing, which needs administrator rights).
+* `blocked`: mitigation and Job Object refusals (the error goes to the caller only).
+* Refused connections: Windows refuses them before a TCP row exists, so only the stop path above produces `net_refused`.
+* Connections shorter than one 25 ms tick; UDP destinations.
+* Bait values sent over the network (HB-022, HB-023): no traffic inspection.
+
+### Known limits in default mode (proposed for owner acceptance)
+
+| Row | Reason |
+|---|---|
+| HB-033, HB-034 | Private ranges that are not a local subnet (10/8, 172.16/12, CGNAT 100.64/10, metadata 169.254.169.254, IPv6 ULA) count as internet for AppContainer isolation. A connection to one is seen in the TCP table and the job is stopped, but its first packets may already have been sent, and a connection shorter than 25 ms is missed. Hardened mode adds WFP filters. |
+| HB-022, HB-023 | Bait values on the network are not inspected. |
+| HB-053 | The limit is measured, not enforced by a quota: a job can exceed it by what it writes before the next scan. |
+| HB-066 | No LPAC (section 8). |
+| HB-045 | No active COM/WMI attempt is tested (coordinator decision: no attack fixtures); covered by the AppContainer token (no capabilities beyond `internetClient`) and breakaway being refused. |
+| HB-063, HB-064 | Verified from the Job Object UI restrictions read back from the kernel and the Low-integrity AppContainer token, not by an active attempt. |

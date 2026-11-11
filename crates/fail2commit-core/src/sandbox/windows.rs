@@ -24,10 +24,14 @@
 //!   failed ACL cleanup is recorded, logged and refused by the next operation.
 
 mod ffi;
+mod watch;
 
-use crate::isolation::{JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend};
+use crate::isolation::{
+    ActivityKind, ActivityReport, JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend,
+};
 use crate::paths::TrustedPaths;
-use std::collections::BTreeMap;
+use crate::sandbox::bait::BaitSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
@@ -108,6 +112,12 @@ fn mandatory_controls() -> Vec<(String, bool)> {
         "timeout-kills-job",
         "bounded-concurrent-output",
         "clean-environment",
+        // SPEC-014 (0.1.4)
+        "internet-capability-only",
+        "mitigation-policies",
+        "bait-oplock-detection",
+        "disk-accounting",
+        "stale-profile-cleanup",
     ]
     .into_iter()
     .map(|name| (name.to_string(), false))
@@ -191,7 +201,7 @@ fn probe_host() -> ProbeReport {
         detail: match result {
             Ok(()) => format!(
                 "all mandatory AppContainer controls verified in one sandboxed launch \
-                 ({} ms); loopback exemptions read from FirewallAPI; LPAC is not enabled or claimed",
+                 ({} ms); loopback exemptions read from FirewallAPI; internet jobs get only                  internetClient; LPAC is not enabled (SPEC-014)",
                 started.elapsed().as_millis()
             ),
             Err(error) => error.message,
@@ -205,6 +215,16 @@ fn probe_host() -> ProbeReport {
 /// marker checks cannot race the output-budget truncation.
 fn probe_host_inner(controls: &mut [(String, bool)]) -> crate::Result<()> {
     let stage_root = stage_root()?;
+    // run_unprobed below also sweeps; doing it first names the failure.
+    clear_stale_profiles(&stage_root)?;
+    // The capability an `Internet` job gets must be the well-known
+    // internetClient SID; every such run reads it back from the token.
+    let internet = ffi::sid_from_string(INTERNET_CLIENT)?;
+    if !ffi::sid_text(internet.as_psid())?.eq_ignore_ascii_case(INTERNET_CLIENT) {
+        return Err(crate::Error::isolation_unavailable(
+            "the internetClient capability SID did not round-trip",
+        ));
+    }
     let system32 = ffi::system_directory()?;
     let cmd_source = system32.join("cmd.exe");
     if !cmd_source.is_file() {
@@ -229,6 +249,8 @@ fn probe_host_inner(controls: &mut [(String, bool)]) -> crate::Result<()> {
     let work = stage.path().join("work");
     fs::create_dir_all(&read_only)?;
     fs::create_dir_all(&work)?;
+    // In-process, no launch: an oplock break must reach a completion port.
+    watch::self_test_oplock(&work)?;
     let cmd = read_only.join("probe-cmd.exe");
     fs::copy(&cmd_source, &cmd).map_err(|e| {
         crate::Error::isolation_unavailable(format!("stage trusted probe executable: {e}"))
@@ -334,6 +356,12 @@ fn probe_host_inner(controls: &mut [(String, bool)]) -> crate::Result<()> {
         "timeout-kills-job",
         "bounded-concurrent-output",
         "clean-environment",
+        // SPEC-014 (0.1.4)
+        "internet-capability-only",
+        "mitigation-policies",
+        "bait-oplock-detection",
+        "disk-accounting",
+        "stale-profile-cleanup",
     ] {
         mark(controls, name);
     }
@@ -368,7 +396,8 @@ fn probe_limits() -> crate::isolation::JobLimits {
         memory_bytes: Some(PROBE_MEMORY_BYTES),
         max_processes: Some(PROBE_PROCESSES),
         max_output_bytes: PROBE_OUTPUT_BYTES,
-        disk_bytes: None,
+        // Exercises the disk scan and job I/O accounting (`disk-accounting`).
+        disk_bytes: Some(64 * 1024 * 1024),
     }
 }
 
@@ -406,6 +435,7 @@ fn probe_command(approval_pipe: &str, default_pipe: &str) -> String {
 fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     let stage_root = stage_root()?;
     clear_pending_revokes(&stage_root)?;
+    clear_stale_profiles(&stage_root)?;
     let paths = ValidatedPaths::new(job, &stage_root)?;
     let max_processes = job.limits.max_processes.filter(|n| *n > 0).ok_or_else(|| {
         crate::Error::isolation_unavailable("a positive process limit is required")
@@ -421,9 +451,38 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     let output_cap = usize::try_from(job.limits.max_output_bytes)
         .map_err(|_| crate::Error::isolation_unavailable("output limit exceeds usize"))?;
 
-    let profile = ffi::Profile::create_fresh()?;
-    verify_no_loopback_exemption(&profile.sid_string)?;
-    let mut grants = StagingGrants::new(profile.sid(), &stage_root);
+    // FR-024: bait goes into the job's own home before grants, so it is staged
+    // and granted like any other work_dir file and never leaves the stage.
+    let mut env = job.env.clone();
+    let bait = if job.bait {
+        Some(place_bait(&paths.work_dir, &mut env)?)
+    } else {
+        None
+    };
+    // FR-023: `Internet` is exactly the internetClient capability.
+    let internet = match job.network {
+        crate::isolation::NetworkMode::Internet => Some(ffi::sid_from_string(INTERNET_CLIENT)?),
+        crate::isolation::NetworkMode::None => None,
+    };
+    let capabilities: Vec<PSID> = internet.iter().map(|s| s.as_psid()).collect();
+    let expected_caps: Vec<String> = internet
+        .iter()
+        .map(|_| INTERNET_CLIENT.to_string())
+        .collect();
+    let baseline = match job.limits.disk_bytes {
+        Some(_) => Some(
+            watch::tree_bytes(&paths.work_dir, watch::SCAN_MAX_ENTRIES).ok_or_else(|| {
+                crate::Error::isolation_unavailable(
+                    "the work_dir has too many entries to measure for the disk limit",
+                )
+            })?,
+        ),
+        None => None,
+    };
+
+    let profile = RecordedProfile::create(&stage_root)?;
+    verify_no_loopback_exemption(&profile.profile().sid_string)?;
+    let mut grants = StagingGrants::new(profile.profile().sid(), &stage_root);
     for root in &paths.read_only {
         grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
     }
@@ -438,8 +497,12 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     let program = plain_path(&paths.program);
     let cwd = plain_path(&paths.cwd);
     let work_dir = plain_path(&paths.work_dir);
-    let env = environment_block(&job.env, &cwd, &work_dir)?;
+    let env = environment_block(&env, &cwd, &work_dir)?;
     let mut command_line = command_line(&program, &job.args)?;
+
+    // Declared after `grants`, so it drops first: the oplock handles must be
+    // closed before the ACL revoke reopens the bait files.
+    let mut monitor = Monitor::new(&job_object, bait.as_ref(), job, &paths.work_dir, baseline)?;
 
     let stdin = OpenOptions::new()
         .read(true)
@@ -458,26 +521,41 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
         &mut command_line,
         &env,
         &cwd,
-        profile.sid(),
+        profile.profile().sid(),
+        &capabilities,
         stdio,
     )?;
-    let facts = ffi::token_facts(&spawned.process, profile.sid())
+    let facts = ffi::token_facts(&spawned.process, profile.profile().sid())
         .map_err(|error| abort_with(&spawned, error))?;
-    if !facts.is_appcontainer || !facts.sid_matches || facts.capability_count != 0 {
+    if !facts.is_appcontainer
+        || !facts.sid_matches
+        || facts.capability_count as usize != expected_caps.len()
+        || facts.capabilities != expected_caps
+    {
         return Err(abort_with(
             &spawned,
-            crate::Error::isolation_unavailable(
-                "child token did not verify as the fresh zero-capability AppContainer",
-            ),
+            crate::Error::isolation_unavailable(format!(
+                "child token did not verify as the fresh AppContainer with capabilities \
+                 {expected_caps:?} (found {:?})",
+                facts.capabilities
+            )),
         ));
     }
-    // The reviewed dependency configuration does not request LPAC. Observing
-    // LPAC would mean the launch policy changed unexpectedly.
+    // LPAC is not the default (SPEC-014 section 4). Observing it would mean the
+    // launch policy changed unexpectedly.
     if facts.is_lpac {
         return Err(abort_with(
             &spawned,
             crate::Error::isolation_unavailable(
-                "unexpected LPAC token; dependency configuration changed",
+                "unexpected LPAC token; launch configuration changed",
+            ),
+        ));
+    }
+    if !ffi::mitigations_applied(&spawned.process).map_err(|error| abort_with(&spawned, error))? {
+        return Err(abort_with(
+            &spawned,
+            crate::Error::isolation_unavailable(
+                "the root process mitigation policies did not read back as requested",
             ),
         ));
     }
@@ -489,6 +567,10 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     // succeed (S7B-005, S7B-012).
     canary
         .verify_after_spawn()
+        .map_err(|error| abort_with(&spawned, error))?;
+    // Breaks that arrive before resume are not the job's (SPEC-014 2.4).
+    monitor
+        .settle_before_resume(&job_object)
         .map_err(|error| abort_with(&spawned, error))?;
     spawned
         .resume()
@@ -504,7 +586,7 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     let (stdout_thread, stdout_rx) = drain(stdout_read, Arc::clone(&budget));
     let (stderr_thread, stderr_rx) = drain(stderr_read, Arc::clone(&budget));
     let deadline = Instant::now() + job.limits.timeout;
-    let status = wait_for_tree(&job_object, deadline)?;
+    let status = wait_for_tree(&job_object, deadline, &mut monitor)?;
     let status = match status {
         Some(status) => status,
         None => JobStatus::Exited(spawned.exit_code()? as i32),
@@ -515,16 +597,21 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     let truncated = budget.lock().unwrap_or_else(|e| e.into_inner()).truncated;
+    let mut report = monitor.finish();
+    if truncated {
+        report.push(ActivityKind::Limit, "output");
+    }
     // Cleanup is part of the operation: a failed revoke is recorded, logged and
     // returned, so the next probe()/run() refuses while it is outstanding.
     grants.release()?;
+    drop(profile);
     Ok(JobOutcome {
         status,
         stdout,
         stderr,
         truncated,
         exported: Vec::new(),
-        report: Default::default(),
+        report,
     })
 }
 
@@ -540,26 +627,34 @@ fn abort_with(spawned: &ffi::Spawned, error: crate::Error) -> crate::Error {
     }
 }
 /// Wait for the job to stop. `Ok(Some(status))` reports a status this function
-/// decided (timed out or resource-killed); `Ok(None)` means the tree emptied on
-/// its own and the caller reads the root exit code. A tree that survives the
-/// deadline plus the grace period is an error, never a success (S7B-004).
-fn wait_for_tree(job_object: &ffi::Job, deadline: Instant) -> crate::Result<Option<JobStatus>> {
+/// decided (timed out, resource-killed, or stopped by the monitor); `Ok(None)`
+/// means the tree emptied on its own and the caller reads the root exit code.
+/// A tree that survives the deadline plus the grace period is an error, never a
+/// success (S7B-004).
+fn wait_for_tree(
+    job_object: &ffi::Job,
+    deadline: Instant,
+    monitor: &mut Monitor,
+) -> crate::Result<Option<JobStatus>> {
     let mut decided = None;
     while Instant::now() < deadline {
-        if let Some(message) = job_object.next_message(POLL_MS) {
-            if message == ffi::MSG_ACTIVE_PROCESS_LIMIT || message == ffi::MSG_JOB_MEMORY_LIMIT {
-                job_object.terminate().map_err(|error| {
-                    crate::Error::isolation_unavailable(format!(
-                        "the sandbox hit a job limit but TerminateJobObject failed: {}",
-                        error.message
-                    ))
-                })?;
-                decided = Some(JobStatus::Killed);
-                break;
-            }
-            if message == ffi::MSG_ACTIVE_PROCESS_ZERO {
-                break;
-            }
+        let stop = match job_object.next_event(POLL_MS) {
+            Some(event) => match monitor.on_event(&event) {
+                Flow::Empty => break,
+                Flow::Stop => true,
+                Flow::Continue => false,
+            },
+            None => false,
+        };
+        if stop || monitor.tick(job_object)? {
+            job_object.terminate().map_err(|error| {
+                crate::Error::isolation_unavailable(format!(
+                    "the sandbox stopped the job but TerminateJobObject failed: {}",
+                    error.message
+                ))
+            })?;
+            decided = Some(JobStatus::Killed);
+            break;
         }
         if job_object.active_processes()? == 0 {
             break;
@@ -572,6 +667,7 @@ fn wait_for_tree(job_object: &ffi::Job, deadline: Instant) -> crate::Result<Opti
                 error.message
             ))
         })?;
+        monitor.report.push(ActivityKind::Limit, "time");
         decided = Some(JobStatus::TimedOut);
     }
     job_object.wait_empty(Instant::now() + CLEANUP_GRACE)?;
@@ -581,6 +677,366 @@ fn wait_for_tree(job_object: &ffi::Job, deadline: Instant) -> crate::Result<Opti
         ));
     }
     Ok(decided)
+}
+
+/// What one job-port packet means for the wait loop.
+enum Flow {
+    Continue,
+    /// The monitor recorded a reason to stop the job (bait, limit).
+    Stop,
+    /// Every process of the job has exited.
+    Empty,
+}
+
+/// Report detail length cap (SPEC-014 section 7).
+const DETAIL_MAX: usize = 512;
+/// Job write bytes between two forced disk scans (SPEC-014 section 3).
+const DISK_KICK_BYTES: u64 = 64 * 1024 * 1024;
+/// Network and disk checks run at most this often, however many job
+/// messages arrive (a build that starts many processes).
+const TICK_EVERY: Duration = Duration::from_millis(POLL_MS as u64);
+
+/// FR-024/FR-026 observation for one job: bait oplocks, process events,
+/// limits, the disk scan and TCP rows of job processes.
+struct Monitor {
+    report: ActivityReport,
+    oplocks: Vec<watch::Oplock>,
+    bait_files: Vec<(PathBuf, String)>,
+    rearmed: Vec<bool>,
+    disk: Option<watch::DiskWatch>,
+    next_kick: u64,
+    seen: BTreeSet<String>,
+    last_tick: Option<Instant>,
+}
+
+impl Monitor {
+    fn new(
+        job_object: &ffi::Job,
+        bait: Option<&PlacedBait>,
+        job: &JobSpec,
+        work_dir: &Path,
+        baseline: Option<u64>,
+    ) -> crate::Result<Monitor> {
+        let bait_files = bait.map(|b| b.files.clone()).unwrap_or_default();
+        let oplocks = bait_files
+            .iter()
+            .map(|(path, rel)| watch::Oplock::request(path, rel.clone(), job_object))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let disk = match (job.limits.disk_bytes, baseline) {
+            (Some(limit), Some(base)) => {
+                Some(watch::DiskWatch::start(work_dir.to_path_buf(), base, limit))
+            }
+            _ => None,
+        };
+        Ok(Monitor {
+            report: ActivityReport::default(),
+            rearmed: vec![false; oplocks.len()],
+            oplocks,
+            bait_files,
+            disk,
+            next_kick: DISK_KICK_BYTES,
+            seen: BTreeSet::new(),
+            last_tick: None,
+        })
+    }
+
+    fn push(&mut self, kind: ActivityKind, detail: &str) {
+        self.report.push(kind, watch::bounded(detail, DETAIL_MAX));
+    }
+
+    /// Before resume nothing of the job runs, so a bait break is someone
+    /// else's (an antivirus scan of the new file): request that oplock again,
+    /// once. A second early break refuses the job.
+    fn settle_before_resume(&mut self, job_object: &ffi::Job) -> crate::Result<()> {
+        while let Some(event) = job_object.next_event(0) {
+            if event.key != ffi::BAIT_KEY {
+                let _ = self.on_event(&event);
+                continue;
+            }
+            let Some(i) = self
+                .oplocks
+                .iter()
+                .position(|o| o.overlapped_addr() == event.value)
+            else {
+                continue;
+            };
+            if self.rearmed[i] {
+                return Err(crate::Error::isolation_unavailable(format!(
+                    "the bait file {} was opened twice before the job started",
+                    self.oplocks[i].rel
+                )));
+            }
+            self.rearmed[i] = true;
+            let (path, rel) = self.bait_files[i].clone();
+            // Replacing drops the old holder, which releases the other opener.
+            self.oplocks[i] = watch::Oplock::request(&path, rel, job_object)?;
+        }
+        Ok(())
+    }
+
+    fn on_event(&mut self, event: &ffi::PortEvent) -> Flow {
+        if event.key == ffi::BAIT_KEY {
+            let Some(rel) = self
+                .oplocks
+                .iter()
+                .find(|o| o.overlapped_addr() == event.value)
+                .map(|o| o.rel.clone())
+            else {
+                return Flow::Continue;
+            };
+            self.push(ActivityKind::Bait, &rel);
+            return Flow::Stop;
+        }
+        if event.key != ffi::JOB_KEY {
+            return Flow::Continue;
+        }
+        match event.msg {
+            ffi::MSG_NEW_PROCESS => {
+                let pid = event.value as u32;
+                let name = watch::image_name(pid).unwrap_or_else(|| format!("pid {pid}"));
+                self.push(ActivityKind::Process, &name);
+                Flow::Continue
+            }
+            ffi::MSG_ACTIVE_PROCESS_LIMIT => {
+                self.push(ActivityKind::Limit, "processes");
+                Flow::Stop
+            }
+            ffi::MSG_JOB_MEMORY_LIMIT => {
+                self.push(ActivityKind::Limit, "memory");
+                Flow::Stop
+            }
+            ffi::MSG_ACTIVE_PROCESS_ZERO => Flow::Empty,
+            _ => Flow::Continue,
+        }
+    }
+
+    /// Per-tick checks. `Ok(true)` stops the job.
+    fn tick(&mut self, job_object: &ffi::Job) -> crate::Result<bool> {
+        if self.last_tick.is_some_and(|t| t.elapsed() < TICK_EVERY) {
+            return Ok(false);
+        }
+        self.last_tick = Some(Instant::now());
+        if let Some(disk) = &self.disk {
+            if job_object.write_bytes()? >= self.next_kick {
+                self.next_kick = self.next_kick.saturating_add(DISK_KICK_BYTES);
+                disk.kick();
+            }
+            if disk.is_over() {
+                self.push(ActivityKind::Limit, "disk");
+                return Ok(true);
+            }
+        }
+        let pids: BTreeSet<u32> = job_object.pids()?.into_iter().collect();
+        if pids.is_empty() {
+            return Ok(false);
+        }
+        let mut stop = false;
+        for row in watch::tcp_rows()? {
+            if !pids.contains(&row.pid) {
+                continue;
+            }
+            let (kind, detail) = if row.state == watch::TCP_LISTEN {
+                (ActivityKind::NetRefused, format!("listen {}", row.local))
+            } else if row.state == watch::TCP_SYN_SENT || row.state == watch::TCP_ESTABLISHED {
+                if crate::sandbox::netpolicy::is_public(row.remote.ip()) {
+                    (ActivityKind::NetAllowed, row.remote.to_string())
+                } else {
+                    (ActivityKind::NetRefused, row.remote.to_string())
+                }
+            } else {
+                continue;
+            };
+            // A listener or a non-public destination is stopped at once;
+            // allowed destinations are listed once each.
+            if kind == ActivityKind::NetRefused {
+                self.push(kind, &detail);
+                stop = true;
+            } else if self.seen.insert(detail.clone()) {
+                self.push(kind, &detail);
+            }
+        }
+        Ok(stop)
+    }
+
+    fn finish(mut self) -> ActivityReport {
+        // Oplocks first: the ACL revoke reopens the bait files.
+        self.oplocks.clear();
+        self.disk.take();
+        std::mem::take(&mut self.report)
+    }
+}
+
+/// Bait files placed for one job: absolute path and path relative to home.
+struct PlacedBait {
+    files: Vec<(PathBuf, String)>,
+}
+
+/// SPEC-014 section 2: the bait home is the job's `USERPROFILE` when it is
+/// inside `work_dir`, otherwise `<work_dir>\.f2c-home`, which is added as
+/// `USERPROFILE` (and `HOME` when absent). Bait env values are appended; a key
+/// the job already sets is refused later as a duplicate.
+fn place_bait(work_dir: &Path, env: &mut Vec<(OsString, OsString)>) -> crate::Result<PlacedBait> {
+    let lookup = |env: &[(OsString, OsString)], key: &str| {
+        env.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    let plain_work = plain_path(work_dir);
+    let home = match lookup(env, "USERPROFILE") {
+        Some(given) => {
+            let lexical = given.is_absolute()
+                && given
+                    .components()
+                    .all(|c| !matches!(c, Component::ParentDir | Component::CurDir))
+                && path_under(&given, &plain_work);
+            if !lexical {
+                return Err(crate::Error::isolation_unavailable(
+                    "the bait home (USERPROFILE) must be inside the job's work_dir",
+                ));
+            }
+            fs::create_dir_all(&given)?;
+            let canonical = canonical_dir(&given, "bait home")?;
+            if !path_under(&canonical, work_dir) {
+                return Err(crate::Error::isolation_unavailable(
+                    "the bait home resolves outside the job's work_dir",
+                ));
+            }
+            // A dedicated folder only: bait in the work_dir root would sit
+            // beside the job's own project files (a project `.env`).
+            if same_path(&canonical, work_dir) {
+                return Err(crate::Error::isolation_unavailable(
+                    "the bait home (USERPROFILE) must be a subfolder of the work_dir, not the                      work_dir itself",
+                ));
+            }
+            canonical
+        }
+        None => {
+            let home = work_dir.join(".f2c-home");
+            fs::create_dir_all(&home)?;
+            env.push(("USERPROFILE".into(), plain_path(&home).into_os_string()));
+            home
+        }
+    };
+    if lookup(env, "HOME").is_none() {
+        env.push(("HOME".into(), plain_path(&home).into_os_string()));
+    }
+    let set = BaitSet::generate()?;
+    // Never overwrite a file the job brought (or a link planted in its place).
+    if let Some(f) = set
+        .files
+        .iter()
+        .find(|f| fs::symlink_metadata(home.join(&f.rel)).is_ok())
+    {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "the bait home already contains {}; refusing to overwrite it",
+            f.rel.display()
+        )));
+    }
+    let written = set.write_into(&home)?;
+    let files = written
+        .into_iter()
+        .zip(&set.files)
+        .map(|(path, f)| (path, f.rel.to_string_lossy().into_owned()))
+        .collect();
+    env.extend(set.env.iter().map(|(k, v)| (k.into(), v.into())));
+    Ok(PlacedBait { files })
+}
+
+/// `internetClient`, the only capability an `Internet` job gets (FR-023).
+const INTERNET_CLIENT: &str = "S-1-15-3-1";
+/// Below the stage root: one record per live profile (SPEC-014 section 6).
+const PROFILE_RECORDS: &str = "profile-records";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ProfileRecord {
+    name: String,
+    pid: u32,
+    created: u64,
+}
+
+/// A profile whose owner is recorded before it is created, so a crash
+/// leaves a record the next run can act on (HB-070, HB-071).
+struct RecordedProfile {
+    profile: Option<ffi::Profile>,
+    record: PathBuf,
+}
+
+impl RecordedProfile {
+    fn create(stage_root: &Path) -> crate::Result<RecordedProfile> {
+        let dir = stage_root.join(PROFILE_RECORDS);
+        fs::create_dir_all(&dir)?;
+        let name = ffi::Profile::fresh_name()?;
+        let record = dir.join(format!("{name}.json"));
+        let owner = ProfileRecord {
+            name: name.clone(),
+            pid: std::process::id(),
+            created: watch::own_creation_time().ok_or_else(|| {
+                crate::Error::isolation_unavailable("read this process's creation time")
+            })?,
+        };
+        let json = serde_json::to_vec(&owner)
+            .map_err(|e| crate::Error::internal(format!("serialize profile record: {e}")))?;
+        crate::fsutil::atomic_write(&record, &json)?;
+        match ffi::Profile::create(&name) {
+            Ok(profile) => Ok(RecordedProfile {
+                profile: Some(profile),
+                record,
+            }),
+            Err(error) => {
+                let _ = fs::remove_file(&record);
+                Err(error)
+            }
+        }
+    }
+
+    fn profile(&self) -> &ffi::Profile {
+        self.profile.as_ref().expect("profile present until drop")
+    }
+}
+
+impl Drop for RecordedProfile {
+    fn drop(&mut self) {
+        // Profile first (its Drop deletes it), then the record.
+        drop(self.profile.take());
+        let _ = fs::remove_file(&self.record);
+    }
+}
+
+/// Delete the profile of every record whose owner process is gone. A live
+/// owner (same PID and creation time) is never touched; a record that cannot
+/// be parsed was cut short by a crash and names its profile in its file name.
+fn clear_stale_profiles(stage_root: &Path) -> crate::Result<()> {
+    let dir = stage_root.join(PROFILE_RECORDS);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten().take(10_000) {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Some(stem) = path
+            .file_stem()
+            .map(watch::lossy)
+            .filter(|s| s.starts_with(ffi::PROFILE_PREFIX))
+        else {
+            continue;
+        };
+        let record: Option<ProfileRecord> = crate::fsutil::read_bounded(&path, 4096)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if let Some(r) = &record {
+            if r.name != stem {
+                continue;
+            }
+            if watch::process_creation_time(r.pid) == Some(r.created) {
+                continue;
+            }
+        }
+        ffi::delete_profile(&stem)?;
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
 }
 
 struct ValidatedPaths {
@@ -1597,6 +2053,71 @@ mod tests {
             error.message
         );
         let _ = handle.join();
+    }
+
+    #[test]
+    fn bait_setup_fails_closed() {
+        let stage = test_stage("bait-setup-");
+        let (_read_only, work) = stage_dirs(stage.path());
+        let work = work.canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        // USERPROFILE outside the work dir, or the work dir itself: refused,
+        // and nothing is written outside the stage.
+        for home in [outside.path().join("home"), plain_path(&work)] {
+            let mut env: Vec<(OsString, OsString)> =
+                vec![("USERPROFILE".into(), home.clone().into())];
+            let error = place_bait(&work, &mut env).err().expect("refused");
+            assert_eq!(error.code, crate::ResultCode::IsolationUnavailable);
+        }
+        assert!(!outside.path().join("home").exists());
+
+        // A file the job brought is never overwritten.
+        let home = work.join("brought-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join(".npmrc"), b"project npmrc").unwrap();
+        let mut env: Vec<(OsString, OsString)> =
+            vec![("USERPROFILE".into(), plain_path(&home).into())];
+        assert!(place_bait(&work, &mut env).is_err());
+        assert_eq!(fs::read(home.join(".npmrc")).unwrap(), b"project npmrc");
+
+        // Default: a dedicated home, USERPROFILE and HOME set, bait values in
+        // the environment, every file inside the work dir.
+        let mut env = Vec::new();
+        let placed = place_bait(&work, &mut env).unwrap();
+        let key = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(key("USERPROFILE"), key("HOME"));
+        assert!(key("NPM_TOKEN").is_some_and(|v| v.to_string_lossy().starts_with("npm_")));
+        assert!(placed
+            .files
+            .iter()
+            .all(|(p, _)| path_under(p, &work) && p.is_file()));
+
+        // A bait key the job already sets is a duplicate: refused.
+        let mut env: Vec<(OsString, OsString)> = vec![("NPM_TOKEN".into(), "x".into())];
+        place_bait(&work, &mut env).unwrap();
+        let error = environment_block(&env, &work, &work).unwrap_err();
+        assert_eq!(error.code, crate::ResultCode::IsolationUnavailable);
+    }
+
+    #[test]
+    fn report_details_are_bounded() {
+        let job_object = ffi::Job::new(1, 16 * 1024 * 1024).unwrap();
+        let stage = test_stage("report-bound-");
+        let (read_only, work) = stage_dirs(stage.path());
+        let spec = job(copy_cmd(&read_only), &read_only, &work);
+        let mut monitor = Monitor::new(&job_object, None, &spec, &work, None).unwrap();
+        let long = "x".repeat(4 * DETAIL_MAX);
+        for _ in 0..(crate::isolation::MAX_ACTIVITY + 50) {
+            monitor.push(ActivityKind::Process, &long);
+        }
+        let report = monitor.finish();
+        assert_eq!(report.events.len(), crate::isolation::MAX_ACTIVITY);
+        assert!(report.truncated);
+        assert!(report
+            .events
+            .iter()
+            .all(|e| e.detail.chars().count() == DETAIL_MAX));
     }
 
     #[test]
