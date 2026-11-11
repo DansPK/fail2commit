@@ -116,6 +116,9 @@ pub enum FindingKind {
     /// A pre-install risk check hit (FR-025): new install script, maintainer
     /// change, very new version, look-alike name, newly obfuscated code.
     RiskSignal,
+    /// What a sandboxed script tried that the sandbox refused, blocked or
+    /// limited, and where it connected (FR-026); information only.
+    SandboxActivity,
 }
 
 /// What a finding requires. `Deny` can never be approved away.

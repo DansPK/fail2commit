@@ -1,6 +1,10 @@
 # CHORE-001 CI entry points (SPEC-011). Platform-gated integration checks
 # (real sandbox, tray, VS Code, packaging) run in separate jobs added by
-# T-007/T-009/T-010/T-011; this job is the always-on baseline.
+# T-007/T-009/T-010/T-011; these jobs are the always-on baseline.
+#
+# NFR-017: format, lint and tests run as parallel jobs, each with its own
+# dependency/target cache, and without full debug info (faster builds and
+# links, smaller caches). Every check that ran before still runs.
 name: ci
 
 on:
@@ -11,8 +15,29 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Backtraces keep file and line numbers.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_BACKTRACE: short
+
 jobs:
-  rust:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt && rustup default stable
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  clippy:
     strategy:
       fail-fast: false
       matrix:
@@ -21,10 +46,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
-      - name: Format
-        run: cargo fmt --all -- --check
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
       - name: Test
         run: cargo test --workspace --locked

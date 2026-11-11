@@ -88,8 +88,8 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         exports: args.exports.clone(),
         export_to: to.clone(),
         limits: JobLimits::from_settings(limits),
-        network: fail2commit_core::isolation::NetworkMode::None,
-        bait: false,
+        network: ctx.settings.sandbox.network,
+        bait: true,
     };
     let outcome = sandbox::run_job(backend.as_ref(), &job)?;
 
@@ -120,9 +120,14 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
             });
         }
     }
+    // FR-024 / FR-026: what the command tried inside the sandbox.
+    let findings = sandbox::report::findings(&outcome.report, &name, "run");
+    if outcome.report.bait_touched() {
+        message.push_str("; it touched a bait credential");
+    }
     Ok(Outcome {
         message,
-        findings: Vec::new(),
+        findings,
         tool_exit: Some(code),
         data: serde_json::json!({
             "backend": probe.backend,

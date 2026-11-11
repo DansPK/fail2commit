@@ -429,7 +429,17 @@ fn lifecycle_env(tc: &Toolchain, tree: &Path, l: &Lifecycle) -> Vec<(OsString, O
         ("TEMP".into(), tmp.clone().into()),
         ("TMP".into(), tmp.clone().into()),
         // CR-014 preload: Windows overrides TEMP inside the AppContainer.
-        ("F2C_IO_DIR".into(), tmp.into()),
+        ("F2C_IO_DIR".into(), tmp.clone().into()),
+        // FR-024: a nested npm or pip must not read the bait config files that
+        // the sandbox places in the job's home.
+        (
+            "npm_config_userconfig".into(),
+            tmp.join(".f2c-no-npmrc").into(),
+        ),
+        (
+            "PIP_CONFIG_FILE".into(),
+            tmp.join(".f2c-no-pip.conf").into(),
+        ),
     ];
     if let Some(gyp) = tc
         .npm_root()
@@ -466,10 +476,11 @@ pub fn run_scripts(
     found: &BTreeSet<String>,
     mode: ScriptRun,
     before_each: &dyn Fn() -> Result<()>,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Vec<crate::protocol::Finding>)> {
     if !matches!(mode, ScriptRun::Sandboxed | ScriptRun::Host) {
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     }
+    let mut activity = Vec::new();
     // CR-007: sandboxed scripts run in a stage below `sandbox-stage`; an
     // approved host run uses the tree and toolchain in place.
     let stage = (mode == ScriptRun::Sandboxed)
@@ -502,10 +513,23 @@ pub fn run_scripts(
                 exports: vec![],
                 export_to: None,
                 limits: JobLimits::from_settings(&deps.settings.limits),
-                network: crate::isolation::NetworkMode::None,
-                bait: false,
+                network: deps.settings.sandbox.network,
+                bait: true,
             };
             let out = crate::sandbox::run_job(deps.backend, &job)?;
+            let found = crate::sandbox::report::findings(
+                &out.report,
+                &format!("npm:{}@{}", l.name, l.version),
+                &l.event,
+            );
+            if out.report.bait_touched() {
+                // FR-024: a hard denial; nothing from this tree is applied.
+                return Err(crate::Error::rejected(format!(
+                    "{label} touched a bait credential in the sandbox; the install was stopped"
+                ))
+                .with_findings(found));
+            }
+            activity.extend(found);
             let tail = runner::tail(&[out.stderr.as_slice(), out.stdout.as_slice()].concat());
             (out.status, tail)
         } else {
@@ -555,5 +579,5 @@ pub fn run_scripts(
         }
         ran.push(label);
     }
-    Ok(ran)
+    Ok((ran, activity))
 }
