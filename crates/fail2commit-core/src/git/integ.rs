@@ -54,9 +54,63 @@ pub fn default_path_editor() -> Box<dyn PathEditor> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
-        Box::new(ProfileEditor {
-            file: home.join(".profile"),
-        })
+        // FR-014: a login bash reads only the first of these that exists, so
+        // `.bash_profile` / `.bash_login` would hide `.profile`.
+        let mut files = vec![home.join(".profile")];
+        files.extend(
+            [".bash_profile", ".bash_login"]
+                .iter()
+                .map(|f| home.join(f))
+                .filter(|f| f.exists()),
+        );
+        Box::new(ProfilesEditor { files })
+    }
+}
+
+/// The same PATH block in several POSIX profiles (FR-014).
+pub struct ProfilesEditor {
+    pub files: Vec<PathBuf>,
+}
+
+impl PathEditor for ProfilesEditor {
+    fn add(&self, dir: &Path) -> crate::Result<Value> {
+        let mut done = Vec::new();
+        for file in &self.files {
+            match (ProfileEditor { file: file.clone() }).add(dir) {
+                Ok(d) => done.push(d),
+                Err(e) => {
+                    // Leave nothing half-applied.
+                    let _ = self.remove(dir, &json!({ "editor": "profiles", "files": done }));
+                    return Err(e);
+                }
+            }
+        }
+        Ok(json!({ "editor": "profiles", "files": done }))
+    }
+
+    fn remove(&self, dir: &Path, detail: &Value) -> crate::Result<()> {
+        // A 0.1.3 record is one `profile` detail for `.profile`.
+        let details = match detail.get("files").and_then(Value::as_array) {
+            Some(list) => list.clone(),
+            None => vec![detail.clone()],
+        };
+        for d in details {
+            let file = d
+                .get("file")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .or_else(|| self.files.first().cloned());
+            if let Some(file) = file {
+                ProfileEditor { file }.remove(dir, &d)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn contains(&self, dir: &Path) -> bool {
+        self.files
+            .iter()
+            .all(|file| ProfileEditor { file: file.clone() }.contains(dir))
     }
 }
 
@@ -97,9 +151,10 @@ impl PathEditor for ProfileEditor {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
+        // FR-015: nested login shells inherit PATH; add the folder only once.
+        let q = sh_quote(&git_path(dir));
         text.push_str(&format!(
-            "{BEGIN}\nexport PATH={}:\"$PATH\"\n{END}\n",
-            sh_quote(&git_path(dir))
+            "{BEGIN}\ncase \":$PATH:\" in *:{q}:*) ;; *) export PATH={q}:\"$PATH\" ;; esac\n{END}\n"
         ));
         if let Some(parent) = self.file.parent() {
             fs::create_dir_all(parent)?;
@@ -533,6 +588,56 @@ fn install_shim(exe: &Path, shim: &Path) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-014 / FR-015: every login profile gets the block, nested shells add
+    /// the folder once, and removal restores each file byte for byte.
+    #[cfg(unix)]
+    #[test]
+    fn login_profiles_get_one_path_entry_and_are_restored() {
+        let home = tempfile::tempdir().unwrap();
+        let bp = home.path().join(".bash_profile");
+        let before = "[[ -f ~/.bashrc ]] && . ~/.bashrc\n";
+        fs::write(&bp, before).unwrap();
+        let files = vec![home.path().join(".profile"), bp.clone()];
+        let e = ProfilesEditor {
+            files: files.clone(),
+        };
+        let dir = home.path().join("bin dir");
+        let detail = e.add(&dir).unwrap();
+        assert!(e.contains(&dir));
+        let script = format!(
+            ". '{p}'; . '{p}'; . '{b}'; echo \"$PATH\"",
+            p = files[0].display(),
+            b = bp.display()
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        let path = String::from_utf8_lossy(&out.stdout);
+        let want = git_path(&dir);
+        let n = path.split(':').filter(|p| p.trim() == want).count();
+        assert_eq!(n, 1, "{path}");
+        e.remove(&dir, &detail).unwrap();
+        assert_eq!(fs::read_to_string(&bp).unwrap(), before);
+        assert!(!files[0].exists(), "a profile setup created is removed");
+    }
+
+    /// A 0.1.3 setup record (one `profile` detail) still uninstalls.
+    #[test]
+    fn old_single_profile_record_still_removes() {
+        let home = tempfile::tempdir().unwrap();
+        let f = home.path().join(".profile");
+        let dir = home.path().join("bin");
+        let old = ProfileEditor { file: f.clone() }.add(&dir).unwrap();
+        ProfilesEditor {
+            files: vec![f.clone()],
+        }
+        .remove(&dir, &old)
+        .unwrap();
+        assert!(!f.exists());
+    }
 
     #[test]
     fn profile_editor_round_trip_keeps_user_lines() {

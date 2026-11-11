@@ -41,6 +41,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
             let push_rest = push_arguments(&real, &lossy[..i], globals, &lossy[i..], rest);
             match push_rest {
                 Some(push_args) => {
+                    let push_args = drop_no_verify(push_args);
                     let dir = hooks_dir(&ctx.paths);
                     if !dir.is_dir() {
                         return Err(fail2commit_core::Error::invalid(
@@ -113,6 +114,33 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         tool_exit: Some(exit_status(&status)),
         ..Default::default()
     })
+}
+
+/// FR-016: `--no-verify` (or a prefix git would accept, such as `--no-veri`)
+/// would skip the pre-push hook; drop it before `--` and say so.
+fn drop_no_verify(args: Vec<OsString>) -> Vec<OsString> {
+    let mut after_dashes = false;
+    let mut dropped = false;
+    let kept: Vec<OsString> = args
+        .into_iter()
+        .filter(|a| {
+            let s = a.to_string_lossy();
+            if after_dashes {
+                return true;
+            }
+            if s == "--" {
+                after_dashes = true;
+                return true;
+            }
+            let skip = s.len() >= "--no-v".len() && "--no-verify".starts_with(s.as_ref());
+            dropped |= skip;
+            !skip
+        })
+        .collect();
+    if dropped {
+        eprintln!("fail2commit: --no-verify is ignored; this push is still checked");
+    }
+    kept
 }
 
 /// Arguments after `push` if this is a push (directly or through a simple
@@ -235,4 +263,30 @@ fn exit_status(s: &std::process::ExitStatus) -> i32 {
 #[cfg(not(unix))]
 fn exit_status(s: &std::process::ExitStatus) -> i32 {
     s.code().unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_no_verify;
+    use std::ffi::OsString;
+
+    fn v(a: &[&str]) -> Vec<OsString> {
+        a.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn no_verify_and_its_prefixes_are_dropped_before_dashes_only() {
+        assert_eq!(
+            drop_no_verify(v(&["--no-verify", "origin", "--no-veri", "main"])),
+            v(&["origin", "main"])
+        );
+        assert_eq!(
+            drop_no_verify(v(&["--no-", "-n", "--verify"])),
+            v(&["--no-", "-n", "--verify"])
+        );
+        assert_eq!(
+            drop_no_verify(v(&["origin", "--", "--no-verify"])),
+            v(&["origin", "--", "--no-verify"])
+        );
+    }
 }
