@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 /// Events that mean the file was opened or read.
-const MASK: u32 = (libc::IN_OPEN | libc::IN_ACCESS | libc::IN_MODIFY | libc::IN_ATTRIB) as u32;
+const MASK: u32 = libc::IN_OPEN | libc::IN_ACCESS | libc::IN_MODIFY | libc::IN_ATTRIB;
 /// `struct inotify_event` header, before the (padding +) name.
 const EVENT_HDR: usize = std::mem::size_of::<libc::inotify_event>();
 

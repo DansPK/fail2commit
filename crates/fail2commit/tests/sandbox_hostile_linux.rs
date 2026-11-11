@@ -318,10 +318,7 @@ fn rows_main() {
     match mode.as_str() {
         "files" => {
             // HB-001..008: the planted fake host home and a stand-in checkout.
-            report(
-                "planted_secret",
-                std::fs::read(&v("F2C_T_PLANTED")).is_err(),
-            );
+            report("planted_secret", std::fs::read(v("F2C_T_PLANTED")).is_err());
             report("host_home", std::fs::read_dir(v("F2C_T_HOME")).is_err());
             report(
                 "checkout_write",
