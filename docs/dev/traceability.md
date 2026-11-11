@@ -13,3 +13,13 @@
 | FR-010 | PRD-003 | BR-003 | SPEC-010 | TC-010 | Approved |
 | FR-011 | PRD-003 | BR-003 | SPEC-011 | TC-011 | Approved |
 | NFR-012 | PRD-003 | BR-003 | SPEC-012 | TC-012 | Approved |
+| FR-013 | PRD-004 | BR-002 | - | - | Draft |
+| FR-014 | PRD-005 | BR-002 | - | - | Draft |
+| FR-015 | PRD-005 | BR-002 | - | - | Draft |
+| FR-016 | PRD-001 | BR-001 | - | - | Draft |
+| NFR-017 | PRD-003 | BR-003 | - | - | Draft |
+| FR-018 | PRD-004 | BR-002 | - | - | Draft |
+| FR-019 | PRD-004 | BR-002 | - | - | Draft |
+| FR-020 | PRD-005 | BR-002 | - | - | Draft |
+| FR-021 | PRD-003 | BR-003 | - | - | Draft |
+| NFR-022 | PRD-002 | BR-002 | - | - | Draft |
