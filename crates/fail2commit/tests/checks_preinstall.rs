@@ -776,3 +776,35 @@ fn npm_flow_pauses_on_risk_signal() {
     );
     assert_eq!(snapshot(&env.project), before);
 }
+
+/// TC-025-10: with checks on, `npm ci` adds exactly one packument GET per
+/// package to the tarball downloads, and nothing else.
+#[test]
+fn npm_ci_checks_add_only_one_packument_request_per_package() {
+    require_node();
+    let reg = Registry::start();
+    let lib = Pkg::new("app-lib", "1.0.0").dep("left-pad", "^1.0.0");
+    let pad = Pkg::new("left-pad", "1.0.0").file("index.js", "module.exports=1");
+    reg.publish(&lib);
+    reg.publish(&pad);
+    let env = Env::new(
+        &reg,
+        r#"{"name":"clean-app","version":"1.0.0","private":true,"dependencies":{"app-lib":"^1.0.0"}}"#,
+    );
+    std::fs::write(
+        env.project.join("package-lock.json"),
+        reg.lockfile(&["app-lib"], &[&lib, &pad]),
+    )
+    .unwrap();
+    reg.clear_hits();
+    let backend = FakeBackend::new(false, false);
+    let run = Run::new(&env, &backend);
+    npm::execute(&run.deps(Behavior::default()), &env.request(&["ci"])).unwrap();
+    let mut other: Vec<String> = reg
+        .hits()
+        .into_iter()
+        .filter(|h| !h.ends_with(".tgz"))
+        .collect();
+    other.sort();
+    assert_eq!(other, vec!["/app-lib".to_string(), "/left-pad".to_string()]);
+}

@@ -58,7 +58,10 @@ fn clean_install_works_and_updates_manifest_and_lock() {
 
 #[test]
 fn ci_installs_the_lockfile_and_keeps_project_files() {
-    let (reg, env) = setup("clean");
+    let (reg, mut env) = setup("clean");
+    // FR-025 checks read one packument per package; this test is about `ci`
+    // resolving nothing (see checks_preinstall for the checks' requests).
+    env.settings.checks.enabled = false;
     let lib = Pkg::new("app-lib", "1.0.0").dep("left-pad", "^1.0.0");
     let pad = Pkg::new("left-pad", "1.0.0").file("index.js", "module.exports=1");
     reg.publish(&lib);

@@ -152,7 +152,7 @@ latest publish time before this one (npm `time`, PyPI earliest file
 | (a) new install script | npm: this version has `preinstall`/`install`/`postinstall` (registry or reviewed `package.json`) and the previous version had none. PyPI: this version's wheel ships a startup file (`*.pth`, `sitecustomize.py`, `usercustomize.py`) and the previous version's wheel did not. | previous version's scripts / wheel |
 | (b) maintainers changed | npm: `maintainers` names differ, or `_npmUser` is not among the previous version's maintainers or publisher. PyPI: the set of author/maintainer names and emails differs. | both versions' people |
 | (c) very new | published less than `checks.min_age_hours` (default 48) ago, or in the future | publish time |
-| (d) look-alike name | not in the popular list, and a popular name is within optimal-string-alignment distance 1 (names ≥ 5 chars), or equal after homoglyph and separator folding (`0→o`, `1/i→l`, `rn→m`, `vv→w`; npm also drops `-_.`) | bundled list only |
+| (d) look-alike name | not in the popular list, and a popular name is within optimal-string-alignment distance 1 (names ≥ 5 chars), or equal after homoglyph and separator folding (`0→o`, `1`/`i`→`l`, `5→s`, `rn→m`, `vv→w`, `-_.` dropped; names ≥ 3 chars; PyPI names PEP 503-normalised first) | bundled list only |
 | (e) newly obfuscated | this version has an obfuscated or minified file and the previous version had none | previous artifact |
 
 (a)/(e) download the previous version's artifact only when this version has
@@ -182,6 +182,13 @@ version means (a), (b), (e) do not apply (not a gap).
 
 Generated once and committed; the file headers record source and date.
 
+Known limits: the false-positive rate of (d) on real, less popular names was
+not measured (an offline estimate was stopped as too slow); hits are
+approvals, never denials. PyPI (b) compares the author/maintainer fields of
+the release JSON, because PyPI does not publish uploader identity. The
+"previous version" is by publish time, so a backported patch release may be
+compared with a newer major line.
+
 ## FR-028 — Output scan
 
 `scan::output::scan_tree(matcher, index, root, files) -> Vec<Finding>` scans
@@ -208,13 +215,22 @@ The npm and pip flows have no progress sink yet; each new step boundary has a
 
 ## Measurements
 
-Filled in after implementation (Windows 11 host, `-j 2`):
+Windows 11 host, 12 cores, `-j 2`, rustc 1.99.1, separate empty target dirs
+(2026-11-11). "Before" is `0b77fa7`; "after" is this branch with yara-x.
 
 | Metric | Before | After | Change |
 |---|---|---|---|
-| `fail2commit.exe` release size | 15,810,658 B | TBD | TBD |
-| Clean release build `cargo build --release -p fail2commit -j 2` | 232 s | TBD | TBD |
-| YARA scan of a clean plan (TC-019-7) | — | TBD | — |
+| `fail2commit.exe` release size | 15,810,658 B | 60,647,016 B | +44,836,358 B (×3.8) |
+| Clean release build `cargo build --release -p fail2commit -j 2` | 232 s | 1,183 s | +951 s (×5.1) |
+| Crates in `THIRD-PARTY-NOTICES.md` | 148 | 282 | +134 |
+| YARA scan of a clean plan (TC-019-7, 200 files, 26 MB) | — | printed by the test on the VM run | — |
+
+The "after" build time is an upper bound: a `cargo clippy -j 2` ran on the
+same host for part of it. Almost all of the cost is wasmtime and cranelift,
+which yara-x uses to compile rules to native code; the disabled modules
+(`pe`, `elf`, `macho`, `dotnet`, `dex`, `lnk`, `crx`, `vt`, `zip`, `cuckoo`,
+`console`) and their crypto dependencies are not built. The release profile
+was not changed (no LTO/strip settings were added in this task).
 
 ## Test cases
 
@@ -246,6 +262,7 @@ Filled in after implementation (Windows 11 host, `-j 2`):
 | TC-025-7 | Clean, established package with the same people, old publish time → no finding. | `checks_preinstall::clean_established_package_has_no_signal` |
 | TC-025-8 | Registry returns no `time`/`maintainers`, or 404 → `info` "not checked" naming the checks; never clean. | `checks_preinstall::missing_metadata_is_not_checked` |
 | TC-025-9 | Through the npm guard, a (c) hit pauses for approval with a `risk_signal`. | `checks_preinstall::npm_flow_pauses_on_risk_signal` |
+| TC-025-10 | Given checks on, When `npm ci` runs, Then the only requests besides tarballs are one packument GET per package (the existing `npm_flow::ci_installs_the_lockfile_and_keeps_project_files` turns checks off and keeps "ci resolves nothing"). | `checks_preinstall::npm_ci_checks_add_only_one_packument_request_per_package` |
 | TC-028-1 | `scan_tree` over produced files flags a YARA match, a code-rule match and a produced malware `package.json` (deny). | `scan_output::scan_tree_flags_yara_code_and_malware` |
 | TC-028-2 | Given a script that writes (downloads) a file matching a bundled rule, When the install runs, Then the finding appears before commit and cancelling leaves the project unchanged. | `scan_output::script_output_match_pauses_before_commit` |
 | TC-028-3 | Approving the output finding commits the tree with the produced file. | `scan_output::approved_script_output_is_committed` |
