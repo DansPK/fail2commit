@@ -26,10 +26,13 @@ use crate::redact;
 use crate::settings::AdvisorySettings;
 
 mod cache;
+pub mod checks;
 pub mod code;
 pub mod malware_list;
 mod osv;
+pub mod output;
 mod rules;
+pub mod yara;
 
 /// Most advisory ids reported for one package. A longer list is truncated and
 /// the report says so.

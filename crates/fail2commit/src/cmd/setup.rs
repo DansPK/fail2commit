@@ -179,6 +179,9 @@ pub fn status(ctx: &Ctx) -> CmdResult {
             "\nwarning: npm registry signature checks are off (signatures.verify = false)",
         );
     }
+    // FR-018: threat-data source, size and age, warning when stale.
+    let (threat_line, threat_data) = super::malware_list::status_line(ctx);
+    text.push_str(&format!("\n{threat_line}"));
     for (tool, file) in &unguarded {
         let shim = ctx.paths.bin_dir.join(if cfg!(windows) {
             format!("{tool}.exe")
@@ -211,6 +214,7 @@ pub fn status(ctx: &Ctx) -> CmdResult {
             "timeout_secs": ctx.settings.advisories.timeout_secs,
         },
         "signatures": ctx.settings.signatures,
+        "threat_data": threat_data,
         "sandbox": {
             "enabled": ctx.settings.sandbox.enabled,
             "backend": probe.backend,

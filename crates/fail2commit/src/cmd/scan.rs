@@ -85,6 +85,16 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
             &local.scripts,
             &install,
         ));
+        // FR-019: the same YARA rules a guarded install uses.
+        if let Some(m) = scan::yara::Matcher::load(&ctx.paths, &ctx.settings.rules)? {
+            findings.extend(scan::yara::scan_package(
+                &m,
+                &local.package,
+                dir,
+                &install,
+                &mut scan::yara::Budget::default(),
+            ));
+        }
     }
 
     // Deny findings can never be approved away, so they also fail the command.
@@ -111,7 +121,12 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         .count();
     let code = findings
         .iter()
-        .filter(|finding| finding.kind == FindingKind::SuspiciousCode)
+        .filter(|finding| {
+            matches!(
+                finding.kind,
+                FindingKind::SuspiciousCode | FindingKind::YaraMatch
+            )
+        })
         .count();
     let mut message = if advisories == 0 {
         "no known advisories for the requested versions".to_string()

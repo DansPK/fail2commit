@@ -24,6 +24,7 @@ zip = { version = "9.4.2", default-features = false, features = ["deflate"] }
 tempfile = "3.27.0"
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 hmac = "0.13.0"
+yara-x = { version = "1.23.0", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "hash-module", "math-module", "string-module", "time-module"] }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.191"
