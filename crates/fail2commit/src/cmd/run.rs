@@ -137,6 +137,8 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
             "truncated": outcome.truncated,
             "stdout": stdout,
             "stderr": stderr,
+            "network": ctx.settings.sandbox.network,
+            "activity": outcome.report,
             "exported": outcome
                 .exported
                 .iter()

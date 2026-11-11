@@ -23,6 +23,11 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub use linux::Bubblewrap;
 
+/// Entry point of the `f2c-sandbox-relay` binary: the in-sandbox TCP to Unix relay that gives
+/// `sandbox.network = internet` its only network path (SPEC-013 §4).
+#[cfg(target_os = "linux")]
+pub use linux::relay_main;
+
 /// The backend for this platform. Unsupported platforms get a backend whose
 /// probe reports unavailable, so callers fail closed.
 pub fn platform_backend() -> Box<dyn SandboxBackend> {
@@ -539,4 +544,5 @@ mod tests {
         assert_eq!(err.code, ResultCode::IsolationUnavailable);
         assert!(!to.exists());
     }
+
 }
