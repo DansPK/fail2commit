@@ -43,14 +43,16 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
     JobObjectAssociateCompletionPortInformation, JobObjectBasicAccountingInformation,
+    JobObjectBasicAndIoAccountingInformation, JobObjectBasicProcessIdList,
     JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject, JOBOBJECTINFOCLASS,
     JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
 };
@@ -60,11 +62,13 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    GetProcessMitigationPolicy, InitializeProcThreadAttributeList, OpenProcessToken,
+    ProcessExtensionPointDisablePolicy, ProcessFontDisablePolicy, ProcessImageLoadPolicy,
+    ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
@@ -83,8 +87,28 @@ pub(super) const UI_LIMIT_ALL: u32 = JOB_OBJECT_UILIMIT_DESKTOP
 /// not enabled for this crate).
 pub(super) const MSG_ACTIVE_PROCESS_LIMIT: u32 = 3;
 pub(super) const MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
+pub(super) const MSG_NEW_PROCESS: u32 = 6;
 pub(super) const MSG_JOB_MEMORY_LIMIT: u32 = 10;
-const JOB_KEY: usize = 0xF2C0;
+pub(super) const JOB_KEY: usize = 0xF2C0;
+/// winnt.h; the SystemServices feature is not enabled for this crate.
+const SE_GROUP_ENABLED: u32 = 4;
+/// Completion key for bait oplock breaks bound to the job port (SPEC-014).
+pub(super) const BAIT_KEY: usize = 0xF2C1;
+
+/// SPEC-014 section 4: root-process mitigations that leave the toolchain
+/// working (winbase.h `PROCESS_CREATION_MITIGATION_POLICY_*_ALWAYS_ON`).
+pub(super) const MITIGATIONS: u64 = (1 << 32) // extension points disabled
+    | (1 << 48) // non-system fonts blocked
+    | (1 << 52); // no remote image loads
+
+/// One completion packet from the job port.
+pub(super) struct PortEvent {
+    pub(super) key: usize,
+    /// Job message id, or bytes transferred for an I/O completion.
+    pub(super) msg: u32,
+    /// Process id for job messages; the OVERLAPPED address for I/O.
+    pub(super) value: usize,
+}
 pub(super) const REQUIRED_LIMIT_FLAGS: u32 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
     | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
     | JOB_OBJECT_LIMIT_JOB_MEMORY
@@ -173,17 +197,21 @@ pub(super) struct Profile {
 }
 
 impl Profile {
-    /// Create a new profile with a random 128-bit name. An existing profile
-    /// with that name is an error, so no prior loopback exemption or other
-    /// per-SID configuration can apply.
-    #[allow(unsafe_code)]
-    pub(super) fn create_fresh() -> crate::Result<Profile> {
+    /// A random 128-bit profile name with the fail2commit prefix.
+    pub(super) fn fresh_name() -> crate::Result<String> {
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(|e| {
             crate::Error::isolation_unavailable(format!("random profile name: {e}"))
         })?;
-        let name_s = format!("fail2commit.sbx.{}", hex::encode(nonce));
-        let name = wide(OsStr::new(&name_s));
+        Ok(format!("{PROFILE_PREFIX}{}", hex::encode(nonce)))
+    }
+
+    /// Create a new profile named `name_s` (from [`Profile::fresh_name`]). An
+    /// existing profile with that name is an error, so no prior loopback
+    /// exemption or other per-SID configuration can apply.
+    #[allow(unsafe_code)]
+    pub(super) fn create(name_s: &str) -> crate::Result<Profile> {
+        let name = wide(OsStr::new(name_s));
         let display = wide(OsStr::new("fail2commit sandbox job"));
         let mut sid: PSID = std::ptr::null_mut();
         // SAFETY: all strings are NUL-terminated and live across the call; a
@@ -228,6 +256,31 @@ impl Drop for Profile {
             DeleteAppContainerProfile(self.name.as_ptr());
             FreeSid(self.sid);
         }
+    }
+}
+
+/// Every profile this backend creates starts with this (SPEC-014 section 6).
+pub(super) const PROFILE_PREFIX: &str = "fail2commit.sbx.";
+
+/// Delete a leftover profile by name. A profile that no longer exists is
+/// success (HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) and S_OK alike).
+#[allow(unsafe_code)]
+pub(super) fn delete_profile(name: &str) -> crate::Result<()> {
+    if !name.starts_with(PROFILE_PREFIX) {
+        return Err(crate::Error::isolation_unavailable(
+            "refusing to delete a profile fail2commit did not create",
+        ));
+    }
+    let w = wide(OsStr::new(name));
+    // SAFETY: NUL-terminated name that lives across the call.
+    let hr = unsafe { DeleteAppContainerProfile(w.as_ptr()) };
+    if hr == 0 || hr as u32 == 0x8007_0002 {
+        Ok(())
+    } else {
+        Err(crate::Error::isolation_unavailable(format!(
+            "DeleteAppContainerProfile({name}) failed: HRESULT 0x{:08X}",
+            hr as u32
+        )))
     }
 }
 
@@ -692,16 +745,78 @@ impl Job {
     }
 
     /// Next job notification for this job, waiting at most `ms`.
-    #[allow(unsafe_code)]
     pub(super) fn next_message(&self, ms: u32) -> Option<u32> {
+        self.next_event(ms)
+            .filter(|e| e.key == JOB_KEY)
+            .map(|e| e.msg)
+    }
+
+    /// Next packet of any key on the job port, waiting at most `ms`. A failed
+    /// I/O completion (a bait oplock that was cancelled) is still returned.
+    #[allow(unsafe_code)]
+    pub(super) fn next_event(&self, ms: u32) -> Option<PortEvent> {
         let mut msg = 0u32;
         let mut key = 0usize;
         let mut ov: *mut OVERLAPPED = std::ptr::null_mut();
         // SAFETY: valid port handle and out-parameters; job notifications
-        // carry the message id in the byte count and no real OVERLAPPED.
+        // carry the message id in the byte count and the process id in the
+        // OVERLAPPED slot, I/O completions carry their real OVERLAPPED.
         let ok =
             unsafe { GetQueuedCompletionStatus(raw(&self.port), &mut msg, &mut key, &mut ov, ms) };
-        (ok != 0 && key == JOB_KEY).then_some(msg)
+        (ok != 0 || !ov.is_null()).then_some(PortEvent {
+            key,
+            msg,
+            value: ov as usize,
+        })
+    }
+
+    /// Bind an overlapped file handle to the job port under `key`.
+    #[allow(unsafe_code)]
+    pub(super) fn associate(&self, file: HANDLE, key: usize) -> crate::Result<()> {
+        // SAFETY: `file` is a live overlapped handle owned by the caller and
+        // the port outlives it (the caller drops the file first).
+        let p = unsafe { CreateIoCompletionPort(file, raw(&self.port), key, 0) };
+        if p.is_null() {
+            return Err(unavailable("bind bait file to the job port"));
+        }
+        Ok(())
+    }
+
+    /// Bytes written by every process of the job, files and pipes alike.
+    pub(super) fn write_bytes(&self) -> crate::Result<u64> {
+        let info: JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION =
+            query_info(raw(&self.handle), JobObjectBasicAndIoAccountingInformation)
+                .ok_or_else(|| crate::Error::internal("query job I/O accounting failed"))?;
+        Ok(info.IoInfo.WriteTransferCount)
+    }
+
+    /// Process ids currently in the job (at most 4096).
+    #[allow(unsafe_code)]
+    pub(super) fn pids(&self) -> crate::Result<Vec<u32>> {
+        const MAX: usize = 4096;
+        // Header (two u32) followed by MAX ULONG_PTR ids.
+        let mut buf = vec![0usize; MAX + 1];
+        let bytes = (std::mem::size_of_val(buf.as_slice())) as u32;
+        // SAFETY: `buf` is usize-aligned and `bytes` long, which is the
+        // JOBOBJECT_BASIC_PROCESS_ID_LIST layout for MAX entries.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                raw(&self.handle),
+                JobObjectBasicProcessIdList,
+                buf.as_mut_ptr().cast(),
+                bytes,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(crate::Error::internal("query job process ids failed"));
+        }
+        // SAFETY: the header's second u32 is NumberOfProcessIdsInList.
+        let listed = unsafe { *(buf.as_ptr() as *const u32).add(1) } as usize;
+        Ok(buf[1..1 + listed.min(MAX)]
+            .iter()
+            .map(|&id| id as u32)
+            .collect())
     }
 }
 
@@ -783,8 +898,9 @@ impl Spawned {
     }
 }
 
-/// Create the process suspended inside the AppContainer `sid` with zero
-/// capabilities. Only `stdio` handles are inherited (explicit HANDLE_LIST).
+/// Create the process suspended inside the AppContainer `sid` with exactly
+/// `capabilities` (empty for no network) and the [`MITIGATIONS`] policy.
+/// Only `stdio` handles are inherited (explicit HANDLE_LIST).
 #[allow(unsafe_code)]
 pub(super) fn spawn_suspended(
     program: &Path,
@@ -792,26 +908,39 @@ pub(super) fn spawn_suspended(
     env_block: &[u16],
     cwd: &Path,
     sid: PSID,
+    capabilities: &[PSID],
     stdio: [HANDLE; 3],
 ) -> crate::Result<Spawned> {
     let program_w = wide(program.as_os_str());
     let cwd_w = wide(cwd.as_os_str());
+    let mut cap_list: Vec<SID_AND_ATTRIBUTES> = capabilities
+        .iter()
+        .map(|&cap| SID_AND_ATTRIBUTES {
+            Sid: cap,
+            Attributes: SE_GROUP_ENABLED,
+        })
+        .collect();
     let caps = SECURITY_CAPABILITIES {
         AppContainerSid: sid,
-        Capabilities: std::ptr::null_mut(),
-        CapabilityCount: 0,
+        Capabilities: if cap_list.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            cap_list.as_mut_ptr()
+        },
+        CapabilityCount: cap_list.len() as u32,
         Reserved: 0,
     };
+    let mitigations: u64 = MITIGATIONS;
     let handles = stdio;
     let mut size = 0usize;
     // SAFETY: sizing call with a null list is documented to fail and set
     // `size`.
-    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size) };
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 3, 0, &mut size) };
     // usize-aligned backing storage for the opaque attribute list.
     let mut buf = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
     let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
     // SAFETY: `buf` is at least `size` bytes and outlives the list.
-    if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut size) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &mut size) } == 0 {
         return Err(unavailable("InitializeProcThreadAttributeList"));
     }
     struct ListGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -823,7 +952,8 @@ pub(super) fn spawn_suspended(
         }
     }
     let _list_guard = ListGuard(list);
-    // SAFETY: `caps` and `handles` outlive CreateProcessW below; sizes match.
+    // SAFETY: `caps` (and the `cap_list` it points into), `mitigations` and
+    // `handles` outlive CreateProcessW below; sizes match.
     let ok = unsafe {
         UpdateProcThreadAttribute(
             list,
@@ -840,6 +970,15 @@ pub(super) fn spawn_suspended(
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                 handles.as_ptr().cast(),
                 std::mem::size_of_val(&handles),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ) != 0
+            && UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+                (&mitigations as *const u64).cast(),
+                std::mem::size_of::<u64>(),
                 std::ptr::null_mut(),
                 std::ptr::null(),
             ) != 0
@@ -867,7 +1006,8 @@ pub(super) fn spawn_suspended(
     // SAFETY: every pointer is valid and NUL-terminated where required, the
     // command line buffer is mutable and NUL-terminated, the environment is
     // a double-NUL-terminated UTF-16 block, and the attribute list holds
-    // only the AppContainer capabilities and the three stdio handles.
+    // only the AppContainer capabilities, the three stdio handles and the
+    // mitigation policy.
     let created = unsafe {
         CreateProcessW(
             program_w.as_ptr(),
@@ -924,6 +1064,8 @@ pub(super) struct TokenFacts {
     pub(super) is_appcontainer: bool,
     pub(super) sid_matches: bool,
     pub(super) capability_count: u32,
+    /// String SIDs of the token's capabilities.
+    pub(super) capabilities: Vec<String>,
     pub(super) is_lpac: bool,
 }
 
@@ -949,17 +1091,57 @@ pub(super) fn token_facts(process: &OwnedHandle, sid: PSID) -> crate::Result<Tok
             !info.TokenAppContainer.is_null() && EqualSid(info.TokenAppContainer, sid) != 0
         })
         .unwrap_or(false);
+    let mut capabilities = Vec::new();
     let capability_count = match token_info(t, TokenCapabilities) {
-        // SAFETY: TOKEN_GROUPS header at the start of the buffer.
-        Some(b) => unsafe { (*(b.as_ptr() as *const TOKEN_GROUPS)).GroupCount },
+        // SAFETY: TOKEN_GROUPS header at the start of the buffer, followed by
+        // GroupCount SID_AND_ATTRIBUTES whose SIDs point into the buffer.
+        Some(b) => unsafe {
+            let groups = &*(b.as_ptr() as *const TOKEN_GROUPS);
+            let first = groups.Groups.as_ptr();
+            for i in 0..groups.GroupCount as usize {
+                capabilities.push(sid_to_string((*first.add(i)).Sid)?);
+            }
+            groups.GroupCount
+        },
         None => u32::MAX,
     };
     Ok(TokenFacts {
         is_appcontainer,
         sid_matches,
         capability_count,
+        capabilities,
         is_lpac,
     })
+}
+
+/// True when the (suspended) root reports every [`MITIGATIONS`] policy on.
+#[allow(unsafe_code)]
+pub(super) fn mitigations_applied(process: &OwnedHandle) -> crate::Result<bool> {
+    let mut all = true;
+    for policy in [
+        ProcessExtensionPointDisablePolicy,
+        ProcessFontDisablePolicy,
+        ProcessImageLoadPolicy,
+    ] {
+        let mut flags = 0u32;
+        // SAFETY: each of these policies is a single DWORD bit-field struct;
+        // the process handle has full access.
+        let ok = unsafe {
+            GetProcessMitigationPolicy(
+                raw(process),
+                policy,
+                (&mut flags as *mut u32).cast(),
+                std::mem::size_of::<u32>(),
+            )
+        };
+        if ok == 0 {
+            return Err(unavailable("GetProcessMitigationPolicy(child)"));
+        }
+        // Bit 0 is DisableExtensionPoints / DisableNonSystemFonts /
+        // NoRemoteImages respectively.
+        all &= flags & 1 == 1;
+    }
+    Ok(all)
 }
 
 /// String SID of the current user (for the tray-style pipe DACL).
