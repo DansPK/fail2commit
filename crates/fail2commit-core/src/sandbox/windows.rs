@@ -368,6 +368,7 @@ fn probe_limits() -> crate::isolation::JobLimits {
         memory_bytes: Some(PROBE_MEMORY_BYTES),
         max_processes: Some(PROBE_PROCESSES),
         max_output_bytes: PROBE_OUTPUT_BYTES,
+        disk_bytes: None,
     }
 }
 
@@ -1425,6 +1426,7 @@ mod tests {
                 memory_bytes: Some(128 * 1024 * 1024),
                 max_processes: Some(4),
                 max_output_bytes: 16 * 1024,
+                disk_bytes: None,
             },
             network: crate::isolation::NetworkMode::None,
             bait: false,

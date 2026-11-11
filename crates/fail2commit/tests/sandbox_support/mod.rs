@@ -62,6 +62,7 @@ mod linux {
             memory_bytes: Some(1024 * 1024 * 1024),
             max_processes: Some(64),
             max_output_bytes: 1024 * 1024,
+            disk_bytes: None,
         }
     }
 

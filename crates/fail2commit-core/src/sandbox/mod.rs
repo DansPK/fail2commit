@@ -3,7 +3,7 @@
 //! `windows.rs`: T-007b (sandboxrs-windows AppContainer).
 //!
 //! Frozen API: [`platform_backend`], [`run_job`]. Coordinator-owned and frozen
-//! for 0.1.4: [`bait`] (FR-024) and [`netpolicy`] (FR-023).
+//! for 0.1.4: [`bait`] (FR-024), [`netpolicy`] (FR-023) and [`report`] (FR-026).
 
 use crate::isolation::{JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend};
 use std::fs;
@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub mod bait;
 pub mod netpolicy;
+pub mod report;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -331,6 +332,7 @@ mod tests {
                 memory_bytes: None,
                 max_processes: None,
                 max_output_bytes: 1024,
+                disk_bytes: None,
             },
             network: crate::isolation::NetworkMode::None,
             bait: false,

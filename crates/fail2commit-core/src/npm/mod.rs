@@ -526,15 +526,18 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     commit::begin(paths, &req.project, &apply_dir)?;
     std::fs::create_dir(&apply_dir)
         .inspect_err(|_| commit::abandon(paths, &req.project, &apply_dir))?;
-    let built = (|| -> Result<(Vec<String>, Vec<String>, Vec<Finding>)> {
+    // (scripts run, build output, sandbox activity, output-scan findings)
+    type Built = (Vec<String>, Vec<String>, Vec<Finding>, Vec<Finding>);
+    let built = (|| -> Result<Built> {
         std::fs::write(apply_dir.join("package.json"), &final_pj)?;
         std::fs::write(apply_dir.join("package-lock.json"), &final_lock)?;
         tree::recheck(&proj_stage, &reviewed)?;
         tree::verify_unchanged(&proj_stage, &snap)?;
         // FR-013: Step::Scripts
-        let ran = apply::run_scripts(deps, &tc, sd, &proj_stage, &reviewed, &found, mode, &|| {
-            tree::recheck(&proj_stage, &reviewed)
-        })?;
+        let (ran, activity) =
+            apply::run_scripts(deps, &tc, sd, &proj_stage, &reviewed, &found, mode, &|| {
+                tree::recheck(&proj_stage, &reviewed)
+            })?;
         let output = if ran.is_empty() {
             Vec::new()
         } else {
@@ -556,9 +559,9 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
             &proj_stage.join("node_modules"),
             &apply_dir.join("node_modules"),
         )?;
-        Ok((ran, output, produced))
+        Ok((ran, output, activity, produced))
     })();
-    let (ran, build_output, produced) = match built {
+    let (ran, build_output, activity, produced) = match built {
         Ok(r) => r,
         Err(e) => {
             commit::abandon(paths, &req.project, &apply_dir);
@@ -586,6 +589,8 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     if let Some(note) = &recovered {
         message.push_str(&format!("; {note}"));
     }
+    // FR-026: what the sandboxed scripts tried, shown with the result.
+    findings.extend(activity);
     findings.extend(produced);
     Ok(NpmOutcome {
         message,

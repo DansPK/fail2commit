@@ -20,7 +20,7 @@ mod scan;
 pub use integ::RegistryEditor;
 pub use integ::{
     default_path_editor, hooks_dir, shim_path, GitIntegration, PathEditor, ProfileEditor,
-    PATH_TARGET_ENV,
+    ProfilesEditor, PATH_TARGET_ENV,
 };
 
 /// One proposed ref update, as Git reports it to pre-push / pre-receive.

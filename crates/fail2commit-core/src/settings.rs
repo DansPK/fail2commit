@@ -153,6 +153,8 @@ pub struct Limits {
     pub job_memory_mb: u64,
     pub job_max_processes: u32,
     pub job_max_output_bytes: u64,
+    /// 0.1.4: bytes a sandbox job may write into its stage (MiB).
+    pub job_disk_mb: u64,
     /// Max bytes of blob content the Git secret scan reads per push.
     pub scan_max_bytes: u64,
     /// Max commits/packages walked per operation.
@@ -200,6 +202,8 @@ impl Default for Limits {
             job_memory_mb: 2048,
             job_max_processes: 64,
             job_max_output_bytes: 8 * 1024 * 1024,
+            // Room for browser downloads such as puppeteer's Chromium.
+            job_disk_mb: 4096,
             scan_max_bytes: 256 * 1024 * 1024,
             graph_max_nodes: 100_000,
             artifact_max_bytes: 512 * 1024 * 1024,

@@ -18,6 +18,9 @@ pub struct JobLimits {
     pub max_processes: Option<u32>,
     /// Combined stdout+stderr cap; excess is dropped and `truncated` set.
     pub max_output_bytes: u64,
+    /// Bytes the job may write into its stage (0.1.4, FR-020 HB-053); `None`
+    /// means no disk limit.
+    pub disk_bytes: Option<u64>,
 }
 
 impl JobLimits {
@@ -27,6 +30,7 @@ impl JobLimits {
             memory_bytes: Some(l.job_memory_mb.saturating_mul(1024 * 1024)),
             max_processes: Some(l.job_max_processes),
             max_output_bytes: l.job_max_output_bytes,
+            disk_bytes: Some(l.job_disk_mb.saturating_mul(1024 * 1024)),
         }
     }
 }

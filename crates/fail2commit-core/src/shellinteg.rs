@@ -96,6 +96,15 @@ fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// (shell function, fail2commit subcommand). `git` (FR-016) keeps pushes
+/// checked when another `git` comes earlier on PATH.
+const FUNCTIONS: [(&str, &str); 4] = [
+    ("pip", "pip"),
+    ("pip3", "pip"),
+    ("npm", "npm"),
+    ("git", "git"),
+];
+
 fn block(flavor: Flavor, exe: &Path) -> String {
     let exe = exe.to_string_lossy();
     let mut b = String::new();
@@ -108,7 +117,7 @@ fn block(flavor: Flavor, exe: &Path) -> String {
             let e = sh_quote(&exe.replace('\\', "/"));
             // CR-021: if fail2commit was removed without uninstall-integrations,
             // fall back to the real command instead of "not found".
-            for (f, sub) in [("pip", "pip"), ("pip3", "pip"), ("npm", "npm")] {
+            for (f, sub) in FUNCTIONS {
                 b.push_str(&format!(
                     "{f}() {{ if [ -x {e} ]; then {e} {sub} \"$@\"; else command {f} \"$@\"; fi; }}\n"
                 ));
@@ -116,8 +125,10 @@ fn block(flavor: Flavor, exe: &Path) -> String {
         }
         Flavor::PowerShell => {
             let e = ps_quote(&exe);
-            for (f, sub) in [("pip", "pip"), ("pip3", "pip"), ("npm", "npm")] {
-                b.push_str(&format!("function {f} {{ & {e} {sub} @args }}\n"));
+            for (f, sub) in FUNCTIONS {
+                b.push_str(&format!(
+                    "function {f} {{ if (Test-Path -LiteralPath {e}) {{ & {e} {sub} @args }} else {{ & (Get-Command {f} -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source @args }} }}\n"
+                ));
             }
         }
     }
@@ -313,7 +324,35 @@ mod tests {
             Flavor::PowerShell,
             Path::new(r"C:\Users\O'Neil\fail2commit.exe"),
         );
-        assert!(b.contains(r"function npm { & 'C:\Users\O''Neil\fail2commit.exe' npm @args }"));
-        assert!(b.contains("function pip3 { & "));
+        assert!(b.contains(
+            r"function npm { if (Test-Path -LiteralPath 'C:\Users\O''Neil\fail2commit.exe') { & 'C:\Users\O''Neil\fail2commit.exe' npm @args }"
+        ));
+        assert!(b.contains("function pip3 { if "));
+        assert!(b.contains("git @args } else { & (Get-Command git -CommandType Application"));
+    }
+
+    /// FR-016 / CR-021: the functions route through fail2commit while it
+    /// exists and fall back to the real command, silently, once it is gone.
+    #[cfg(unix)]
+    #[test]
+    fn posix_git_function_routes_through_the_guard_and_falls_back() {
+        let d = tempfile::tempdir().unwrap();
+        let exe = d.path().join("f2c");
+        std::fs::write(&exe, "#!/bin/sh\necho \"guard $*\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rc = d.path().join("rc");
+        std::fs::write(&rc, block(Flavor::Posix, &exe)).unwrap();
+        let run = || {
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(". '{}'; git --version", rc.display()))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(run(), "guard git --version\n");
+        std::fs::remove_file(&exe).unwrap();
+        assert!(run().starts_with("git version"), "real git after removal");
     }
 }
