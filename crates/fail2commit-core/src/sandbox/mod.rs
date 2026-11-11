@@ -331,6 +331,7 @@ mod tests {
                 memory_bytes: None,
                 max_processes: None,
                 max_output_bytes: 1024,
+                disk_bytes: None,
             },
             network: crate::isolation::NetworkMode::None,
             bait: false,

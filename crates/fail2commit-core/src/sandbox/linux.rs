@@ -667,6 +667,7 @@ fn probe_scope(bash: &Path) -> Option<Scope> {
         memory_bytes: Some(64 * 1024 * 1024),
         max_processes: Some(7),
         max_output_bytes: 4096,
+        disk_bytes: None,
     };
     let mut c = scope_command(&scope, &limits);
     c.arg(bash).args(["-c", SCOPE_SCRIPT]);
@@ -700,6 +701,7 @@ fn self_test(tools: &Tools, diagnostic: &mut String) -> crate::Result<Vec<(Strin
             memory_bytes: Some(PROBE_MEMORY),
             max_processes: Some(PROBE_NPROC),
             max_output_bytes: 64 * 1024,
+            disk_bytes: None,
         },
         network: crate::isolation::NetworkMode::None,
         bait: false,
