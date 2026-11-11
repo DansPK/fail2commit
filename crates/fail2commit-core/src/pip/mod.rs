@@ -154,6 +154,8 @@ pub fn install(
 
     // 1. nothing is resolved or fetched until the input is acceptable
     let req = request::parse_args(args, cwd)?;
+    // FR-019: a user rule file that does not compile stops the install here.
+    let matcher = crate::scan::yara::Matcher::load(ctx.paths, &ctx.settings.rules)?;
     if seams.check_ambient_config {
         interp::check_env(std::env::vars(), DEFAULT_INDEX)?;
     }
@@ -250,8 +252,33 @@ pub fn install(
     // 4. review: advisories, approval bound to the exact wheel set
     let reviewed = apply::materialize(ctx.paths, &staged)?;
     let requested = req.canonical();
+    // FR-018: refresh stale threat data first when the user asked for it.
+    let mut extra = crate::scan::malware_list::auto_refresh(ctx.paths, ctx.settings);
+    extra.extend(match_wheels(matcher.as_ref(), &reviewed, &wheels));
+    // FR-013: Step::PreInstallChecks — registry metadata and the reviewed wheels (FR-025).
+    let cands: Vec<crate::scan::checks::Candidate> = wheels
+        .iter()
+        .map(|w| crate::scan::checks::Candidate {
+            pkg: w.package(),
+            artifact: reviewed.join(&w.filename),
+            install_script: false,
+        })
+        .collect();
+    extra.extend(crate::scan::checks::run(
+        ctx.paths,
+        ctx.settings,
+        &crate::scan::checks::Origin {
+            url: &policy.url,
+            file_hosts: &policy.file_hosts,
+            artifact_max_bytes: ctx.settings.limits.artifact_max_bytes,
+        },
+        &cands,
+    ));
+    // FR-028: pip installs wheels only and runs no package code (no sandboxed
+    // scripts, `has_scripts = false` below), so there is no script output to
+    // scan before apply.
     let result = review_and_apply(
-        ctx, &cx, seams, &digest, &wheels, &reviewed, &requested, &interp, &policy,
+        ctx, &cx, seams, &digest, &wheels, &reviewed, &requested, &interp, &policy, extra,
     );
     if !apply::journal_exists(ctx.paths, &interp) {
         let _ = std::fs::remove_dir_all(&reviewed);
@@ -281,6 +308,25 @@ fn reserved_names(interp: &Interpreter) -> Vec<String> {
         }
     }
     v
+}
+
+/// FR-019: match every entry of every reviewed wheel against the YARA rules.
+// FR-013: Step::ScanCode
+fn match_wheels(
+    matcher: Option<&crate::scan::yara::Matcher>,
+    dir: &Path,
+    wheels: &[PlanWheel],
+) -> Vec<Finding> {
+    let Some(m) = matcher else {
+        return Vec::new();
+    };
+    let mut budget = crate::scan::yara::Budget::default();
+    wheels
+        .iter()
+        .flat_map(|w| {
+            crate::scan::yara::scan_wheel(m, &w.package(), &dir.join(&w.filename), &mut budget)
+        })
+        .collect()
 }
 
 /// What inspecting the reviewed copies found: approvable startup files, and a
@@ -356,9 +402,11 @@ fn review_and_apply(
     requested: &[String],
     interp: &Interpreter,
     policy: &IndexPolicy,
+    extra: Vec<Finding>,
 ) -> crate::Result<(Vec<Finding>, bool)> {
     // Layout denies and startup files come from the reviewed copies (RP-003/4).
     let startup = scan_wheels(reviewed, wheels, interp)?.startup;
+    // FR-013: Step::Advisories
     let pkgs: Vec<PackageId> = wheels.iter().map(PlanWheel::package).collect();
     let adv = (seams.advisories)(&pkgs);
     if adv.findings.iter().any(|f| f.action == FindingAction::Deny) {
@@ -369,6 +417,7 @@ fn review_and_apply(
     }
     let mut findings = adv.findings.clone();
     findings.extend(startup.iter().cloned());
+    findings.extend(extra);
     let needs_approval =
         !adv.complete || findings.iter().any(|f| f.action == FindingAction::Approve);
     let mut approved = false;
@@ -433,6 +482,7 @@ fn review_and_apply(
     if seams.cancel.load(Ordering::SeqCst) {
         return Err(Error::rejected("canceled; nothing was installed"));
     }
+    // FR-013: Step::Apply
     apply::apply(
         cx,
         &apply::PlanInputs {
@@ -544,6 +594,9 @@ fn recover_locked(
     let startup = scan_wheels(&j.reviewed, &left, interp)?.startup;
     let mut findings = adv.findings.clone();
     findings.extend(startup.iter().cloned());
+    // FR-019: the remaining wheels are matched again before the fresh approval.
+    let matcher = crate::scan::yara::Matcher::load(ctx.paths, &ctx.settings.rules)?;
+    findings.extend(match_wheels(matcher.as_ref(), &j.reviewed, &left));
     let digest = plan::recover_digest(interp, &left)?;
     let details: Vec<String> = std::iter::once(format!(
         "interpreter {} ({}, {}); finishing an unfinished plan: {} of {} wheel(s) already installed",

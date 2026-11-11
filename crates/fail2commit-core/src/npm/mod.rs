@@ -197,7 +197,12 @@ pub fn execute(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
 
 fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     let paths = deps.paths;
+    // FR-019: a user rule file that does not compile stops here, before npm
+    // or any package code runs.
+    let matcher = crate::scan::yara::Matcher::load(paths, &deps.settings.rules)?;
     let recovered = commit::recover(paths, &req.project)?;
+    // FR-018: refresh stale threat data first when the user asked for it.
+    let refreshed = crate::scan::malware_list::auto_refresh(paths, deps.settings);
     let tc = runner::Toolchain::resolve(paths)?;
     let registry = config::trusted_registry(paths)?;
     let (proj_cfg, npmrc) = config::project_settings(&req.project)?;
@@ -283,6 +288,51 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     // Hashed before the review reads anything: a later difference is a change.
     let snap = tree::snapshot(&proj_stage)?;
     let found = tree::review(deps, &proj_stage, &plan, &mut reviewed)?;
+    let installed: Vec<&review::ReviewedPkg> = reviewed
+        .pkgs
+        .iter()
+        .filter(|p| p.file.is_some() && found.contains(&p.plan.path))
+        .collect();
+    // FR-013: Step::ScanCode — YARA rules over every installed file (FR-019).
+    let mut extra = refreshed;
+    if let Some(m) = &matcher {
+        let mut budget = crate::scan::yara::Budget::default();
+        for rp in &installed {
+            let install: std::collections::BTreeSet<String> =
+                rp.inputs.iter().map(|(p, _)| p.clone()).collect();
+            extra.extend(crate::scan::yara::scan_package(
+                m,
+                &review::package_id(&rp.plan),
+                &proj_stage.join(&rp.plan.path),
+                &install,
+                &mut budget,
+            ));
+        }
+    }
+    // FR-013: Step::PreInstallChecks — registry and reviewed files (FR-025).
+    let mut cands: Vec<crate::scan::checks::Candidate> = Vec::new();
+    for rp in &installed {
+        let pkg = review::package_id(&rp.plan);
+        if !cands.iter().any(|c| c.pkg == pkg) {
+            cands.push(crate::scan::checks::Candidate {
+                artifact: proj_stage.join(&rp.plan.path),
+                install_script: !rp.scripts.is_empty(),
+                pkg,
+            });
+        }
+    }
+    extra.extend(crate::scan::checks::run(
+        paths,
+        deps.settings,
+        &crate::scan::checks::Origin {
+            url: &registry.url,
+            file_hosts: &[],
+            artifact_max_bytes: deps.settings.limits.artifact_max_bytes,
+        },
+        &cands,
+    ));
+    reviewed.findings.extend(extra);
+    // FR-013: Step::Advisories
     let ids: Vec<PackageId> = {
         let mut v: Vec<_> = plan.pkgs.iter().map(review::package_id).collect();
         v.sort();
@@ -476,11 +526,14 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     commit::begin(paths, &req.project, &apply_dir)?;
     std::fs::create_dir(&apply_dir)
         .inspect_err(|_| commit::abandon(paths, &req.project, &apply_dir))?;
-    let built = (|| -> Result<(Vec<String>, Vec<String>, Vec<Finding>)> {
+    // (scripts run, build output, sandbox activity, output-scan findings)
+    type Built = (Vec<String>, Vec<String>, Vec<Finding>, Vec<Finding>);
+    let built = (|| -> Result<Built> {
         std::fs::write(apply_dir.join("package.json"), &final_pj)?;
         std::fs::write(apply_dir.join("package-lock.json"), &final_lock)?;
         tree::recheck(&proj_stage, &reviewed)?;
         tree::verify_unchanged(&proj_stage, &snap)?;
+        // FR-013: Step::Scripts
         let (ran, activity) =
             apply::run_scripts(deps, &tc, sd, &proj_stage, &reviewed, &found, mode, &|| {
                 tree::recheck(&proj_stage, &reviewed)
@@ -491,13 +544,24 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
             tree::verify_after_scripts(&proj_stage, &plan, &found, &snap, &reviewed)?
         };
         let _ = std::fs::remove_dir_all(proj_stage.join(".f2c-tmp"));
+        // FR-013: Step::ScanOutput — FR-028, before anything reaches the project.
+        let produced = review_output(
+            deps,
+            &plan_digest,
+            &summary,
+            &proj_stage,
+            &reviewed,
+            &output,
+            matcher.as_ref(),
+        )?;
+        // FR-013: Step::Apply
         apply::move_tree(
             &proj_stage.join("node_modules"),
             &apply_dir.join("node_modules"),
         )?;
-        Ok((ran, output, activity))
+        Ok((ran, output, activity, produced))
     })();
-    let (ran, build_output, activity) = match built {
+    let (ran, build_output, activity, produced) = match built {
         Ok(r) => r,
         Err(e) => {
             commit::abandon(paths, &req.project, &apply_dir);
@@ -527,6 +591,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     }
     // FR-026: what the sandboxed scripts tried, shown with the result.
     findings.extend(activity);
+    findings.extend(produced);
     Ok(NpmOutcome {
         message,
         findings,
@@ -540,6 +605,87 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
             "recovered": recovered,
         }),
     })
+}
+
+/// FR-028: scan what the lifecycle scripts produced. A `deny` stops the
+/// install; `approve` findings need a second approval bound to the plan and
+/// the exact produced bytes. Either way nothing has reached the project yet.
+fn review_output(
+    deps: &Deps<'_>,
+    plan_digest: &Digest,
+    summary: &str,
+    stage: &Path,
+    reviewed: &review::Reviewed,
+    output: &[String],
+    matcher: Option<&crate::scan::yara::Matcher>,
+) -> Result<Vec<Finding>> {
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    let owner = |rel: &str| {
+        reviewed
+            .pkgs
+            .iter()
+            .filter(|p| rel.starts_with(&format!("{}/", p.plan.path)))
+            .max_by_key(|p| p.plan.path.len())
+            .map(|p| review::package_id(&p.plan))
+    };
+    let files: Vec<(PackageId, String)> = output
+        .iter()
+        .filter_map(|rel| Some((owner(rel)?, rel.clone())))
+        .collect();
+    let state = crate::scan::malware_list::load(deps.paths);
+    let index = match &state {
+        crate::scan::malware_list::State::Valid(i) => Some(i),
+        _ => None,
+    };
+    let findings = crate::scan::output::scan_tree(matcher, index, stage, &files);
+    if findings.iter().any(|f| f.action == FindingAction::Deny) {
+        return Err(Error::rejected(
+            "install blocked by policy: an install script produced a file that is denied; nothing was changed",
+        )
+        .with_findings(findings));
+    }
+    if !findings.iter().any(|f| f.action == FindingAction::Approve) {
+        return Ok(findings);
+    }
+    let produced: Vec<(String, String)> = output
+        .iter()
+        .map(|rel| {
+            let sha = std::fs::read(stage.join(rel))
+                .map(|b| sha_hex(&b))
+                .unwrap_or_default();
+            (rel.clone(), sha)
+        })
+        .collect();
+    let digest = Digest::of("npm.output", &(plan_digest.as_hex(), &produced))?;
+    let details: Vec<String> = findings
+        .iter()
+        .map(|f| {
+            format!(
+                "{:?}: {} {}",
+                f.kind,
+                f.location.as_deref().unwrap_or(""),
+                crate::redact::redact_url_credentials(&f.evidence)
+            )
+        })
+        .collect();
+    let request = new_request(
+        ApprovalKind::Operation,
+        &digest,
+        format!(
+            "{summary}; files produced by install scripts need review before they are installed"
+        ),
+        details,
+        findings.clone(),
+        deps.settings.approval.request_ttl_secs,
+        false,
+        vec![Decision::ApproveOnce],
+    )?;
+    match (deps.approve)(&request)? {
+        Decision::ApproveOnce => Ok(findings),
+        _ => Err(Error::rejected("install cancelled; nothing was changed").with_findings(findings)),
+    }
 }
 
 /// Project directory used by the CLI: nearest ancestor with a package.json.

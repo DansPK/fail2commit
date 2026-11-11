@@ -54,7 +54,7 @@ impl Rule {
         }
     }
 
-    fn message(self) -> &'static str {
+    pub fn message(self) -> &'static str {
         match self {
             Rule::HiddenCode => "runs hidden code: it decodes an encoded string and executes it",
             Rule::CredentialHarvest => {
@@ -382,6 +382,13 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Whether the file at package-relative `rel` with content `bytes` is code
+/// these rules read (FR-028 output scan).
+pub(crate) fn is_candidate(rel: &str, bytes: &[u8]) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    candidate(name, &bytes[..bytes.len().min(2)])
 }
 
 /// Files worth reading: scripts a package can run, by extension or shebang.
