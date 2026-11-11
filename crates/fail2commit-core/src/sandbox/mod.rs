@@ -2,11 +2,15 @@
 //! `linux.rs`, this `mod.rs` and the export step: T-007a (Bubblewrap).
 //! `windows.rs`: T-007b (sandboxrs-windows AppContainer).
 //!
-//! Frozen API: [`platform_backend`], [`run_job`].
+//! Frozen API: [`platform_backend`], [`run_job`]. Coordinator-owned and frozen
+//! for 0.1.4: [`bait`] (FR-024) and [`netpolicy`] (FR-023).
 
 use crate::isolation::{JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+pub mod bait;
+pub mod netpolicy;
 
 #[cfg(target_os = "linux")]
 mod linux;
