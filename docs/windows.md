@@ -35,7 +35,13 @@ Still not covered: programs that call `npm.cmd`, `node ...\npm-cli.js` or a Pyth
 
 Apps & features (or `uninstall.exe`) does this, in order: asks a running tray to exit, runs `fail2commit uninstall-integrations` (restores exactly the recorded changes, including the previous value of the Run entry), removes the Run value if it points into this install, deletes the files listed above, and removes the shortcut and the uninstall key. Third-party hooks, an existing `core.hooksPath`, PATH entries and other Run values are not touched.
 
-Kept on purpose: `%LOCALAPPDATA%\fail2commit` and `%APPDATA%\fail2commit` (settings, password verifier, caches). Delete both folders to remove all fail2commit data.
+Your data in `%LOCALAPPDATA%\fail2commit` and `%APPDATA%\fail2commit` (settings, password verifier, approvals, caches, signing-key records, the offline malware list) is kept unless you ask: the uninstaller asks whether to delete it (default No), and a silent uninstall deletes it only with `/PURGE`:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\fail2commit\uninstall.exe" /S /PURGE
+```
+
+Empty folders that setup created (`Documents\PowerShell`, `Documents\WindowsPowerShell`) are removed. Two leftovers belong to Windows and NSIS, not fail2commit: the empty `%LOCALAPPDATA%\Programs` folder, and the uninstaller's temporary copy in `%TEMP%`, which Windows clears later.
 
 ## The tray
 

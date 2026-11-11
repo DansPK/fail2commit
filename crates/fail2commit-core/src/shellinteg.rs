@@ -160,6 +160,7 @@ impl Integration for ShellIntegration {
             if !existed && !create {
                 continue;
             }
+            let dir_existed = file.parent().is_none_or(Path::exists);
             if !ctx.dry_run {
                 let old = if existed {
                     String::from_utf8_lossy(&fs::read(&file)?).into_owned()
@@ -180,7 +181,7 @@ impl Integration for ShellIntegration {
                 integration: ID.into(),
                 kind: "shell-block".into(),
                 path: Some(file),
-                detail: json!({ "existed": existed }),
+                detail: json!({ "existed": existed, "dir_existed": dir_existed }),
             });
         }
         Ok(changes)
@@ -194,6 +195,13 @@ impl Integration for ShellIntegration {
             let existed = c.detail["existed"].as_bool().unwrap_or(true);
             if text.trim().is_empty() && !existed {
                 fs::remove_file(file)?;
+                // A folder setup created (Documents\PowerShell) goes too, if
+                // nothing else was put in it; records without the flag keep it.
+                if c.detail["dir_existed"] == false {
+                    if let Some(dir) = file.parent() {
+                        let _ = fs::remove_dir(dir);
+                    }
+                }
             } else {
                 crate::fsutil::atomic_write(file, text.as_bytes())?;
             }
@@ -247,6 +255,49 @@ mod tests {
         assert_eq!(
             strip_block(&again).trim_end(),
             "alias ll='ls -l'\nexport A=1"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_a_folder_setup_created_only_when_empty() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = SetupCtx {
+            paths: crate::paths::TrustedPaths::under(d.path()),
+            exe: "fail2commit".into(),
+            dry_run: false,
+        };
+        let change = |file: &Path, dir_existed: Option<bool>| {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, block(Flavor::PowerShell, &ctx.exe)).unwrap();
+            let mut detail = json!({ "existed": false });
+            if let Some(v) = dir_existed {
+                detail["dir_existed"] = v.into();
+            }
+            OwnedChange {
+                integration: ID.into(),
+                kind: "shell-block".into(),
+                path: Some(file.into()),
+                detail,
+            }
+        };
+        let created = d.path().join("PowerShell").join("profile.ps1");
+        let shared = d.path().join("Shared").join("profile.ps1");
+        let legacy = d.path().join("Legacy").join("profile.ps1");
+        let owned = [
+            change(&created, Some(false)),
+            change(&shared, Some(false)),
+            change(&legacy, None),
+        ];
+        fs::write(d.path().join("Shared").join("user.txt"), "keep").unwrap();
+        ShellIntegration.uninstall(&ctx, &owned).unwrap();
+        assert!(
+            !created.parent().unwrap().exists(),
+            "empty folder setup created is removed"
+        );
+        assert!(!shared.exists() && d.path().join("Shared").join("user.txt").exists());
+        assert!(
+            !legacy.exists() && legacy.parent().unwrap().exists(),
+            "old records keep the folder"
         );
     }
 
