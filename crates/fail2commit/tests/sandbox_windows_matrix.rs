@@ -88,6 +88,8 @@ fn spec(stage: &Stage, action: &str, args: &[OsString], limits: JobLimits) -> Jo
         exports: Vec::new(),
         export_to: None,
         limits,
+        network: fail2commit_core::isolation::NetworkMode::None,
+        bait: false,
     }
 }
 
@@ -169,6 +171,7 @@ impl SandboxBackend for RecordingLauncher {
             stderr: Vec::new(),
             truncated: false,
             exported: Vec::new(),
+            report: Default::default(),
         })
     }
 }

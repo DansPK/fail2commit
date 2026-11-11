@@ -502,6 +502,8 @@ pub fn run_scripts(
                 exports: vec![],
                 export_to: None,
                 limits: JobLimits::from_settings(&deps.settings.limits),
+                network: crate::isolation::NetworkMode::None,
+                bait: false,
             };
             let out = crate::sandbox::run_job(deps.backend, &job)?;
             let tail = runner::tail(&[out.stderr.as_slice(), out.stdout.as_slice()].concat());

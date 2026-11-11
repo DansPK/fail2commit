@@ -79,6 +79,8 @@ mod linux {
             exports: vec![],
             export_to: None,
             limits: limits(),
+            network: fail2commit_core::isolation::NetworkMode::None,
+            bait: false,
         };
         (work, spec)
     }

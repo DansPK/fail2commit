@@ -512,6 +512,7 @@ fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Re
         stderr,
         truncated: t1 || t2,
         exported: Vec::new(),
+        report: Default::default(),
     })
 }
 
@@ -700,6 +701,8 @@ fn self_test(tools: &Tools, diagnostic: &mut String) -> crate::Result<Vec<(Strin
             max_processes: Some(PROBE_NPROC),
             max_output_bytes: 64 * 1024,
         },
+        network: crate::isolation::NetworkMode::None,
+        bait: false,
     };
     let out = execute(tools, &job, &[("F2C_PROBE_CANARY", "host")])?;
     if out.status != JobStatus::Exited(0) {

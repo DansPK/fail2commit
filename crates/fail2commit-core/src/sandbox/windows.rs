@@ -257,6 +257,8 @@ fn probe_host_inner(controls: &mut [(String, bool)]) -> crate::Result<()> {
         exports: Vec::new(),
         export_to: None,
         limits: probe_limits(),
+        network: crate::isolation::NetworkMode::None,
+        bait: false,
     };
     let outcome = run_unprobed(&job)?;
     if outcome.status != JobStatus::TimedOut {
@@ -521,6 +523,7 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
         stderr,
         truncated,
         exported: Vec::new(),
+        report: Default::default(),
     })
 }
 
@@ -1423,6 +1426,8 @@ mod tests {
                 max_processes: Some(4),
                 max_output_bytes: 16 * 1024,
             },
+            network: crate::isolation::NetworkMode::None,
+            bait: false,
         }
     }
 

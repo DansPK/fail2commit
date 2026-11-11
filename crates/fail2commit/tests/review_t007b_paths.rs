@@ -111,6 +111,8 @@ fn native_work_job(
         exports: Vec::new(),
         export_to: None,
         limits: limits(),
+        network: fail2commit_core::isolation::NetworkMode::None,
+        bait: false,
     }
 }
 

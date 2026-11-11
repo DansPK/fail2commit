@@ -16,6 +16,103 @@ pub struct Settings {
     pub advisories: AdvisorySettings,
     pub approval: ApprovalSettings,
     pub signatures: SignatureSettings,
+    /// 0.1.4 (FR-013).
+    pub ui: UiSettings,
+    /// 0.1.4 (FR-018).
+    pub threat_data: ThreatDataSettings,
+    /// 0.1.4 (FR-025).
+    pub checks: CheckSettings,
+    /// 0.1.4 (FR-019).
+    pub rules: RuleSettings,
+}
+
+/// FR-013.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiSettings {
+    /// Windows: open the progress window during guarded installs.
+    pub progress_window: bool,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        UiSettings {
+            progress_window: true,
+        }
+    }
+}
+
+/// FR-018.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThreatDataSettings {
+    /// `status` warns when the offline malware index is older than this.
+    pub max_age_days: u64,
+    /// Refresh an index older than `max_age_days` before a guarded install.
+    pub auto_update: bool,
+}
+
+impl Default for ThreatDataSettings {
+    fn default() -> Self {
+        ThreatDataSettings {
+            max_age_days: 7,
+            auto_update: false,
+        }
+    }
+}
+
+/// FR-025.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CheckSettings {
+    pub enabled: bool,
+    /// Versions published more recently than this get a finding.
+    pub min_age_hours: u64,
+}
+
+impl Default for CheckSettings {
+    fn default() -> Self {
+        CheckSettings {
+            enabled: true,
+            min_age_hours: 48,
+        }
+    }
+}
+
+/// FR-019.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuleSettings {
+    /// Match package files against the bundled and user YARA rules.
+    pub enabled: bool,
+}
+
+impl Default for RuleSettings {
+    fn default() -> Self {
+        RuleSettings { enabled: true }
+    }
+}
+
+/// FR-023 / CR-022: what sandboxed scripts may reach.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// Nothing (the 0.1.3 behaviour).
+    None,
+    /// Public internet addresses only.
+    #[default]
+    Internet,
+}
+
+/// FR-027 / FR-029: which sandbox backend runs jobs.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendChoice {
+    /// Hardened mode when installed, else the platform default.
+    #[default]
+    Auto,
+    /// Disposable virtual machine (FR-029).
+    Vm,
 }
 
 /// CR-018 (P-108): npm registry signatures and Sigstore provenance.
@@ -42,6 +139,10 @@ impl Default for SignatureSettings {
 pub struct SandboxSettings {
     /// FR-008: defaults to on.
     pub enabled: bool,
+    /// FR-023.
+    pub network: NetworkMode,
+    /// FR-027 / FR-029.
+    pub backend: BackendChoice,
 }
 
 /// SPEC-012 bounds. Defaults are provisional until T-012 measurements.
@@ -84,7 +185,11 @@ pub struct ApprovalSettings {
 
 impl Default for SandboxSettings {
     fn default() -> Self {
-        SandboxSettings { enabled: true }
+        SandboxSettings {
+            enabled: true,
+            network: NetworkMode::Internet,
+            backend: BackendChoice::Auto,
+        }
     }
 }
 

@@ -600,6 +600,7 @@ impl SandboxBackend for FakeBackend {
             stderr: vec![],
             truncated: false,
             exported: vec![],
+            report: Default::default(),
         })
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! CHORE-001 contract layout. Coordinator-owned (frozen, change only via the
 //! coordinator): `protocol`, `digest`, `error`, `paths`, `fsutil`, `settings`,
-//! `policy`, `approver`, `isolation`, `integration`, `redact`, `toolpath`.
+//! `policy`, `approver`, `isolation`, `integration`, `redact`, `toolpath`,
+//! `progress`.
 //!
 //! Area modules are owned by their task worker, who must keep the public
 //! signatures marked "frozen" in each area `mod.rs`:
@@ -22,6 +23,7 @@ pub mod integration;
 pub mod isolation;
 pub mod paths;
 pub mod policy;
+pub mod progress;
 pub mod protocol;
 pub mod redact;
 pub mod settings;

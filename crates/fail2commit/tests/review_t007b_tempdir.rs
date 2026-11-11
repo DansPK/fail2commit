@@ -62,6 +62,8 @@ fn job_in(root: &Path) -> JobSpec {
             max_processes: Some(2),
             max_output_bytes: 4096,
         },
+        network: fail2commit_core::isolation::NetworkMode::None,
+        bait: false,
     }
 }
 

@@ -328,6 +328,8 @@ mod tests {
                 max_processes: None,
                 max_output_bytes: 1024,
             },
+            network: crate::isolation::NetworkMode::None,
+            bait: false,
         }
     }
 
@@ -490,6 +492,7 @@ mod tests {
                 stderr: vec![],
                 truncated: false,
                 exported: vec![],
+                report: Default::default(),
             })
         }
     }

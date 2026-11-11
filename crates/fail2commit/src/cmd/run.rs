@@ -88,6 +88,8 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         exports: args.exports.clone(),
         export_to: to.clone(),
         limits: JobLimits::from_settings(limits),
+        network: fail2commit_core::isolation::NetworkMode::None,
+        bait: false,
     };
     let outcome = sandbox::run_job(backend.as_ref(), &job)?;
 

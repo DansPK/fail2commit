@@ -107,6 +107,15 @@ pub enum FindingKind {
     UnsupportedInput,
     /// Package code would run on the host without a sandbox (FR-008 Off).
     HostExecution,
+    /// A package or script-produced file matched a YARA rule (FR-019, FR-028);
+    /// needs approval.
+    YaraMatch,
+    /// A sandboxed script opened a bait credential or sent a bait value
+    /// (FR-024); a denial.
+    BaitTouched,
+    /// A pre-install risk check hit (FR-025): new install script, maintainer
+    /// change, very new version, look-alike name, newly obfuscated code.
+    RiskSignal,
 }
 
 /// What a finding requires. `Deny` can never be approved away.
