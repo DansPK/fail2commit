@@ -78,6 +78,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         &stage.0.join("toolchain"),
         limits.artifact_max_bytes,
     )?;
+    fs::create_dir_all(work.join(HOME_DIR))?;
     let job = JobSpec {
         env: job_env(&work, read_only.first()),
         program: program.clone(),
@@ -342,7 +343,8 @@ fn job_env(work: &Path, tools: Option<&PathBuf>) -> Vec<(OsString, OsString)> {
     path.push("/usr/local/bin:/usr/bin:/bin");
     vec![
         ("PATH".into(), path),
-        ("HOME".into(), work.into()),
+        // FR-024: bait goes into the job home, never beside the project files.
+        ("HOME".into(), work.join(HOME_DIR).into()),
         ("TMPDIR".into(), "/tmp".into()),
         ("LANG".into(), "C.UTF-8".into()),
     ]
@@ -362,11 +364,15 @@ fn job_env(work: &Path, tools: Option<&PathBuf>) -> Vec<(OsString, OsString)> {
     vec![
         ("SystemRoot".into(), root),
         ("PATH".into(), path),
-        ("USERPROFILE".into(), work.into()),
+        // FR-024: bait goes into the job home, never beside the project files.
+        ("USERPROFILE".into(), work.join(HOME_DIR).into()),
         ("TEMP".into(), work.into()),
         ("TMP".into(), work.into()),
     ]
 }
+
+/// The job's home inside the copied input (FR-024).
+const HOME_DIR: &str = ".f2c-home";
 
 /// Untrusted output for display: lossy UTF-8, control and bidi-override
 /// characters replaced (no terminal escapes), bounded length.
