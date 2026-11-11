@@ -15,6 +15,8 @@ if [ -f "$DEST/gcc-root.tar.gz" ]; then
   export F2C_TEST_GCC_ROOT="$DEST/gcc-root" F2C_REQUIRE_NATIVE_BUILD=1
 fi
 export F2C_BIN="$DEST/bin/fail2commit" F2C_REQUIRE_SANDBOX=1
+# FR-023: the Linux egress relay is looked up by path when the tests run outside cargo.
+export F2C_SANDBOX_RELAY="$DEST/bin/f2c-sandbox-relay"
 echo "host: $(uname -sr) uid=$(id -u) bwrap: $(bwrap --version 2>&1)"
 echo "tracers: $(command -v strace ltrace || echo none)"
 fail=0

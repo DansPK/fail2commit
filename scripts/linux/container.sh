@@ -44,8 +44,10 @@ cargo test --workspace --no-run --message-format=json |
       *) cp "$exe" "$B/bin/" ;;
     esac
   done
-cargo build -p fail2commit --bin fail2commit
+cargo build -p fail2commit --bin fail2commit --bin f2c-sandbox-relay
 cp "${CARGO_TARGET_DIR:-target}/debug/fail2commit" "$B/bin/"
+# FR-023: the Linux backend stages this next to the job (SPEC-013 §4).
+cp "${CARGO_TARGET_DIR:-target}/debug/f2c-sandbox-relay" "$B/bin/"
 if [ "$GCC" = 1 ]; then
   bash scripts/linux/stage-gcc.sh "$B/gcc-root.tar.gz"
 fi
