@@ -118,6 +118,8 @@ pub fn uninstall(ctx: &Ctx) -> CmdResult {
             store_state(ctx, &state)?;
             removed.push(i.id());
         }
+        // The shim folder setup made goes too, once every shim is out of it.
+        let _ = std::fs::remove_dir(&ctx.paths.bin_dir);
         Ok(removed)
     })?;
     let mut o = Outcome::msg(format!("removed {} integration(s)", removed.len()));

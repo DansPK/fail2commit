@@ -95,6 +95,23 @@ To uninstall, run `fail2commit uninstall-integrations`, then remove the binary
 you installed and the extracted source directory. Building on macOS, non-amd64
 Linux, musl, or non-GNU userlands is not a release-tested path.
 
+## Linux: your data, and removing without `uninstall-integrations`
+
+`uninstall-integrations` restores your shell startup files and Git config and
+removes the hook and shims. Your settings and data stay, for a later reinstall:
+the approval password, signing-key records, caches and the offline malware list
+(about 12 MB). To delete them too:
+
+```sh
+rm -rf ~/.local/state/fail2commit ~/.local/share/fail2commit ~/.cache/fail2commit ~/.config/fail2commit
+```
+
+If the package was removed first, `git push`, `npm` and `pip` keep working and
+say that fail2commit is gone (setups from 0.1.4 on). To clean up, reinstall the
+package, run `fail2commit uninstall-integrations`, then remove it again. Setups
+made by 0.1.3 or earlier fail every `git push` in that state until you do this
+or run `git config --global --unset core.hooksPath`.
+
 ## VS Code VSIX
 
 In VS Code, choose **Extensions: Install from VSIX...** and select

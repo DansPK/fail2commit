@@ -38,6 +38,8 @@ pub fn run(_ctx: &Ctx, args: Args) -> CmdResult {
             let left = data["left_in_place"].as_array().map_or(0, Vec::len);
             let mut o = Outcome::msg(if left == 0 {
                 "machine-wide shims removed".to_string()
+            } else if data["delete_at_restart"] == true {
+                format!("machine-wide shims removed from PATH; {left} file(s) in use will be deleted at the next restart")
             } else {
                 format!("machine-wide shims removed from PATH; {left} file(s) in use were left in place")
             });
