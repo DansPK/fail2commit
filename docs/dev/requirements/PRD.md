@@ -32,6 +32,7 @@
 ## PRD-005
 
 - **Links** BR-001, BR-002
-- **Story** As a developer on Linux or Windows, the guard covers every shell I use, and a hostile install script cannot get out of the sandbox.
+- **Story** As a developer on Linux or Windows, the guard covers every shell I use, and a hostile install script cannot get out of the sandbox and is caught when it tries.
 - **Priority** Must
-- **Status:** Draft
+- **Out of scope** Kernel drivers (crash risk, owner decision).
+- **Status:** Approved (owner, 2026-11-11)
