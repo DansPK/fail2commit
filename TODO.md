@@ -22,6 +22,16 @@ Integration branch: `main` (one PR per change). Latest release `v0.1.3` (pre-rel
 | T-011 | Ship reproducible releases | FR-011, SPEC-011 | orca:codex + coordinator | done; Arch pacman package added (CR-016); GitHub release-candidate run passed on `2888aec`; Windows code signing pending (P-101) | T-003–T-010 |
 | T-012 | Keep resource use bounded | NFR-012, SPEC-012 | orca:claude-sonnet | done | T-004, T-005, T-007, T-009 |
 
+## 0.1.4 tasks (integration branch `DansPK/f2c-0.1.4`)
+
+| ID | Task | Req IDs | Owner | Status | Depends on |
+|---|---|---|---|---|---|
+| T-013 | Implement SPEC-018 (hardened sandbox mode) | FR-027 | - | handoff→developer | T-007 |
+| T-014 | Implement the FR-013 progress window and terminal line (SPEC-015 hooks are in place; `ui.progress_window` setting exists, no sink yet) | FR-013 | - | ready | - |
+| T-015 | Implement SPEC-019 (VM sandbox backend) | FR-029 | - | ready | T-013 |
+
+FR-029 (VM backend, Could) stays in 0.1.4 by owner decision (2026-11-13); it lands last, after T-013 and T-014.
+
 ## Production roadmap (proposed, not yet approved)
 
 The MVP stops install-time attacks for npm and pip when the install goes through the guard (verify report sections 5f and 5g). Production grade means three more things: the guard is hard to bypass by accident, it costs a developer little time and few prompts, and the OS trusts the releases. Each row below needs its requirement written with `/write-requirements` and approved before code starts. "Exit" is the check that closes the row.
