@@ -179,10 +179,73 @@ fn owned_service_config(
         && start_type == 2
 }
 
+fn recorded_sid_matches(recorded: Option<&str>, current: Option<&str>) -> crate::Result<bool> {
+    let recorded = recorded.ok_or_else(|| {
+        crate::Error::integrity("legacy hardened state cannot authorize account deletion")
+    })?;
+    let recorded = crate::ipc::winsec::sid_from_string(recorded)
+        .ok_or_else(|| crate::Error::integrity("recorded hardened account SID is invalid"))?;
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    let current = crate::ipc::winsec::sid_from_string(current)
+        .ok_or_else(|| crate::Error::integrity("current hardened account SID is invalid"))?;
+    Ok(recorded == current)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn system_uid_range(login_defs: &str) -> crate::Result<(u32, u32)> {
+    let mut min = None;
+    let mut max = None;
+    for line in login_defs.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("SYS_UID_MIN") => min = fields.next().and_then(|v| v.parse().ok()),
+            Some("SYS_UID_MAX") => max = fields.next().and_then(|v| v.parse().ok()),
+            _ => {}
+        }
+    }
+    match (min, max) {
+        (Some(min), Some(max)) if min <= max => Ok((min, max)),
+        _ => Err(crate::Error::integrity(
+            "/etc/login.defs has no valid SYS_UID_MIN/SYS_UID_MAX range",
+        )),
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn system_uid_candidate(passwd: &str, min: u32, max: u32) -> crate::Result<u32> {
+    if min > max {
+        return Err(crate::Error::integrity("invalid system UID range"));
+    }
+    let used: std::collections::HashSet<u32> = passwd
+        .lines()
+        .filter_map(|line| line.split(':').nth(2)?.parse().ok())
+        .collect();
+    (min..=max)
+        .find(|uid| !used.contains(uid))
+        .ok_or_else(|| crate::Error::isolation_unavailable("no free system UID is available"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn persist_uid_before_create(
+    state: &mut InstallState,
+    uid: u32,
+    persist: impl FnOnce(&InstallState) -> crate::Result<()>,
+    create: impl FnOnce(u32) -> crate::Result<()>,
+) -> crate::Result<()> {
+    state.sandbox_uid = Some(uid);
+    persist(state)?;
+    create(uid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_then_remove_state, owned_service_config, recorded_executable_matches, InstallState,
+        cleanup_then_remove_state, owned_service_config, persist_uid_before_create,
+        recorded_executable_matches, recorded_sid_matches, system_uid_candidate, system_uid_range,
+        InstallState,
     };
     use std::path::Path;
 
@@ -268,6 +331,71 @@ mod tests {
         assert!(marker.is_file());
         cleanup_then_remove_state(&marker, || Ok(())).unwrap();
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn recorded_account_sid_must_match_before_name_based_deletion() {
+        assert!(
+            recorded_sid_matches(Some("S-1-5-21-7-8-9-1001"), Some("S-1-5-21-7-8-9-1001")).unwrap()
+        );
+        assert!(
+            !recorded_sid_matches(Some("S-1-5-21-7-8-9-1001"), Some("S-1-5-21-7-8-9-1002"))
+                .unwrap()
+        );
+        assert!(!recorded_sid_matches(Some("S-1-5-21-7-8-9-1001"), None).unwrap());
+        assert!(recorded_sid_matches(None, Some("S-1-5-21-7-8-9-1002")).is_err());
+    }
+
+    #[test]
+    fn linux_uid_is_durable_before_account_creation_and_survives_failure() {
+        let td = tempfile::tempdir().unwrap();
+        let state_path = td.path().join("install.json");
+        let mut state = InstallState {
+            version: 1,
+            installer_uid: 1000,
+            installer_sid: None,
+            sandbox_sid: None,
+            sandbox_uid: None,
+            executable: "/usr/lib/fail2commit-hardened/fail2commit".into(),
+            account: "f2c-sandbox".into(),
+        };
+        let result = persist_uid_before_create(
+            &mut state,
+            998,
+            |state| {
+                std::fs::write(&state_path, serde_json::to_vec(state).unwrap())?;
+                Ok(())
+            },
+            |uid| {
+                let durable: InstallState =
+                    serde_json::from_slice(&std::fs::read(&state_path)?).unwrap();
+                assert_eq!(durable.sandbox_uid, Some(uid));
+                Err(crate::Error::internal("injected id failure after useradd"))
+            },
+        );
+        assert!(result.is_err());
+        let durable: InstallState =
+            serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
+        assert_eq!(durable.sandbox_uid, Some(998));
+    }
+
+    #[test]
+    fn linux_system_uid_allocation_uses_only_free_configured_system_range() {
+        assert_eq!(
+            system_uid_range("# SYS_UID_MIN 1\nSYS_UID_MIN 100\nSYS_UID_MAX 999\n").unwrap(),
+            (100, 999)
+        );
+        assert_eq!(
+            system_uid_candidate(
+                "root:x:0:0::/:/bin/sh\nuser:x:1000:1000::/:/bin/sh",
+                100,
+                101
+            )
+            .unwrap(),
+            100
+        );
+        assert!(system_uid_candidate("a:x:100:1::/:/bin/sh", 100, 100).is_err());
+        assert!(system_uid_range("SYS_UID_MIN 500\nSYS_UID_MAX 100\n").is_err());
     }
 }
 
@@ -360,7 +488,13 @@ mod linux {
             executable: installed_exe.to_string_lossy().into_owned(),
             account: SANDBOX_USER.into(),
         };
-        write_state(&state)?;
+        let uid_range = system_uid_range(&std::fs::read_to_string("/etc/login.defs")?)?;
+        let passwd = run("getent", &["passwd"])?;
+        let planned_uid = system_uid_candidate(
+            &String::from_utf8_lossy(&passwd.stdout),
+            uid_range.0,
+            uid_range.1,
+        )?;
         let result = (|| {
             std::fs::create_dir_all(bin_dir)?;
             let tmp = bin_dir.join("fail2commit.new");
@@ -373,22 +507,34 @@ mod linux {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
             file.sync_all()?;
             std::fs::rename(&tmp, &installed_exe)?;
-            run(
-                "useradd",
-                &[
-                    "--system",
-                    "--no-create-home",
-                    "--shell",
-                    "/usr/sbin/nologin",
-                    SANDBOX_USER,
-                ],
+            persist_uid_before_create(
+                &mut state,
+                planned_uid,
+                |state| write_state_at(Path::new(LINUX_STATE), state),
+                |uid| {
+                    let uid = uid.to_string();
+                    run(
+                        "useradd",
+                        &[
+                            "--system",
+                            "--uid",
+                            &uid,
+                            "--no-create-home",
+                            "--shell",
+                            "/usr/sbin/nologin",
+                            SANDBOX_USER,
+                        ],
+                    )?;
+                    let actual = run("id", &["-u", SANDBOX_USER])?;
+                    if String::from_utf8_lossy(&actual.stdout).trim() != uid {
+                        return Err(crate::Error::integrity(
+                            "created sandbox account uid differs from the durably recorded uid",
+                        ));
+                    }
+                    Ok(())
+                },
             )?;
-            let uid = run("id", &["-u", SANDBOX_USER])?;
-            let account_uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
-            state.sandbox_uid = Some(account_uid.parse().map_err(|_| {
-                crate::Error::integrity("created sandbox account returned an invalid uid")
-            })?);
-            write_state(&state)?;
+            let account_uid = planned_uid.to_string();
             std::fs::create_dir_all(LINUX_DATA_DIR)?;
             run("chown", &[&account_uid, LINUX_DATA_DIR])?;
             std::fs::set_permissions(LINUX_DATA_DIR, std::fs::Permissions::from_mode(0o700))?;
@@ -426,10 +572,9 @@ mod linux {
         Ok(status())
     }
 
-    fn write_state(state: &InstallState) -> crate::Result<()> {
+    fn write_state_at(path: &Path, state: &InstallState) -> crate::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let path = Path::new(LINUX_STATE);
         let tmp = path.with_extension("json.new");
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -754,7 +899,7 @@ mod windows {
     fn w(s: &std::ffi::OsStr) -> Vec<u16> {
         s.encode_wide().chain([0]).collect()
     }
-    fn account_sid() -> crate::Result<(Vec<u64>, String)> {
+    fn lookup_account_sid() -> crate::Result<Option<(Vec<u64>, String)>> {
         let account = w(std::ffi::OsStr::new("f2c-sandbox"));
         let mut sid_len = 0u32;
         let mut domain_len = 0u32;
@@ -770,6 +915,10 @@ mod windows {
                 &mut domain_len,
                 &mut use_type,
             );
+        }
+        let lookup_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        if sid_len == 0 && lookup_error == 1332 {
+            return Ok(None);
         }
         if sid_len == 0 || sid_len > 4096 || domain_len > 32768 {
             return Err(crate::Error::integrity(
@@ -797,7 +946,12 @@ mod windows {
         }
         let bytes =
             unsafe { std::slice::from_raw_parts(sid.as_ptr().cast::<u8>(), sid_len as usize) };
-        Ok((sid, crate::ipc::winsec::sid_string(bytes)))
+        Ok(Some((sid, crate::ipc::winsec::sid_string(bytes))))
+    }
+
+    fn account_sid() -> crate::Result<(Vec<u64>, String)> {
+        lookup_account_sid()?
+            .ok_or_else(|| crate::Error::integrity("hardened sandbox account does not exist"))
     }
 
     fn sid_words(text: &str) -> crate::Result<Vec<u64>> {
@@ -1125,6 +1279,12 @@ mod windows {
             // not authority to touch SCM or the local account.
             return Ok(serde_json::json!({"installed":false,"removed":true}));
         };
+        let recorded_sid = state.sandbox_sid.as_deref().ok_or_else(|| {
+            crate::Error::integrity(
+                "legacy hardened state cannot authorize deletion of the sandbox account",
+            )
+        })?;
+        let mut sandbox_sid = sid_words(recorded_sid)?;
         let expected = std::env::var_os("ProgramFiles")
             .map(std::path::PathBuf::from)
             .ok_or_else(|| crate::Error::isolation_unavailable("ProgramFiles is unavailable"))?
@@ -1232,17 +1392,20 @@ mod windows {
                 CloseServiceHandle(manager);
             }
         }
-        let mut sandbox_sid = match state.sandbox_sid.as_deref() {
-            Some(sid) => sid_words(sid)?,
-            None => account_sid()?.0,
-        };
         set_interactive_logon_denied(false, &mut sandbox_sid)?;
-        let user = w(std::ffi::OsStr::new("f2c-sandbox"));
-        let rc = unsafe { NetUserDel(std::ptr::null(), user.as_ptr()) };
-        if rc != 0 && rc != 2221 {
-            return Err(crate::Error::internal(format!(
-                "NetUserDel failed with code {rc}"
-            )));
+        let current_sid = lookup_account_sid()?.map(|(_, sid)| sid);
+        if recorded_sid_matches(Some(recorded_sid), current_sid.as_deref())? {
+            let user = w(std::ffi::OsStr::new("f2c-sandbox"));
+            let rc = unsafe { NetUserDel(std::ptr::null(), user.as_ptr()) };
+            if rc != 0 && rc != 2221 {
+                return Err(crate::Error::internal(format!(
+                    "NetUserDel failed with code {rc}"
+                )));
+            }
+        } else if current_sid.is_some() {
+            return Err(crate::Error::integrity(
+                "current f2c-sandbox account SID differs from the protected installation SID; refusing account deletion",
+            ));
         }
         std::fs::remove_dir_all(expected.parent().unwrap())?;
         let p = crate::sandbox::hardened::machine_state_path()?;
