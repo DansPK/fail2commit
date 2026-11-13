@@ -7,11 +7,13 @@
 //! head, a host name or a plain-HTTP body stop the job (FR-024). The value itself is never logged.
 
 use crate::isolation::ActivityKind;
-use crate::isolation::ActivityReport;
 use crate::sandbox::bait::BaitSet;
-use crate::sandbox::netpolicy;
+pub(crate) use crate::sandbox::egress::Watch;
+use crate::sandbox::egress::{
+    all_public, content_length, find_head_end, has_bait, resolve, Request,
+};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,35 +33,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE: Duration = Duration::from_secs(60);
 /// Concurrent connections; a package cannot exhaust the parent.
 const MAX_CONNECTIONS: usize = 64;
-
-/// Report plus the "stop this job" flag, shared by the proxy, the bait watcher and the meters.
-#[derive(Default)]
-pub struct Watch {
-    report: Mutex<ActivityReport>,
-    tripped: AtomicBool,
-}
-
-impl Watch {
-    pub fn record(&self, kind: ActivityKind, detail: impl Into<String>) {
-        if let Ok(mut r) = self.report.lock() {
-            r.push(kind, detail);
-        }
-    }
-
-    /// Record and stop the job (a bait touch or a hard limit).
-    pub fn trip(&self, kind: ActivityKind, detail: impl Into<String>) {
-        self.record(kind, detail);
-        self.tripped.store(true, Ordering::SeqCst);
-    }
-
-    pub fn tripped(&self) -> bool {
-        self.tripped.load(Ordering::SeqCst)
-    }
-
-    pub fn take_report(&self) -> ActivityReport {
-        self.report.lock().map(|r| r.clone()).unwrap_or_default()
-    }
-}
 
 /// A running proxy. Dropping it stops accepting and removes the socket.
 pub struct Egress {
@@ -129,76 +102,6 @@ fn accept_loop(
         }
     }
 }
-/// One parsed proxy request.
-struct Request {
-    method: String,
-    host: String,
-    port: u16,
-}
-
-impl Request {
-    /// `CONNECT host:port HTTP/1.1`, or an absolute-URI request (`GET http://host/path`).
-    /// Origin-form requests cannot be attributed to a destination and are refused.
-    fn parse(head: &[u8]) -> Option<Request> {
-        let text = String::from_utf8_lossy(head);
-        let line = text.lines().next()?;
-        let mut parts = line.split(' ');
-        let method = parts.next()?.to_string();
-        let target = parts.next()?;
-        let (host, port) = if method.eq_ignore_ascii_case("CONNECT") {
-            split_authority(target, 443)?
-        } else {
-            let rest = target
-                .strip_prefix("http://")
-                .or_else(|| target.strip_prefix("HTTP://"))?;
-            let authority = rest.split(['/', '?', '#']).next()?;
-            split_authority(authority, 80)?
-        };
-        if host.is_empty() || method.is_empty() {
-            return None;
-        }
-        Some(Request { method, host, port })
-    }
-
-    /// `host:port`, with brackets for an IPv6 literal so the detail is unambiguous.
-    fn authority(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-}
-
-/// `host[:port]`, `[v6][:port]`; `default_port` when no port is given.
-fn split_authority(s: &str, default_port: u16) -> Option<(String, u16)> {
-    if let Some(rest) = s.strip_prefix('[') {
-        let (host, tail) = rest.split_once(']')?;
-        let port = match tail.strip_prefix(':') {
-            Some(p) => p.parse().ok()?,
-            None => default_port,
-        };
-        return Some((host.to_string(), port));
-    }
-    match s.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => Some((host.to_string(), port.parse().ok()?)),
-        _ => Some((s.to_string(), default_port)),
-    }
-}
-
-/// Every resolved address must be public; an empty answer is a refusal.
-fn all_public(addrs: &[SocketAddr]) -> bool {
-    !addrs.is_empty() && addrs.iter().all(|a| netpolicy::is_public(a.ip()))
-}
-
-fn resolve(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
-    if let Ok(ip) = host.parse() {
-        return Some(vec![SocketAddr::new(ip, port)]);
-    }
-    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs().ok()?.collect();
-    (!addrs.is_empty()).then_some(addrs)
-}
-
 fn connect(targets: &[SocketAddr]) -> std::io::Result<Option<TcpStream>> {
     for a in targets {
         if let Ok(s) = TcpStream::connect_timeout(a, CONNECT_TIMEOUT) {
@@ -245,24 +148,6 @@ fn read_request(conn: &mut UnixStream) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     Ok((head, body))
 }
 
-fn find_head_end(head: &[u8]) -> Option<usize> {
-    head.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-}
-
-fn content_length(head: &[u8]) -> Option<usize> {
-    let text = String::from_utf8_lossy(head);
-    for line in text.lines() {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                return value.trim().parse().ok();
-            }
-        }
-    }
-    None
-}
-
 fn tunnel(a: UnixStream, mut b: TcpStream) -> std::io::Result<()> {
     let _ = a.set_read_timeout(Some(IDLE));
     let _ = a.set_write_timeout(Some(IDLE));
@@ -289,7 +174,7 @@ fn handle(mut conn: UnixStream, watch: &Watch, bait: Option<&BaitSet>) -> std::i
         return refuse(&mut conn, "400 Bad Request", "malformed proxy request");
     };
     let authority = req.authority();
-    if bait.is_some_and(|b| b.find_value(&head).is_some() || b.find_value(&body).is_some()) {
+    if has_bait(bait, &head, &body) {
         // The value is bait: never echo or log it, only the destination.
         watch.trip(ActivityKind::Bait, format!("egress: {authority}"));
         return refuse(
