@@ -189,7 +189,7 @@ Idempotent; third-party firewall rules are never touched.
 1. System user `f2c-sandbox`: `useradd --system --no-create-home --shell
    /usr/sbin/nologin`.
 2. Units: `fail2commit-hardened.socket` (`ListenStream=/run/fail2commit-hardened/sock`,
-   mode 0600, root) + `fail2commit-hardened.service` (socket-activated, root,
+   mode 0600, installer uid via `SocketUser`) + `fail2commit-hardened.service` (socket-activated, root,
    `ExecStart=<exe> sandbox serve`). The exe path is the packaged binary
    (packaging records it; a per-user cargo install is not a supported hardened
    host).
@@ -197,6 +197,12 @@ Idempotent; third-party firewall rules are never touched.
    Stage root `/var/lib/fail2commit-hardened/` (account-writable) is created but
    job stages stay in the user's cache (§2); the directory holds only service
    state.
+
+The runtime directory is root-owned mode 0755 and never writable by the
+installer or sandbox account. Unit files, executable and installation state
+remain root-owned and not user-writable. The installer uid must be neither
+root nor the sandbox account. Socket ownership permits the intended client
+to connect; it does not replace service peer authentication (CR-023).
 
 ### 4.2 Service: peer authentication
 
