@@ -160,6 +160,22 @@ fn backtracked_candidate_activity_does_not_count_as_final_plan_completion() {
         candidate_activity.iter().all(|(done, _)| *done == 0),
         "unresolved candidates must not count as completed plan items"
     );
+    let mut active_step = None;
+    for event in &events[..plan_step] {
+        match event {
+            ProgressEvent::Step(step, total) => active_step = Some((*step, *total)),
+            ProgressEvent::Advance(done, _) if active_step == Some((Step::DownloadVerify, 0)) => {
+                assert_eq!(
+                    *done, 0,
+                    "an unknown-total candidate phase cannot claim package completion"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(events[..plan_step].windows(2).any(|pair| {
+        matches!(pair, [ProgressEvent::Step(Step::Resolve, 1), ProgressEvent::Advance(1, current)] if current == "dependency plan resolved")
+    }));
     assert!(
         events[plan_step + 1..]
             .iter()

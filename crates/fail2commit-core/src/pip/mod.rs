@@ -273,6 +273,11 @@ fn install_inner(
     let report =
         std::fs::read(&report_path).map_err(|_| Error::internal("pip produced no report"))?;
     let staged = plan::from_report(&report, &proxy)?;
+    // Candidate downloads may have switched the visible phase to
+    // DownloadVerify while pip was resolving. Complete the resolver phase
+    // explicitly so its completion never appears as a package count in the
+    // unknown-total download phase.
+    seams.progress.step(Step::Resolve, 1);
     seams.progress.advance(1, "dependency plan resolved");
     if let Some(e) = proxy.shared.failure.lock().unwrap().clone() {
         return Err(e);
