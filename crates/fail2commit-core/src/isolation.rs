@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JobLimits {
     pub timeout: Duration,
     pub memory_bytes: Option<u64>,
@@ -64,7 +64,7 @@ pub use crate::settings::NetworkMode;
 
 /// FR-026: what the sandbox observed. Entries are untrusted, bounded
 /// ([`MAX_ACTIVITY`]) and must be redacted before display.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ActivityReport {
     pub events: Vec<Activity>,
     /// More events happened than were kept.
@@ -73,14 +73,14 @@ pub struct ActivityReport {
 
 pub const MAX_ACTIVITY: usize = 200;
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Activity {
     pub kind: ActivityKind,
     /// Path, destination (`host:port` or address), command line or limit name.
     pub detail: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityKind {
     /// Access outside the grants was refused.
@@ -129,7 +129,7 @@ pub struct ProbeReport {
     pub controls: Vec<(String, bool)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum JobStatus {
     Exited(i32),
     TimedOut,
@@ -137,7 +137,7 @@ pub enum JobStatus {
     Killed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JobOutcome {
     pub status: JobStatus,
     /// Untrusted bytes; display only after sanitizing.

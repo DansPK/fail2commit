@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 pub mod bait;
+pub mod hardened;
 pub mod netpolicy;
 pub mod report;
 
