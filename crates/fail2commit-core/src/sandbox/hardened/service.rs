@@ -335,21 +335,182 @@ fn serve_one(
 }
 
 #[cfg(windows)]
+static SERVICE_STOP_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn service_running() -> bool {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Status {
+        kind: u32,
+        state: u32,
+        accepted: u32,
+        win32: u32,
+        specific: u32,
+        checkpoint: u32,
+        hint: u32,
+    }
+    const NAME: &[u16] = &[
+        102, 97, 105, 108, 50, 99, 111, 109, 109, 105, 116, 45, 104, 97, 114, 100, 101, 110, 101,
+        100, 0,
+    ];
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> *mut c_void;
+        fn OpenServiceW(manager: *mut c_void, name: *const u16, access: u32) -> *mut c_void;
+        fn QueryServiceStatus(service: *mut c_void, status: *mut Status) -> i32;
+        fn CloseServiceHandle(service: *mut c_void) -> i32;
+    }
+    // SAFETY: all names are static NUL-terminated UTF-16 strings.
+    let manager = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), 1) };
+    if manager.is_null() {
+        return false;
+    }
+    let svc = unsafe { OpenServiceW(manager, NAME.as_ptr(), 4) };
+    if svc.is_null() {
+        unsafe { CloseServiceHandle(manager) };
+        return false;
+    }
+    let mut status = Status {
+        kind: 0,
+        state: 0,
+        accepted: 0,
+        win32: 0,
+        specific: 0,
+        checkpoint: 0,
+        hint: 0,
+    };
+    let ok = unsafe { QueryServiceStatus(svc, &mut status) } != 0 && status.state == 4;
+    unsafe {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(manager)
+    };
+    ok
+}
+
+#[cfg(windows)]
 #[allow(unsafe_code)]
 pub fn serve_windows() -> crate::Result<()> {
+    use std::ffi::c_void;
+    use std::sync::atomic::Ordering;
+    #[repr(C)]
+    struct Status {
+        kind: u32,
+        state: u32,
+        accepted: u32,
+        win32: u32,
+        specific: u32,
+        checkpoint: u32,
+        hint: u32,
+    }
+    #[repr(C)]
+    struct Entry {
+        name: *mut u16,
+        main: Option<unsafe extern "system" fn(u32, *mut *mut u16)>,
+    }
+    const SERVICE_NAME_W: &[u16] = &[
+        102, 97, 105, 108, 50, 99, 111, 109, 109, 105, 116, 45, 104, 97, 114, 100, 101, 110, 101,
+        100, 0,
+    ];
+    static mut STATUS_HANDLE: *mut c_void = std::ptr::null_mut();
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn StartServiceCtrlDispatcherW(table: *const Entry) -> i32;
+        fn RegisterServiceCtrlHandlerW(
+            name: *const u16,
+            handler: Option<unsafe extern "system" fn(u32)>,
+        ) -> *mut c_void;
+        fn SetServiceStatus(handle: *mut c_void, status: *const Status) -> i32;
+    }
+    unsafe extern "system" fn handler(control: u32) {
+        if control == 1 {
+            SERVICE_STOP_REQUESTED.store(true, Ordering::SeqCst);
+            let st = Status {
+                kind: 0x10,
+                state: 3,
+                accepted: 0,
+                win32: 0,
+                specific: 0,
+                checkpoint: 1,
+                hint: 5000,
+            };
+            // SAFETY: service status handle is set by service_main and st is a valid value.
+            unsafe { SetServiceStatus(STATUS_HANDLE, &st) };
+        }
+    }
+    unsafe extern "system" fn service_main(_: u32, _: *mut *mut u16) {
+        SERVICE_STOP_REQUESTED.store(false, Ordering::SeqCst);
+        // SAFETY: constant service name and callback have static lifetime.
+        unsafe {
+            STATUS_HANDLE = RegisterServiceCtrlHandlerW(SERVICE_NAME_W.as_ptr(), Some(handler));
+        }
+        if unsafe { STATUS_HANDLE.is_null() } {
+            return;
+        }
+        let mut st = Status {
+            kind: 0x10,
+            state: 2,
+            accepted: 0,
+            win32: 0,
+            specific: 0,
+            checkpoint: 1,
+            hint: 5000,
+        };
+        unsafe { SetServiceStatus(STATUS_HANDLE, &st) };
+        st.state = 4;
+        st.accepted = 1;
+        st.checkpoint = 0;
+        st.hint = 0;
+        unsafe { SetServiceStatus(STATUS_HANDLE, &st) };
+        let code = service_loop_windows();
+        st.state = 1;
+        st.accepted = 0;
+        st.win32 = if code.is_ok() { 0 } else { 1066 };
+        st.specific = 0;
+        st.checkpoint = 0;
+        st.hint = 0;
+        unsafe { SetServiceStatus(STATUS_HANDLE, &st) };
+    }
+    SERVICE_STOP_REQUESTED.store(false, Ordering::SeqCst);
+    let table = [
+        Entry {
+            name: SERVICE_NAME_W.as_ptr() as *mut u16,
+            main: Some(service_main),
+        },
+        Entry {
+            name: std::ptr::null_mut(),
+            main: None,
+        },
+    ];
+    // SAFETY: table and service name remain live for the dispatcher call.
+    if unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } == 0 {
+        return Err(crate::Error::rejected(format!(
+            "hardened service must be started by SCM: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn service_loop_windows() -> crate::Result<()> {
     use crate::ipc::winsec::{self, PipeSecurity};
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    use std::sync::atomic::Ordering;
     use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+        GetLastError, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, SetNamedPipeHandleState,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
 
     let state = super::lifecycle::installed_state()?;
@@ -363,13 +524,16 @@ pub fn serve_windows() -> crate::Result<()> {
     let wide: Vec<u16> = OsStr::new(&name).encode_wide().chain([0]).collect();
     let security = PipeSecurity::new(&expected)?;
     loop {
+        if SERVICE_STOP_REQUESTED.load(Ordering::SeqCst) {
+            break Ok(());
+        }
         // SAFETY: name is NUL-terminated and security attributes remain alive
         // until the handle is wrapped; pipe mode is local, synchronous byte IO.
         let raw = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | 0x00000001 | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 MAX_REQUEST as u32,
                 MAX_REQUEST as u32,
@@ -386,9 +550,27 @@ pub fn serve_windows() -> crate::Result<()> {
         // SAFETY: raw is a fresh named-pipe handle owned here.
         let handle = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
         // SAFETY: raw is a connected server pipe handle; NULL requests sync IO.
-        let connected = unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) } != 0
-            || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+        let mut connected = unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) } != 0;
+        while !connected && unsafe { GetLastError() } == ERROR_PIPE_LISTENING {
+            if SERVICE_STOP_REQUESTED.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            connected = unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) } != 0;
+        }
+        connected |= unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
         if !connected {
+            if SERVICE_STOP_REQUESTED.load(Ordering::SeqCst) {
+                break Ok(());
+            }
+            continue;
+        }
+        let mut mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+        // SAFETY: valid connected server pipe and writable mode value.
+        if unsafe {
+            SetNamedPipeHandleState(raw, &mut mode, std::ptr::null_mut(), std::ptr::null_mut())
+        } == 0
+        {
             continue;
         }
         let mut pid = 0u32;
