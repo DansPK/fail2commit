@@ -1,4 +1,4 @@
-﻿# FR-013 progress review fixes verification
+# FR-013 progress review fixes verification
 
 Code commit tested: `c30128bd43dd775dfacabbfc1f09fde711fd9bb0` (based on `6536c6b46a0945070337afd7f652696b19409b12`).
 
@@ -65,3 +65,7 @@ The backtracking integration regression now records the complete event stream. I
 - One overlapping cargo invocation initially failed to link because it attempted to overwrite the integration-test executable while the first test was still running (Windows linker reported `Permission denied`); after the first process completed, the focused regression was rerun sequentially and passed. No source change was needed for that transient collision.
 
 Windows native GUI and current-source Windows npm/pip runtime gates remain pending the interactive Win11 guest, as recorded above. No broad build or new VM runtime pass was attempted for this narrowly scoped source fix.
+
+## Manager integration verification
+
+Integrated source `f928a451758a8fac774ac80989bf000f1cabe5e9` after Sol r4 source acceptance. Manager tree `4a5bd93` passed `cargo fmt --all -- --check` (exit 0) and `cargo check --tests -p fail2commit -p fail2commit-core --locked` (exit 0, 1m 09s). These are host formatting/compile checks only; Windows native GUI and current-source Windows sandbox package gates remain pending.
