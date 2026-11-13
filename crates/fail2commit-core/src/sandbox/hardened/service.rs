@@ -108,13 +108,18 @@ fn decode_response(line: &[u8]) -> crate::Result<Response> {
 }
 
 #[cfg(any(target_os = "linux", windows, test))]
-fn response(ok: bool, detail: &'static str) -> Response {
+fn response(ok: bool, detail: impl Into<String>) -> Response {
     Response {
         ok,
         service_running: true,
         probe_available: false,
-        detail: detail.to_owned(),
+        detail: detail.into(),
     }
+}
+
+#[cfg(any(windows, test))]
+fn bounded_error_detail(message: &str) -> String {
+    message.chars().take(256).collect()
 }
 
 #[cfg(any(target_os = "linux", windows, test))]
@@ -863,10 +868,13 @@ fn service_loop_windows() -> crate::Result<()> {
                 &sandbox_sid,
             ) {
                 Ok(()) => response(true, "launcher completed; outcome was verified"),
-                Err(_) => response(
-                    false,
-                    "launcher failed or mandatory controls are unavailable; job was not accepted",
-                ),
+                Err(error) => {
+                    // Only the authenticated installer SID can read this pipe. Return a bounded
+                    // user-facing control error so failed platform checks can be diagnosed;
+                    // never log passwords, process output, or unbounded error text.
+                    let detail = bounded_error_detail(&error.message);
+                    response(false, format!("launcher rejected the job: {detail}"))
+                }
             },
             _ => response(false, "unknown or malformed operation"),
         };
@@ -1022,6 +1030,10 @@ fn ensure_snapshot_store(path: &Path) -> crate::Result<std::path::PathBuf> {
             "cannot secure hardened snapshot store",
         ));
     }
+    // On Windows, a LocalSystem-created directory can default to the
+    // Administrators group as owner. The service store has an explicit owner
+    // contract, so set and read back SYSTEM ownership below.
+    set_system_owner(path)?;
     let dir = open_windows_object(
         path,
         true,
@@ -1141,6 +1153,7 @@ fn set_snapshot_acl(path: &Path, sandbox_sid: &str, sandbox_access: &str) -> cra
             "failed to restrict hardened job snapshot ACL",
         ));
     }
+    set_system_owner(path)?;
     let directory = open_windows_object(
         path,
         true,
@@ -1174,6 +1187,23 @@ fn set_snapshot_acl(path: &Path, sandbox_sid: &str, sandbox_access: &str) -> cra
     if !has_system || !has_sandbox {
         return Err(crate::Error::integrity(
             "job snapshot ACL did not read back",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_system_owner(path: &Path) -> crate::Result<()> {
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| crate::Error::isolation_unavailable("SystemRoot is unavailable"))?;
+    let output = std::process::Command::new(root.join("System32\\icacls.exe"))
+        .arg(path)
+        .args(["/setowner", "*S-1-5-18"])
+        .output()?;
+    if !output.status.success() {
+        return Err(crate::Error::integrity(
+            "failed to assign hardened snapshot ownership to SYSTEM",
         ));
     }
     Ok(())
@@ -1315,7 +1345,12 @@ fn run_snapshot_as_sandbox(
     // SAFETY: CreatePipe returned two owned handles.
     let write_end = unsafe { OwnedHandle::from_raw_handle(write_raw as RawHandle) };
     // Only the read end is inherited by the launcher.
-    unsafe { SetHandleInformation(write_raw, HANDLE_FLAG_INHERIT, 0) };
+    if unsafe { SetHandleInformation(write_raw, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(crate::Error::isolation_unavailable(format!(
+            "cannot exclude watchdog writer from launcher inheritance (Win32 error {code})"
+        )));
+    }
     let handle_list = [read_raw];
     let mut needed = 0usize;
     // SAFETY: sizing call to obtain the required attribute-list buffer size.
@@ -1464,25 +1499,38 @@ fn run_snapshot_as_sandbox(
         let mut watchdog = Some(write_end);
         let mut disconnected_at = None;
         loop {
-            if unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 100) } == 0 {
+            let waited = unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 100) };
+            if waited == 0 {
                 break;
             }
-            let mut available = 0u32;
-            if unsafe {
-                windows_sys::Win32::System::Pipes::PeekNamedPipe(
-                    client_pipe,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut available,
-                    std::ptr::null_mut(),
-                )
-            } == 0
-            {
+            if waited != windows_sys::Win32::Foundation::WAIT_TIMEOUT {
+                let code = unsafe { GetLastError() };
                 watchdog.take();
-                disconnected_at.get_or_insert_with(std::time::Instant::now);
+                unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 0xE003) };
+                return Err(crate::Error::internal(format!(
+                    "WaitForSingleObject(launcher) failed with Win32 error {code}"
+                )));
             }
-            if disconnected_at.is_some_and(|at| at.elapsed() > std::time::Duration::from_secs(10)) {
+            match client_pipe_read(client_pipe) {
+                ClientPipeRead::Idle => {}
+                ClientPipeRead::Disconnected | ClientPipeRead::UnexpectedData => {
+                    // The request is one line only. Any later bytes are an invalid suffix,
+                    // and a disconnected client must not keep the launcher alive with bytes
+                    // left buffered in the pipe. Closing the watchdog writer asks the
+                    // launcher to terminate its Job Object; the explicit process termination
+                    // below is the bounded fallback if that path stalls.
+                    watchdog.take();
+                    disconnected_at.get_or_insert_with(std::time::Instant::now);
+                }
+                ClientPipeRead::Failed(code) => {
+                    watchdog.take();
+                    unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 0xE003) };
+                    return Err(crate::Error::isolation_unavailable(format!(
+                        "cannot track hardened client pipe (Win32 error {code})"
+                    )));
+                }
+            }
+            if disconnected_at.is_some_and(|at| at.elapsed() > std::time::Duration::from_secs(2)) {
                 unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 0xE002) };
             }
         }
@@ -1505,6 +1553,52 @@ fn run_snapshot_as_sandbox(
     drop(username);
     drop(password_w);
     launch_result
+}
+
+#[cfg(windows)]
+enum ClientPipeRead {
+    Idle,
+    Disconnected,
+    UnexpectedData,
+    Failed(u32),
+}
+
+/// Consume any post-request bytes and observe the broken-pipe error after EOF.
+/// `PeekNamedPipe` cannot do this: buffered suffix data can remain readable
+/// after the peer has closed and falsely look like a live client.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn client_pipe_read(pipe: windows_sys::Win32::Foundation::HANDLE) -> ClientPipeRead {
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+
+    let mut byte = 0u8;
+    let mut read = 0u32;
+    // The server pipe was placed in nonblocking byte mode before the first
+    // request read. One byte is enough to detect and reject every suffix.
+    if unsafe {
+        ReadFile(
+            pipe,
+            (&mut byte as *mut u8).cast(),
+            1,
+            &mut read,
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        return if read == 0 {
+            ClientPipeRead::Disconnected
+        } else {
+            ClientPipeRead::UnexpectedData
+        };
+    }
+    match unsafe { GetLastError() } {
+        ERROR_NO_DATA => ClientPipeRead::Idle,
+        ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED => ClientPipeRead::Disconnected,
+        code => ClientPipeRead::Failed(code),
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -1536,7 +1630,7 @@ fn launch_windows_request(
     peer_sid: &[u8],
     sandbox_sid: &str,
 ) -> crate::Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ};
 
@@ -1562,7 +1656,15 @@ fn launch_windows_request(
             "launcher outcome is unsafe or oversized",
         ));
     }
-    let bytes = std::fs::read(&outcome_path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    outcome
+        .take((super::protocol::MAX_OUTCOME_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > super::protocol::MAX_OUTCOME_BYTES {
+        return Err(crate::Error::integrity(
+            "launcher outcome exceeded the hardened outcome limit",
+        ));
+    }
     super::protocol::decode_outcome(&bytes)?;
     let output = dir.path.join("outcome.json");
     let mut file = std::fs::OpenOptions::new()
@@ -1676,6 +1778,12 @@ mod tests {
     }
 
     #[test]
+    fn launcher_error_details_are_bounded() {
+        assert_eq!(bounded_error_detail(&"x".repeat(300)).len(), 256);
+        assert_eq!(bounded_error_detail("safe failure"), "safe failure");
+    }
+
+    #[test]
     fn windows_command_arguments_are_quoted_without_shell_interpretation() {
         assert_eq!(
             quote_windows_arg(r"C:\Program Files\tool.exe"),
@@ -1698,6 +1806,116 @@ mod tests {
         assert!(windows_peer_allowed(b"installer", b"installer", false));
         assert!(!windows_peer_allowed(b"other", b"installer", false));
         assert!(!windows_peer_allowed(b"installer", b"installer", true));
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    fn test_pipe() -> (
+        std::os::windows::io::OwnedHandle,
+        std::os::windows::io::OwnedHandle,
+    ) {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+        use windows_sys::Win32::Foundation::{
+            GetLastError, ERROR_PIPE_CONNECTED, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        };
+        use windows_sys::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        };
+
+        static PIPE_SEQUENCE: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let name = format!(
+            r"\\.\pipe\f2c-watchdog-test-{}-{}",
+            std::process::id(),
+            PIPE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let name_w: Vec<u16> = OsStr::new(&name).encode_wide().chain([0]).collect();
+        let server_raw = unsafe {
+            CreateNamedPipeW(
+                name_w.as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+                1,
+                1024,
+                1024,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(server_raw, INVALID_HANDLE_VALUE);
+        let server = unsafe { OwnedHandle::from_raw_handle(server_raw as RawHandle) };
+        let connect_name = name_w.clone();
+        let client_thread = std::thread::spawn(move || unsafe {
+            CreateFileW(
+                connect_name.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            ) as usize
+        });
+        let connected = unsafe { ConnectNamedPipe(server_raw, std::ptr::null_mut()) };
+        assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
+        let client_raw = client_thread.join().unwrap() as windows_sys::Win32::Foundation::HANDLE;
+        assert_ne!(client_raw, INVALID_HANDLE_VALUE, "Win32 error {}", unsafe {
+            GetLastError()
+        });
+        let client = unsafe { OwnedHandle::from_raw_handle(client_raw as RawHandle) };
+        (server, client)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_pipe_read_observes_disconnect_without_suffix() {
+        use std::os::windows::io::AsRawHandle;
+
+        let (server, client) = test_pipe();
+        drop(client);
+        assert!(matches!(
+            client_pipe_read(server.as_raw_handle() as _),
+            ClientPipeRead::Disconnected
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn client_pipe_read_drains_suffix_then_observes_disconnect() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+
+        let (server, client) = test_pipe();
+        let mut written = 0u32;
+        let byte = b'x';
+        assert_ne!(
+            unsafe {
+                WriteFile(
+                    client.as_raw_handle() as _,
+                    (&byte as *const u8).cast(),
+                    1,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert_eq!(written, 1);
+        assert!(matches!(
+            client_pipe_read(server.as_raw_handle() as _),
+            ClientPipeRead::UnexpectedData
+        ));
+        drop(client);
+        assert!(matches!(
+            client_pipe_read(server.as_raw_handle() as _),
+            ClientPipeRead::Disconnected
+        ));
     }
 
     #[test]
