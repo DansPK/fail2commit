@@ -122,6 +122,42 @@ fn bounded_error_detail(message: &str) -> String {
     message.chars().take(256).collect()
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessWait {
+    Signaled,
+    TimedOut,
+    Failed(u32),
+}
+
+#[cfg(any(windows, test))]
+fn termination_confirmation(
+    terminate: impl FnOnce() -> std::result::Result<(), u32>,
+    wait: impl FnOnce(u32) -> ProcessWait,
+) -> std::result::Result<(), String> {
+    const TERMINATION_WAIT_MS: u32 = 5_000;
+    let terminate_error = terminate().err();
+    match wait(TERMINATION_WAIT_MS) {
+        ProcessWait::Signaled => Ok(()),
+        ProcessWait::TimedOut => Err(match terminate_error {
+            Some(code) => format!(
+                "TerminateProcess failed with Win32 error {code} and launcher did not exit within {TERMINATION_WAIT_MS} ms"
+            ),
+            None => format!(
+                "launcher did not exit within {TERMINATION_WAIT_MS} ms after TerminateProcess"
+            ),
+        }),
+        ProcessWait::Failed(code) => Err(match terminate_error {
+            Some(terminate_code) => format!(
+                "TerminateProcess failed with Win32 error {terminate_code}; termination wait failed with Win32 error {code}"
+            ),
+            None => format!(
+                "termination wait failed with Win32 error {code}; launcher exit is unconfirmed"
+            ),
+        }),
+    }
+}
+
 #[cfg(any(target_os = "linux", windows, test))]
 fn decode_request(line: &[u8]) -> crate::Result<Request> {
     if line.len() >= MAX_REQUEST || !line.ends_with(b"\n") {
@@ -482,6 +518,9 @@ fn serve_one(
 
 #[cfg(windows)]
 static SERVICE_STOP_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static LAUNCHER_CONTAINMENT_FAILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
@@ -861,6 +900,10 @@ fn service_loop_windows() -> crate::Result<()> {
             "LAUNCH" if request.job_dir.is_none() => {
                 response(false, "job_dir is required; job was not started")
             }
+            "LAUNCH" if LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst) => response(
+                false,
+                "a prior launcher termination was not confirmed; service is locked fail-closed",
+            ),
             "LAUNCH" => match launch_windows_request(
                 raw,
                 request.job_dir.as_deref().unwrap(),
@@ -1218,6 +1261,7 @@ fn run_snapshot_as_sandbox(
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::sync::atomic::Ordering;
     use windows_sys::Win32::Foundation::{
         GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
     };
@@ -1276,7 +1320,6 @@ fn run_snapshot_as_sandbox(
         fn DestroyEnvironmentBlock(environment: *mut c_void) -> i32;
     }
     use windows_sys::Win32::System::Pipes::CreatePipe;
-    use windows_sys::Win32::System::Threading::TerminateProcess;
 
     let state_path = super::machine_state_path()?;
     let data_dir = state_path
@@ -1446,6 +1489,8 @@ fn run_snapshot_as_sandbox(
             "LoadUserProfileW failed with Win32 error {code}"
         )));
     }
+    let mut retained_process = None;
+    let mut containment_confirmed = true;
     let launch_result = (|| {
         let mut environment = std::ptr::null_mut();
         // SAFETY: environment is a writable output pointer for the user token.
@@ -1493,7 +1538,10 @@ fn run_snapshot_as_sandbox(
             )));
         }
         drop(read_end);
-        let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as RawHandle) };
+        retained_process = Some(unsafe { OwnedHandle::from_raw_handle(pi.hProcess as RawHandle) });
+        let process = retained_process
+            .as_ref()
+            .expect("launcher process handle is present");
         let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as RawHandle) };
         drop(thread);
         let mut watchdog = Some(write_end);
@@ -1506,9 +1554,16 @@ fn run_snapshot_as_sandbox(
             if waited != windows_sys::Win32::Foundation::WAIT_TIMEOUT {
                 let code = unsafe { GetLastError() };
                 watchdog.take();
-                unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 0xE003) };
+                if let Err(termination) =
+                    terminate_launcher_and_confirm(process.as_raw_handle() as HANDLE, 0xE003)
+                {
+                    containment_confirmed = false;
+                    return Err(crate::Error::isolation_unavailable(format!(
+                        "WaitForSingleObject(launcher) failed with Win32 error {code}; containment is unconfirmed: {termination}"
+                    )));
+                }
                 return Err(crate::Error::internal(format!(
-                    "WaitForSingleObject(launcher) failed with Win32 error {code}"
+                    "WaitForSingleObject(launcher) failed with Win32 error {code}; launcher termination was confirmed"
                 )));
             }
             match client_pipe_read(client_pipe) {
@@ -1524,14 +1579,30 @@ fn run_snapshot_as_sandbox(
                 }
                 ClientPipeRead::Failed(code) => {
                     watchdog.take();
-                    unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 0xE003) };
+                    if let Err(termination) =
+                        terminate_launcher_and_confirm(process.as_raw_handle() as HANDLE, 0xE003)
+                    {
+                        containment_confirmed = false;
+                        return Err(crate::Error::isolation_unavailable(format!(
+                            "cannot track hardened client pipe (Win32 error {code}); containment is unconfirmed: {termination}"
+                        )));
+                    }
                     return Err(crate::Error::isolation_unavailable(format!(
-                        "cannot track hardened client pipe (Win32 error {code})"
+                        "cannot track hardened client pipe (Win32 error {code}); launcher termination was confirmed"
                     )));
                 }
             }
             if disconnected_at.is_some_and(|at| at.elapsed() > std::time::Duration::from_secs(2)) {
-                unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 0xE002) };
+                watchdog.take();
+                if let Err(termination) =
+                    terminate_launcher_and_confirm(process.as_raw_handle() as HANDLE, 0xE002)
+                {
+                    containment_confirmed = false;
+                    return Err(crate::Error::isolation_unavailable(format!(
+                        "launcher cancellation did not complete; containment is unconfirmed: {termination}"
+                    )));
+                }
+                break;
             }
         }
         let mut exit = 1u32;
@@ -1542,8 +1613,19 @@ fn run_snapshot_as_sandbox(
         }
         Ok(exit)
     })();
-    // SAFETY: profile handle belongs to the loaded user profile; no child is
-    // left running because the closure waits for launcher termination.
+    if !containment_confirmed {
+        // Keep the process and token handles, plus the loaded profile, until
+        // the service exits; do not unload a profile that a live process may
+        // still be using. The service's global flag refuses later LAUNCH jobs.
+        LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+        if let Some(process) = retained_process.take() {
+            std::mem::forget(process);
+        }
+        std::mem::forget(_token);
+        return launch_result;
+    }
+    // SAFETY: the launcher process was observed signaled or forced termination
+    // was confirmed before unloading the sandbox account profile.
     if unsafe { UnloadUserProfile(token_raw, profile.profile) } == 0 {
         let code = unsafe { GetLastError() };
         return Err(crate::Error::isolation_unavailable(format!(
@@ -1599,6 +1681,31 @@ fn client_pipe_read(pipe: windows_sys::Win32::Foundation::HANDLE) -> ClientPipeR
         ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED => ClientPipeRead::Disconnected,
         code => ClientPipeRead::Failed(code),
     }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn terminate_launcher_and_confirm(
+    process: windows_sys::Win32::Foundation::HANDLE,
+    exit_code: u32,
+) -> std::result::Result<(), String> {
+    use windows_sys::Win32::Foundation::{GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    termination_confirmation(
+        || {
+            if unsafe { TerminateProcess(process, exit_code) } == 0 {
+                Err(unsafe { GetLastError() })
+            } else {
+                Ok(())
+            }
+        },
+        |timeout_ms| match unsafe { WaitForSingleObject(process, timeout_ms) } {
+            WAIT_OBJECT_0 => ProcessWait::Signaled,
+            WAIT_TIMEOUT => ProcessWait::TimedOut,
+            _ => ProcessWait::Failed(unsafe { GetLastError() }),
+        },
+    )
 }
 
 #[cfg(any(windows, test))]
@@ -1784,6 +1891,38 @@ mod tests {
     }
 
     #[test]
+    fn termination_is_not_confirmed_by_api_success_without_signal() {
+        let result = termination_confirmation(
+            || Ok(()),
+            |timeout| {
+                assert_eq!(timeout, 5_000);
+                ProcessWait::TimedOut
+            },
+        );
+        assert!(result.unwrap_err().contains("did not exit"));
+    }
+
+    #[test]
+    fn already_signaled_process_is_safe_when_terminate_races_exit() {
+        let result = termination_confirmation(|| Err(5), |_| ProcessWait::Signaled);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn termination_wait_failure_remains_an_explicit_containment_error() {
+        let result = termination_confirmation(|| Ok(()), |_| ProcessWait::Failed(6));
+        assert!(result.unwrap_err().contains("launcher exit is unconfirmed"));
+    }
+
+    #[test]
+    fn terminate_api_failure_and_timeout_are_both_reported() {
+        let result = termination_confirmation(|| Err(5), |_| ProcessWait::TimedOut);
+        let error = result.unwrap_err();
+        assert!(error.contains("TerminateProcess failed with Win32 error 5"));
+        assert!(error.contains("did not exit within 5000 ms"));
+    }
+
+    #[test]
     fn windows_command_arguments_are_quoted_without_shell_interpretation() {
         assert_eq!(
             quote_windows_arg(r"C:\Program Files\tool.exe"),
@@ -1824,7 +1963,7 @@ mod tests {
             CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
         };
         use windows_sys::Win32::System::Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+            ConnectNamedPipe, CreateNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
         };
 
         static PIPE_SEQUENCE: std::sync::atomic::AtomicUsize =
@@ -1839,7 +1978,7 @@ mod tests {
             CreateNamedPipeW(
                 name_w.as_ptr(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
                 1,
                 1024,
                 1024,
@@ -1849,26 +1988,36 @@ mod tests {
         };
         assert_ne!(server_raw, INVALID_HANDLE_VALUE);
         let server = unsafe { OwnedHandle::from_raw_handle(server_raw as RawHandle) };
-        let connect_name = name_w.clone();
-        let client_thread = std::thread::spawn(move || unsafe {
+        let client_raw = unsafe {
             CreateFileW(
-                connect_name.as_ptr(),
+                name_w.as_ptr(),
                 GENERIC_WRITE,
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
                 0,
                 std::ptr::null_mut(),
-            ) as usize
-        });
+            )
+        };
         let connected = unsafe { ConnectNamedPipe(server_raw, std::ptr::null_mut()) };
         assert!(connected != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED);
-        let client_raw = client_thread.join().unwrap() as windows_sys::Win32::Foundation::HANDLE;
         assert_ne!(client_raw, INVALID_HANDLE_VALUE, "Win32 error {}", unsafe {
             GetLastError()
         });
         let client = unsafe { OwnedHandle::from_raw_handle(client_raw as RawHandle) };
         (server, client)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_pipe_read_reports_idle_connected_peer() {
+        use std::os::windows::io::AsRawHandle;
+
+        let (server, _client) = test_pipe();
+        assert!(matches!(
+            client_pipe_read(server.as_raw_handle() as _),
+            ClientPipeRead::Idle
+        ));
     }
 
     #[cfg(windows)]
@@ -1907,11 +2056,11 @@ mod tests {
             0
         );
         assert_eq!(written, 1);
+        drop(client);
         assert!(matches!(
             client_pipe_read(server.as_raw_handle() as _),
             ClientPipeRead::UnexpectedData
         ));
-        drop(client);
         assert!(matches!(
             client_pipe_read(server.as_raw_handle() as _),
             ClientPipeRead::Disconnected
