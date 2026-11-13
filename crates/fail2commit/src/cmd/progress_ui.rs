@@ -236,13 +236,145 @@ fn decode_handover(hex: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn spawn_result_window(payload: &str) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    std::process::Command::new(std::env::current_exe()?)
-        .arg(HANDOVER_ARG)
-        .arg(payload)
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .spawn()
-        .map(|_| ())
+    spawn_detached_process(&std::env::current_exe()?, &[HANDOVER_ARG, payload])
+}
+
+#[cfg(windows)]
+fn spawn_detached_process(executable: &std::path::Path, args: &[&str]) -> std::io::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
+        InitializeProcThreadAttributeList, UpdateProcThreadAttribute, CREATE_NO_WINDOW,
+        EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    };
+
+    if args.iter().any(|arg| {
+        arg.bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte == b'"')
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "detached process argument is not a safe token",
+        ));
+    }
+    let executable_text = executable.to_string_lossy();
+    let command_line = format!("\"{executable_text}\" {}", args.join(" "));
+    let mut application: Vec<u16> = executable.as_os_str().encode_wide().collect();
+    application.push(0);
+    let mut command_wide: Vec<u16> = OsStr::new(&command_line).encode_wide().collect();
+    command_wide.push(0);
+
+    let input = std::fs::OpenOptions::new().read(true).open("NUL")?;
+    let output = std::fs::OpenOptions::new().write(true).open("NUL")?;
+    let duplicate = |handle: HANDLE| -> std::io::Result<OwnedHandle> {
+        let mut duplicate: HANDLE = std::ptr::null_mut();
+        // SAFETY: source and destination are the current process; the source
+        // handles are live NUL devices and the out pointer is valid.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: DuplicateHandle returned a new owned kernel handle.
+        Ok(unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) })
+    };
+    let std_handles = [
+        duplicate(input.as_raw_handle() as HANDLE)?,
+        duplicate(output.as_raw_handle() as HANDLE)?,
+        duplicate(output.as_raw_handle() as HANDLE)?,
+    ];
+    let raw_handles: Vec<HANDLE> = std_handles
+        .iter()
+        .map(|handle| handle.as_raw_handle() as HANDLE)
+        .collect();
+
+    let mut size = 0usize;
+    // SAFETY: sizing call with a null list is documented to fail and set size.
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+    if size == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut storage = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+    let attribute_list = storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    // SAFETY: storage is sized and aligned for the opaque attribute list.
+    if unsafe { InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut size) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    struct AttributeListGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
+    impl Drop for AttributeListGuard {
+        fn drop(&mut self) {
+            // SAFETY: this pointer was successfully initialized above.
+            unsafe { DeleteProcThreadAttributeList(self.0) }
+        }
+    }
+    let _attribute_guard = AttributeListGuard(attribute_list);
+    // SAFETY: raw_handles remains alive through CreateProcessW.
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            raw_handles.as_ptr().cast(),
+            std::mem::size_of_val(&raw_handles),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: all-zero STARTUPINFOEXW / PROCESS_INFORMATION are valid.
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = raw_handles[0];
+    startup.StartupInfo.hStdOutput = raw_handles[1];
+    startup.StartupInfo.hStdError = raw_handles[2];
+    startup.lpAttributeList = attribute_list;
+    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: application and command_line are NUL-terminated, mutable command
+    // line storage is valid, and the attribute list whitelists exactly the
+    // three NUL stdio handles. No caller pipe or unrelated handle is inherited.
+    let created = unsafe {
+        CreateProcessW(
+            application.as_ptr(),
+            command_wide.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup.StartupInfo,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: CreateProcessW returned valid process/thread handles; this
+    // handover is fire-and-forget, so neither handle needs to stay open.
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -454,6 +586,8 @@ unsafe extern "system" fn progress_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::io::Read;
 
     #[test]
     fn result_handover_is_bounded_sanitized_and_round_trips() {
@@ -500,5 +634,92 @@ mod tests {
         })
         .unwrap();
         assert!(!called);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn result_helper_does_not_hold_captured_parent_pipes_open() {
+        const PARENT: &str = "F2C_PROGRESS_PIPE_TEST_PARENT";
+        const CHILD: &str = "F2C_PROGRESS_PIPE_TEST_CHILD";
+        const STOP: &str = "F2C_PROGRESS_PIPE_TEST_STOP";
+
+        if let Some(marker) = std::env::var_os(CHILD) {
+            let marker = std::path::PathBuf::from(marker);
+            let stop = std::path::PathBuf::from(std::env::var_os(STOP).unwrap());
+            std::fs::write(&marker, b"alive").unwrap();
+            while !stop.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = std::fs::remove_file(marker);
+            return;
+        }
+
+        if let Some(marker) = std::env::var_os(PARENT) {
+            let marker = std::path::PathBuf::from(marker);
+            let stop = marker.with_extension("stop");
+            std::env::set_var(CHILD, &marker);
+            std::env::set_var(STOP, &stop);
+            spawn_detached_process(
+                &std::env::current_exe().unwrap(),
+                &[
+                    "--exact",
+                    "cmd::progress_ui::tests::result_helper_does_not_hold_captured_parent_pipes_open",
+                    "--nocapture",
+                ],
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(marker.exists(), "detached helper did not start");
+            return;
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!(
+            "f2c-progress-pipe-{}-{nonce}.alive",
+            std::process::id()
+        ));
+        let stop = marker.with_extension("stop");
+        let mut parent = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cmd::progress_ui::tests::result_helper_does_not_hold_captured_parent_pipes_open",
+                "--nocapture",
+            ])
+            .env(PARENT, &marker)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdout = parent.stdout.take().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            let _ = sent.send(bytes);
+        });
+        assert!(parent.wait().unwrap().success());
+
+        let eof_received = received
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        let helper_alive_at_eof = marker.exists();
+        let eof_while_helper_alive = eof_received && helper_alive_at_eof;
+        let _ = std::fs::write(&stop, b"stop");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_file(stop);
+        assert!(
+            eof_while_helper_alive,
+            "stdout EOF before helper close: {eof_received}; helper alive at EOF: {helper_alive_at_eof}"
+        );
     }
 }

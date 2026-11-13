@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,7 +54,6 @@ pub struct Shared {
     pub failure: Mutex<Option<Error>>,
     pub requests: Mutex<usize>,
     progress: Mutex<Option<Arc<dyn Progress>>>,
-    completed_downloads: AtomicU64,
     download_step_started: AtomicBool,
 }
 
@@ -87,7 +86,6 @@ impl Proxy {
             failure: Mutex::new(None),
             requests: Mutex::new(0),
             progress: Mutex::new(None),
-            completed_downloads: AtomicU64::new(0),
             download_step_started: AtomicBool::new(false),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -180,8 +178,8 @@ impl Shared {
         ensure_download_step(progress.as_deref(), &self.download_step_started);
         if let Some(p) = &progress {
             p.advance(
-                self.completed_downloads.load(Ordering::SeqCst),
-                &format!("Downloading {} ({})", project, file.filename),
+                0,
+                &format!("Downloading candidate {} ({})", project, file.filename),
             );
         }
         let fail = |e: Error| {
@@ -235,11 +233,7 @@ impl Shared {
         if let Some(e) = self.files.lock().unwrap().get_mut(id) {
             e.verified = Some(v.clone());
         }
-        note_verified_download(
-            progress.as_deref(),
-            &self.completed_downloads,
-            &Ok(v.clone()),
-        );
+        note_verified_candidate(progress.as_deref(), &Ok(v.clone()));
         Ok(v)
     }
 
@@ -300,14 +294,15 @@ fn ensure_download_step(progress: Option<&dyn Progress>, started: &AtomicBool) {
     }
 }
 
-fn note_verified_download(
-    progress: Option<&dyn Progress>,
-    completed: &AtomicU64,
-    result: &crate::Result<Verified>,
-) {
+fn note_verified_candidate(progress: Option<&dyn Progress>, result: &crate::Result<Verified>) {
     if let (Some(p), Ok(v)) = (progress, result) {
-        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-        p.advance(done, &format!("{} ({})", v.project, v.filename));
+        p.advance(
+            0,
+            &format!(
+                "Verified candidate {} ({}) while resolving plan",
+                v.project, v.filename
+            ),
+        );
     }
 }
 
@@ -462,17 +457,15 @@ mod progress_tests {
     }
 
     #[test]
-    fn proxy_starts_unknown_download_phase_once_and_counts_only_verified_results() {
+    fn proxy_reports_candidate_activity_without_counting_unresolved_plan_items() {
         let p = Recorder::default();
         let started = AtomicBool::new(false);
         ensure_download_step(Some(&p), &started);
         ensure_download_step(Some(&p), &started);
         assert_eq!(&*p.steps.lock().unwrap(), &[(Step::DownloadVerify, 0)]);
 
-        let count = AtomicU64::new(0);
         let failed: crate::Result<Verified> = Err(Error::integrity("invalid hash"));
-        note_verified_download(Some(&p), &count, &failed);
-        assert_eq!(count.load(Ordering::SeqCst), 0);
+        note_verified_candidate(Some(&p), &failed);
         let verified = Verified {
             project: "pkg".into(),
             filename: "pkg-1.whl".into(),
@@ -481,11 +474,13 @@ mod progress_tests {
             upstream_url: "https://registry.invalid/pkg.whl".into(),
             path: PathBuf::from("pkg.whl"),
         };
-        note_verified_download(Some(&p), &count, &Ok(verified));
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        note_verified_candidate(Some(&p), &Ok(verified));
         assert_eq!(
             &*p.advances.lock().unwrap(),
-            &[(1, "pkg (pkg-1.whl)".into())]
+            &[(
+                0,
+                "Verified candidate pkg (pkg-1.whl) while resolving plan".into()
+            )]
         );
     }
 }

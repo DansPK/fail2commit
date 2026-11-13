@@ -284,7 +284,8 @@ fn install_inner(
         .progress
         .step(Step::DownloadVerify, wheels.len() as u64);
     // The report contains only wheels the staging proxy fetched and verified.
-    // Reconcile from the unknown streaming count to the full resolved package plan.
+    // Only now, after resolution has excluded backtracked candidates, publish
+    // the resolved package count as plan completion.
     seams.progress.advance(wheels.len() as u64, "");
     check_pins(&req, &wheels)?;
     let digest = plan::plan_digest(&interp, &policy.url, &req.canonical(), &wheels)?;

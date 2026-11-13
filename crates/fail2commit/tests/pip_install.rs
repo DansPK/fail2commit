@@ -4,6 +4,7 @@
 mod pip_support;
 
 use fail2commit_core::pip;
+use fail2commit_core::progress::{End, Progress, Step};
 use fail2commit_core::protocol::{ApprovalRequest, Decision};
 use fail2commit_core::scan::AdvisoryReport;
 use fail2commit_core::{Error, Finding, FindingAction, FindingKind, ResultCode};
@@ -59,6 +60,35 @@ fn advisory() -> AdvisoryReport {
     }
 }
 
+#[derive(Debug)]
+enum ProgressEvent {
+    Step(Step, u64),
+    Advance(u64, String),
+}
+
+#[derive(Default)]
+struct RecordingProgress(Mutex<Vec<ProgressEvent>>);
+
+impl Progress for RecordingProgress {
+    fn step(&self, step: Step, total: u64) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(ProgressEvent::Step(step, total));
+    }
+
+    fn advance(&self, done: u64, current: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(ProgressEvent::Advance(done, current.to_owned()));
+    }
+
+    fn finding(&self, _finding: &Finding) {}
+    fn pause(&self) {}
+    fn finish(&self, _end: End, _summary: &str) {}
+}
+
 #[test]
 fn clean_wheel_install_works_with_transitive_dependency() {
     let f = fixture();
@@ -81,6 +111,61 @@ fn clean_wheel_install_works_with_transitive_dependency() {
     for w in &r.packages {
         assert_eq!(w.sha256.len(), 64);
     }
+}
+
+#[test]
+fn backtracked_candidate_activity_does_not_count_as_final_plan_completion() {
+    let f = fixture();
+    // pip first considers beta 2.0, whose gamma>=2 metadata conflicts with
+    // alpha's gamma==1.0 pin, then backtracks to beta 1.0.
+    f.index
+        .add_wheel("alpha", "1.0", &["beta>=1", "gamma==1.0"]);
+    f.index.add_wheel("beta", "1.0", &[]);
+    f.index.add_wheel("beta", "2.0", &["gamma>=2"]);
+    f.index.add_wheel("gamma", "1.0", &[]);
+    f.index.add_wheel("gamma", "2.0", &[]);
+    let progress = Arc::new(RecordingProgress::default());
+    let mut s = seams(&f.index);
+    s.progress = progress.clone();
+
+    let report = f.install(&["alpha"], &s).unwrap();
+    let selected: Vec<_> = report
+        .packages
+        .iter()
+        .map(|w| format!("{}=={}", w.name, w.version))
+        .collect();
+    assert_eq!(selected, ["alpha==1.0", "beta==1.0", "gamma==1.0"]);
+
+    let events = progress.0.lock().unwrap();
+    let plan_step = events
+        .iter()
+        .position(|event| matches!(event, ProgressEvent::Step(Step::DownloadVerify, 3)))
+        .expect("resolved plan reports three selected wheels");
+    let candidate_activity = events[..plan_step]
+        .iter()
+        .filter_map(|event| match event {
+            ProgressEvent::Advance(done, current) if current.contains("candidate") => {
+                Some((*done, current.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        candidate_activity.iter().any(|(_, current)| {
+            current.contains("beta-2.0-py3-none-any.whl") && current.contains("candidate")
+        }),
+        "the rejected beta 2.0 candidate was fetched and reported"
+    );
+    assert!(
+        candidate_activity.iter().all(|(done, _)| *done == 0),
+        "unresolved candidates must not count as completed plan items"
+    );
+    assert!(
+        events[plan_step + 1..]
+            .iter()
+            .any(|event| { matches!(event, ProgressEvent::Advance(done, _) if *done == 3) }),
+        "only the resolved three-wheel plan is counted complete"
+    );
 }
 
 #[test]
