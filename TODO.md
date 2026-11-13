@@ -27,7 +27,7 @@ Integration branch: `main` (one PR per change). Latest release `v0.1.3` (pre-rel
 | ID | Task | Req IDs | Owner | Status | Depends on |
 |---|---|---|---|---|---|
 | T-013 | Implement SPEC-018 (hardened sandbox mode) | FR-027 | Orca Luna worker | partial protocol/boundary/Linux lifecycle at d7baa10; Windows SCM/account milestone in progress; not integrated | T-007 |
-| T-014 | Implement the FR-013 progress window and terminal line (SPEC-015 hooks are in place; `ui.progress_window` setting exists, no sink yet) | FR-013 | Orca Luna worker; Sol review | implemented at 6536c6b; independent review in progress; GUI/runtime platform gates pending; not integrated | - |
+| T-014 | Implement the FR-013 progress window and terminal line (SPEC-015 hooks are in place; `ui.progress_window` setting exists, no sink yet) | FR-013 | Orca Luna worker; Sol review | source accepted by Sol r4 and integrated from f928a45; Linux PTY flows passed; Windows GUI/current package gates pending | - |
 | T-015 | Implement SPEC-019 (VM sandbox backend) | FR-029 | - | ready | T-013 |
 
 FR-029 (VM backend, Could) stays in 0.1.4 by owner decision (2026-11-13); it lands last, after T-013 and T-014.
