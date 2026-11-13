@@ -23,7 +23,10 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         Action::Guarded(req) => {
             let backend = fail2commit_core::sandbox::platform_backend();
             let approval = ctx.approval();
-            let deps = Deps::production(&approval, backend.as_ref());
+            let progress =
+                super::progress_ui::ProgressUi::new(ctx.json, ctx.settings.ui.progress_window);
+            let mut deps = Deps::production(&approval, backend.as_ref());
+            deps.progress = &progress;
             let o = npm::execute(&deps, &req)?;
             Ok(Outcome {
                 message: o.message,

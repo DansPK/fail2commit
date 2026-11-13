@@ -9,6 +9,7 @@
 use super::index::{IndexClient, IndexFile};
 use super::interp::normalize;
 use super::wheel::{self, WheelError};
+use crate::progress::Progress;
 use crate::{Error, Finding, FindingAction, FindingKind};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -52,6 +53,7 @@ pub struct Shared {
     /// Integrity or limit failure seen while serving: reported by name.
     pub failure: Mutex<Option<Error>>,
     pub requests: Mutex<usize>,
+    progress: Mutex<Option<Arc<dyn Progress>>>,
 }
 
 pub struct Proxy {
@@ -82,6 +84,7 @@ impl Proxy {
             projects: Mutex::new(BTreeMap::new()),
             failure: Mutex::new(None),
             requests: Mutex::new(0),
+            progress: Mutex::new(None),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (s2, stop2) = (shared.clone(), stop.clone());
@@ -109,6 +112,10 @@ impl Proxy {
     /// `--index-url` for pip.
     pub fn index_url(&self) -> String {
         format!("http://{}/{}/simple/", self.addr, self.shared.token)
+    }
+
+    pub fn set_progress(&self, progress: Arc<dyn Progress>) {
+        *self.shared.progress.lock().unwrap() = Some(progress);
     }
 
     fn files_prefix(&self) -> String {
@@ -165,6 +172,13 @@ impl Shared {
         let dir = self.staging.join(id);
         std::fs::create_dir_all(&dir)?;
         let dest = dir.join(&file.filename);
+        let progress = self.progress.lock().unwrap().clone();
+        if let Some(p) = &progress {
+            p.advance(
+                0,
+                &format!("Downloading candidate {} ({})", project, file.filename),
+            );
+        }
         let fail = |e: Error| {
             let _ = std::fs::remove_file(&dest);
             if matches!(
@@ -216,6 +230,7 @@ impl Shared {
         if let Some(e) = self.files.lock().unwrap().get_mut(id) {
             e.verified = Some(v.clone());
         }
+        note_verified_candidate(progress.as_deref(), &Ok(v.clone()));
         Ok(v)
     }
 
@@ -265,6 +280,18 @@ impl Shared {
         html.push_str("</body></html>\n");
         self.projects.lock().unwrap().insert(name, stats);
         Ok(html)
+    }
+}
+
+fn note_verified_candidate(progress: Option<&dyn Progress>, result: &crate::Result<Verified>) {
+    if let (Some(p), Ok(v)) = (progress, result) {
+        p.advance(
+            0,
+            &format!(
+                "Verified candidate {} ({}) while resolving plan",
+                v.project, v.filename
+            ),
+        );
     }
 }
 
@@ -396,4 +423,50 @@ fn handle(s: &Shared, mut stream: TcpStream) -> std::io::Result<()> {
         b"not found",
         send_body,
     )
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use crate::progress::{End, Step};
+
+    #[derive(Default)]
+    struct Recorder {
+        steps: Mutex<Vec<(Step, u64)>>,
+        advances: Mutex<Vec<(u64, String)>>,
+    }
+    impl Progress for Recorder {
+        fn step(&self, step: Step, total: u64) {
+            self.steps.lock().unwrap().push((step, total));
+        }
+        fn advance(&self, done: u64, current: &str) {
+            self.advances.lock().unwrap().push((done, current.into()));
+        }
+        fn finish(&self, _end: End, _summary: &str) {}
+    }
+
+    #[test]
+    fn proxy_reports_candidate_activity_without_counting_unresolved_plan_items() {
+        let p = Recorder::default();
+        assert!(p.steps.lock().unwrap().is_empty());
+
+        let failed: crate::Result<Verified> = Err(Error::integrity("invalid hash"));
+        note_verified_candidate(Some(&p), &failed);
+        let verified = Verified {
+            project: "pkg".into(),
+            filename: "pkg-1.whl".into(),
+            sha256: "ab".into(),
+            size: 2,
+            upstream_url: "https://registry.invalid/pkg.whl".into(),
+            path: PathBuf::from("pkg.whl"),
+        };
+        note_verified_candidate(Some(&p), &Ok(verified));
+        assert_eq!(
+            &*p.advances.lock().unwrap(),
+            &[(
+                0,
+                "Verified candidate pkg (pkg-1.whl) while resolving plan".into()
+            )]
+        );
+    }
 }

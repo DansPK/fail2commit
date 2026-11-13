@@ -8,6 +8,7 @@ pub mod malware_list;
 pub mod npm;
 pub mod password;
 pub mod pip;
+pub mod progress_ui;
 pub mod rules;
 pub mod run;
 pub mod sandbox;
