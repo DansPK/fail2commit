@@ -128,8 +128,51 @@ fn main() -> ExitCode {
     if let Command::Sandbox(args) = &cli.command {
         match &args.action {
             cmd::sandbox::Action::Serve => return exit(cmd::sandbox::serve().map_or(70, |_| 0)),
-            cmd::sandbox::Action::Launch { jobfile, watchdog } => {
-                return exit(cmd::sandbox::launch(jobfile, *watchdog).map_or(70, |_| 0));
+            cmd::sandbox::Action::Launch {
+                jobfile,
+                watchdog,
+                prepare_request,
+                prepare_ack,
+                launch_id,
+                test_diagnostic,
+            } => {
+                let result = if *test_diagnostic {
+                    cmd::sandbox::launch_test_diagnostic(
+                        jobfile,
+                        *watchdog,
+                        *prepare_request,
+                        *prepare_ack,
+                        launch_id.as_deref(),
+                    )
+                } else {
+                    cmd::sandbox::launch(
+                        jobfile,
+                        *watchdog,
+                        *prepare_request,
+                        *prepare_ack,
+                        launch_id.as_deref(),
+                    )
+                };
+                return exit(result.map_or(70, |_| 0));
+            }
+            #[cfg(not(all(feature = "hardened-test-diagnostics", debug_assertions)))]
+            cmd::sandbox::Action::Launch {
+                jobfile,
+                watchdog,
+                prepare_request,
+                prepare_ack,
+                launch_id,
+            } => {
+                return exit(
+                    cmd::sandbox::launch(
+                        jobfile,
+                        *watchdog,
+                        *prepare_request,
+                        *prepare_ack,
+                        launch_id.as_deref(),
+                    )
+                    .map_or(70, |_| 0),
+                );
             }
             _ => {}
         }

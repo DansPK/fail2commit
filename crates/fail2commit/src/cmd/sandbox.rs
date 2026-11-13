@@ -28,6 +28,15 @@ pub enum Action {
         jobfile: std::path::PathBuf,
         #[arg(long)]
         watchdog: Option<u64>,
+        #[arg(long)]
+        prepare_request: Option<u64>,
+        #[arg(long)]
+        prepare_ack: Option<u64>,
+        #[arg(long)]
+        launch_id: Option<String>,
+        #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+        #[arg(long, hide = true)]
+        test_diagnostic: bool,
     },
 }
 
@@ -95,6 +104,35 @@ pub fn serve() -> fail2commit_core::Result<()> {
     fail2commit_core::sandbox::hardened::serve()
 }
 
-pub fn launch(jobfile: &std::path::Path, watchdog: Option<u64>) -> fail2commit_core::Result<()> {
-    fail2commit_core::sandbox::hardened::launch(jobfile, watchdog)
+pub fn launch(
+    jobfile: &std::path::Path,
+    watchdog: Option<u64>,
+    prepare_request: Option<u64>,
+    prepare_ack: Option<u64>,
+    launch_id: Option<&str>,
+) -> fail2commit_core::Result<()> {
+    fail2commit_core::sandbox::hardened::launch_with_control(
+        jobfile,
+        watchdog,
+        prepare_request,
+        prepare_ack,
+        launch_id,
+    )
+}
+
+#[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+pub fn launch_test_diagnostic(
+    jobfile: &std::path::Path,
+    watchdog: Option<u64>,
+    prepare_request: Option<u64>,
+    prepare_ack: Option<u64>,
+    launch_id: Option<&str>,
+) -> fail2commit_core::Result<()> {
+    fail2commit_core::sandbox::hardened::launch_with_test_diagnostic_control(
+        jobfile,
+        watchdog,
+        prepare_request,
+        prepare_ack,
+        launch_id,
+    )
 }

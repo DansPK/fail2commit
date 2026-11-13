@@ -35,6 +35,16 @@ pub struct JobFile {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct HardenedJobFile {
+    version: u32,
+    stage_root: String,
+    job: JobFile,
+    #[serde(default)]
+    test_diagnostic: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OutcomeFile {
     status: JobStatus,
     stdout_b64: String,
@@ -155,6 +165,101 @@ pub fn decode_job(bytes: &[u8]) -> crate::Result<JobSpec> {
     JobSpec::try_from(wire)
 }
 
+/// Private launcher envelope; the public JobSpec and backend APIs are unchanged.
+pub fn encode_hardened_job(job: &JobSpec, stage_root: &Path) -> crate::Result<Vec<u8>> {
+    if !stage_root.is_absolute() {
+        return Err(crate::Error::isolation_unavailable(
+            "hardened stage root must be absolute",
+        ));
+    }
+    let stage_root = stage_root.to_str().ok_or_else(|| {
+        crate::Error::isolation_unavailable("hardened stage root is not valid UTF-8")
+    })?;
+    let envelope = HardenedJobFile {
+        version: 1,
+        stage_root: stage_root.to_owned(),
+        job: JobFile::try_from(job)?,
+        test_diagnostic: false,
+    };
+    let bytes = serde_json::to_vec(&envelope).map_err(|e| {
+        crate::Error::isolation_unavailable(format!("hardened job serialization failed: {e}"))
+    })?;
+    if bytes.len() > MAX_JOB_BYTES {
+        return Err(crate::Error::isolation_unavailable(
+            "hardened job envelope exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub fn decode_hardened_job(bytes: &[u8]) -> crate::Result<(JobSpec, PathBuf)> {
+    let (job, stage_root, test_diagnostic) = decode_hardened_job_mode(bytes)?;
+    if test_diagnostic {
+        return Err(crate::Error::rejected(
+            "test diagnostic job envelopes are unavailable in this build",
+        ));
+    }
+    Ok((job, stage_root))
+}
+
+fn decode_hardened_job_mode(bytes: &[u8]) -> crate::Result<(JobSpec, PathBuf, bool)> {
+    if bytes.len() > MAX_JOB_BYTES {
+        return Err(crate::Error::invalid(
+            "hardened job envelope exceeds size limit",
+        ));
+    }
+    let envelope: HardenedJobFile = serde_json::from_slice(bytes)
+        .map_err(|e| crate::Error::invalid(format!("invalid hardened job envelope: {e}")))?;
+    if envelope.version != 1 || !Path::new(&envelope.stage_root).is_absolute() {
+        return Err(crate::Error::integrity(
+            "hardened job envelope has an invalid stage identity",
+        ));
+    }
+    Ok((
+        JobSpec::try_from(envelope.job)?,
+        PathBuf::from(envelope.stage_root),
+        envelope.test_diagnostic,
+    ))
+}
+
+#[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+pub fn encode_hardened_diagnostic_job(job: &JobSpec, stage_root: &Path) -> crate::Result<Vec<u8>> {
+    if job.network != NetworkMode::None || !stage_root.is_absolute() {
+        return Err(crate::Error::rejected(
+            "test diagnostic jobs require absolute stage roots and network mode none",
+        ));
+    }
+    let stage_root = stage_root.to_str().ok_or_else(|| {
+        crate::Error::isolation_unavailable("hardened stage root is not valid UTF-8")
+    })?;
+    let envelope = HardenedJobFile {
+        version: 1,
+        stage_root: stage_root.to_owned(),
+        job: JobFile::try_from(job)?,
+        test_diagnostic: true,
+    };
+    let bytes = serde_json::to_vec(&envelope)
+        .map_err(|error| crate::Error::internal(format!("encode test diagnostic job: {error}")))?;
+    if bytes.len() > MAX_JOB_BYTES {
+        return Err(crate::Error::rejected(
+            "test diagnostic job envelope exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_hardened_job_for_service(
+    bytes: &[u8],
+) -> crate::Result<(JobSpec, PathBuf, bool)> {
+    let (job, root, test_diagnostic) = decode_hardened_job_mode(bytes)?;
+    if test_diagnostic && !cfg!(all(feature = "hardened-test-diagnostics", debug_assertions)) {
+        return Err(crate::Error::rejected(
+            "test diagnostic job envelopes are unavailable in this build",
+        ));
+    }
+    Ok((job, root, test_diagnostic))
+}
+
 pub fn encode_outcome(outcome: &JobOutcome) -> crate::Result<Vec<u8>> {
     use base64::Engine;
     if outcome.stdout.len() > MAX_STREAM_BYTES || outcome.stderr.len() > MAX_STREAM_BYTES {
@@ -219,7 +324,29 @@ pub fn decode_outcome(bytes: &[u8]) -> crate::Result<JobOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::isolation::{ActivityReport, JobOutcome};
+    use crate::isolation::{ActivityReport, JobLimits, JobOutcome};
+
+    fn job() -> JobSpec {
+        JobSpec {
+            program: PathBuf::from("C:\\work\\tool.exe"),
+            args: vec!["--version".into()],
+            cwd: PathBuf::from("C:\\work\\job"),
+            env: vec![("PATH".into(), "C:\\work".into())],
+            read_only: vec![PathBuf::from("C:\\work\\stage\\input")],
+            work_dir: PathBuf::from("C:\\work\\stage\\job"),
+            exports: Vec::new(),
+            export_to: None,
+            limits: JobLimits {
+                timeout: Duration::from_secs(20),
+                memory_bytes: Some(128 * 1024 * 1024),
+                max_processes: Some(8),
+                max_output_bytes: 64 * 1024,
+                disk_bytes: Some(256 * 1024 * 1024),
+            },
+            network: NetworkMode::None,
+            bait: true,
+        }
+    }
 
     fn outcome() -> JobOutcome {
         JobOutcome {
@@ -250,6 +377,33 @@ mod tests {
         assert!(decode_outcome(raw.as_bytes()).is_err());
         encoded.resize(MAX_OUTCOME_BYTES + 1, b' ');
         assert!(decode_outcome(&encoded).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardened_job_envelope_round_trips_and_rejects_relative_or_unknown_roots() {
+        let root = PathBuf::from(r"C:\Users\fixture\AppData\Local\f2c\cache\sandbox-stage");
+        let encoded = encode_hardened_job(&job(), &root).unwrap();
+        let (decoded, decoded_root) = decode_hardened_job(&encoded).unwrap();
+        assert_eq!(decoded.program, job().program);
+        assert_eq!(decoded.work_dir, job().work_dir);
+        assert_eq!(decoded_root, root);
+
+        let relative = String::from_utf8(encoded.clone()).unwrap().replace(
+            r"C:\\Users\\fixture\\AppData\\Local\\f2c\\cache\\sandbox-stage",
+            "relative",
+        );
+        assert!(decode_hardened_job(relative.as_bytes()).is_err());
+        let unknown = String::from_utf8(encoded)
+            .unwrap()
+            .replace("\"version\":1", "\"version\":2");
+        assert!(decode_hardened_job(unknown.as_bytes()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardened_job_envelope_never_accepts_relative_stage_root() {
+        assert!(encode_hardened_job(&job(), Path::new("relative-stage")).is_err());
     }
 
     #[cfg(unix)]

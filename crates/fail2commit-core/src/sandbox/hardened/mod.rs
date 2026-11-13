@@ -3,6 +3,8 @@
 pub mod lifecycle;
 pub mod protocol;
 pub mod service;
+#[cfg(windows)]
+mod windows_wfp;
 
 use crate::isolation::{JobOutcome, JobSpec, ProbeReport, SandboxBackend};
 use crate::settings::{BackendChoice, Settings};
@@ -49,13 +51,73 @@ pub fn serve() -> crate::Result<()> {
 /// Launcher entry point deliberately refuses until all per-job isolation
 /// controls, grants, and watchdog handling have been wired and probed.
 pub fn launch(jobfile: &std::path::Path, watchdog: Option<u64>) -> crate::Result<()> {
+    launch_with_control(jobfile, watchdog, None, None, None)
+}
+
+pub fn launch_with_control(
+    jobfile: &std::path::Path,
+    watchdog: Option<u64>,
+    prepare_request: Option<u64>,
+    prepare_ack: Option<u64>,
+    launch_id: Option<&str>,
+) -> crate::Result<()> {
+    launch_with_control_mode(
+        jobfile,
+        watchdog,
+        prepare_request,
+        prepare_ack,
+        launch_id,
+        false,
+    )
+}
+
+#[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+pub fn launch_with_test_diagnostic_control(
+    jobfile: &std::path::Path,
+    watchdog: Option<u64>,
+    prepare_request: Option<u64>,
+    prepare_ack: Option<u64>,
+    launch_id: Option<&str>,
+) -> crate::Result<()> {
+    launch_with_control_mode(
+        jobfile,
+        watchdog,
+        prepare_request,
+        prepare_ack,
+        launch_id,
+        true,
+    )
+}
+
+fn launch_with_control_mode(
+    jobfile: &std::path::Path,
+    watchdog: Option<u64>,
+    prepare_request: Option<u64>,
+    prepare_ack: Option<u64>,
+    launch_id: Option<&str>,
+    test_diagnostic: bool,
+) -> crate::Result<()> {
     #[cfg(windows)]
     {
-        service::launch_hidden(jobfile, watchdog)
+        service::launch_hidden(
+            jobfile,
+            watchdog,
+            prepare_request,
+            prepare_ack,
+            launch_id,
+            test_diagnostic,
+        )
     }
     #[cfg(not(windows))]
     {
-        let _ = (jobfile, watchdog);
+        let _ = (
+            jobfile,
+            watchdog,
+            prepare_request,
+            prepare_ack,
+            launch_id,
+            test_diagnostic,
+        );
         Err(crate::Error::isolation_unavailable(
             "hardened launcher controls are not verified; refusing to execute job",
         ))

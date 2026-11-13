@@ -23,7 +23,7 @@
 //!   are checked, so a run never reports success while package code lives and a
 //!   failed ACL cleanup is recorded, logged and refused by the next operation.
 
-mod ffi;
+pub(crate) mod ffi;
 mod watch;
 
 use crate::isolation::{
@@ -433,10 +433,86 @@ fn probe_command(approval_pipe: &str, default_pipe: &str) -> String {
 /// root, grant read-back, loopback list, token, job limits, handle list) so a
 /// cached probe verdict is never the only evidence for a launch (S7B-005).
 fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
-    let stage_root = stage_root()?;
-    clear_pending_revokes(&stage_root)?;
-    clear_stale_profiles(&stage_root)?;
-    let paths = ValidatedPaths::new(job, &stage_root)?;
+    match run_with_launch_mode(job, None, None, false)? {
+        WindowsLaunchResult::Completed(outcome) => Ok(outcome),
+        #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+        WindowsLaunchResult::Diagnostic(_) => Err(crate::Error::internal(
+            "ordinary sandbox runner returned a test diagnostic",
+        )),
+    }
+}
+
+pub(crate) fn run_hardened_lpac(
+    job: &JobSpec,
+    stage_root: &Path,
+    preparation: &mut crate::sandbox::hardened::service::PreparationClient,
+) -> crate::Result<JobOutcome> {
+    match run_with_launch_mode(job, Some(stage_root), Some(preparation), false)? {
+        WindowsLaunchResult::Completed(outcome) => Ok(outcome),
+        #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+        WindowsLaunchResult::Diagnostic(_) => Err(crate::Error::internal(
+            "ordinary hardened runner returned a test diagnostic",
+        )),
+    }
+}
+
+#[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+pub(crate) fn run_hardened_lpac_diagnostic(
+    job: &JobSpec,
+    stage_root: &Path,
+    preparation: &mut crate::sandbox::hardened::service::PreparationClient,
+) -> crate::Result<crate::sandbox::hardened::service::HardenedLauncherDiagnostic> {
+    match run_with_launch_mode(job, Some(stage_root), Some(preparation), true)? {
+        WindowsLaunchResult::Diagnostic(diagnostic) => Ok(diagnostic),
+        WindowsLaunchResult::Completed(_) => Err(crate::Error::internal(
+            "test diagnostic unexpectedly completed a package job",
+        )),
+    }
+}
+
+enum WindowsLaunchResult {
+    Completed(JobOutcome),
+    #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+    Diagnostic(crate::sandbox::hardened::service::HardenedLauncherDiagnostic),
+}
+
+fn run_with_launch_mode(
+    job: &JobSpec,
+    hardened_stage_root: Option<&Path>,
+    mut preparation: Option<&mut crate::sandbox::hardened::service::PreparationClient>,
+    diagnostic: bool,
+) -> crate::Result<WindowsLaunchResult> {
+    if diagnostic && !cfg!(all(feature = "hardened-test-diagnostics", debug_assertions)) {
+        return Err(crate::Error::rejected(
+            "hardened test diagnostic controls are unavailable in this build",
+        ));
+    }
+    if diagnostic && preparation.is_none() {
+        return Err(crate::Error::rejected(
+            "hardened test diagnostic requires the authenticated SYSTEM preparation channel",
+        ));
+    }
+    if preparation.is_some() && job.network == crate::isolation::NetworkMode::Internet {
+        return Err(crate::Error::isolation_unavailable(
+            "hardened Internet jobs are disabled until the shared proxy transport and WFP proxy exception pass their probes",
+        ));
+    }
+    let validation_root = match hardened_stage_root {
+        Some(root) => root.canonicalize().map_err(|error| {
+            crate::Error::isolation_unavailable(format!(
+                "cannot open authenticated hardened stage root: {error}"
+            ))
+        })?,
+        None => stage_root()?,
+    };
+    // Profile records belong to the sandbox account's private profile. The
+    // authenticated envelope points at the caller's staged job tree and is
+    // used only to validate package inputs; mixing these roots would make the
+    // service account attempt to write into caller-owned state.
+    let profile_root = stage_root()?;
+    clear_pending_revokes(&profile_root)?;
+    clear_stale_profiles(&profile_root)?;
+    let paths = ValidatedPaths::new(job, &validation_root)?;
     let max_processes = job.limits.max_processes.filter(|n| *n > 0).ok_or_else(|| {
         crate::Error::isolation_unavailable("a positive process limit is required")
     })?;
@@ -454,15 +530,17 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     // FR-024: bait goes into the job's own home before grants, so it is staged
     // and granted like any other work_dir file and never leaves the stage.
     let mut env = job.env.clone();
-    let bait = if job.bait {
+    let bait = if job.bait && !diagnostic {
         Some(place_bait(&paths.work_dir, &mut env)?)
     } else {
         None
     };
     // FR-023: `Internet` is exactly the internetClient capability.
-    let internet = match job.network {
-        crate::isolation::NetworkMode::Internet => Some(ffi::sid_from_string(INTERNET_CLIENT)?),
-        crate::isolation::NetworkMode::None => None,
+    let internet = match (preparation.is_some(), job.network) {
+        (true, _) | (false, crate::isolation::NetworkMode::None) => None,
+        (false, crate::isolation::NetworkMode::Internet) => {
+            Some(ffi::sid_from_string(INTERNET_CLIENT)?)
+        }
     };
     let capabilities: Vec<PSID> = internet.iter().map(|s| s.as_psid()).collect();
     let expected_caps: Vec<String> = internet
@@ -480,13 +558,21 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
         None => None,
     };
 
-    let profile = RecordedProfile::create(&stage_root)?;
+    let profile = RecordedProfile::create(&profile_root)?;
     verify_no_loopback_exemption(&profile.profile().sid_string)?;
-    let mut grants = StagingGrants::new(profile.profile().sid(), &stage_root);
-    for root in &paths.read_only {
-        grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
-    }
-    grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
+    // The SYSTEM service adds the LPAC package SID ACEs after reading this
+    // freshly-created profile SID over the authenticated preparation channel.
+    // A sandbox account cannot safely grant it access to caller-owned files.
+    let mut grants = if preparation.is_none() {
+        let mut grants = StagingGrants::new(profile.profile().sid(), &validation_root);
+        for root in &paths.read_only {
+            grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
+        }
+        grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
+        Some(grants)
+    } else {
+        None
+    };
 
     let job_object = ffi::Job::new(max_processes, memory_bytes)?;
     job_object.verify(max_processes, memory_bytes)?;
@@ -494,11 +580,26 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     // `\\?\` form that canonicalization returns, so execution inputs use the
     // plain DOS form. Canonical verbatim paths are still what every containment
     // comparison and every ACL call uses.
-    let program = plain_path(&paths.program);
-    let cwd = plain_path(&paths.cwd);
+    let (program, cwd, args, environment) = if diagnostic {
+        let system32 = required_windows_directory()?.join("System32");
+        let program = system32.join("whoami.exe");
+        (
+            program.clone(),
+            system32,
+            Vec::new(),
+            Vec::<(OsString, OsString)>::new(),
+        )
+    } else {
+        (
+            plain_path(&paths.program),
+            plain_path(&paths.cwd),
+            job.args.clone(),
+            env.clone(),
+        )
+    };
     let work_dir = plain_path(&paths.work_dir);
-    let env = environment_block(&env, &cwd, &work_dir)?;
-    let mut command_line = command_line(&program, &job.args)?;
+    let env = environment_block(&environment, &cwd, &work_dir)?;
+    let mut command_line = command_line(&program, &args)?;
 
     // Declared after `grants`, so it drops first: the oplock handles must be
     // closed before the ACL revoke reopens the bait files.
@@ -515,16 +616,28 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
         stdout_write.as_raw_handle() as HANDLE,
         stderr_write.as_raw_handle() as HANDLE,
     ];
-    let mut canary = HandleCanary::create(&paths.stage)?;
-    let spawned = ffi::spawn_suspended(
-        &program,
-        &mut command_line,
-        &env,
-        &cwd,
-        profile.profile().sid(),
-        &capabilities,
-        stdio,
-    )?;
+    let mut canary = HandleCanary::create(&paths.work_dir)?;
+    let spawned = if preparation.is_some() {
+        ffi::spawn_lpac_suspended(
+            &program,
+            &mut command_line,
+            &env,
+            &cwd,
+            profile.profile().sid(),
+            &capabilities,
+            stdio,
+        )?
+    } else {
+        ffi::spawn_suspended(
+            &program,
+            &mut command_line,
+            &env,
+            &cwd,
+            profile.profile().sid(),
+            &capabilities,
+            stdio,
+        )?
+    };
     let facts = ffi::token_facts(&spawned.process, profile.profile().sid())
         .map_err(|error| abort_with(&spawned, error))?;
     if !facts.is_appcontainer
@@ -541,13 +654,13 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
             )),
         ));
     }
-    // LPAC is not the default (SPEC-014 section 4). Observing it would mean the
-    // launch policy changed unexpectedly.
-    if facts.is_lpac {
+    // Hardened jobs require the LPAC token read-back; the default runner keeps
+    // the frozen standard AppContainer policy.
+    if facts.is_lpac != preparation.is_some() {
         return Err(abort_with(
             &spawned,
             crate::Error::isolation_unavailable(
-                "unexpected LPAC token; launch configuration changed",
+                "child token LPAC state did not match the selected launch mode",
             ),
         ));
     }
@@ -572,6 +685,71 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     monitor
         .settle_before_resume(&job_object)
         .map_err(|error| abort_with(&spawned, error))?;
+    let _policy_receipt = if let Some(preparation) = preparation.as_deref_mut() {
+        let package_sid = ffi::sid_to_string(profile.profile().sid())?;
+        let receipt = preparation
+            .prepare(
+                &package_sid,
+                profile.profile().name(),
+                crate::isolation::NetworkMode::None,
+            )
+            .map_err(|error| abort_with(&spawned, error))?;
+        if receipt.package_sid != package_sid || receipt.launch_id != preparation.launch_id() {
+            return Err(abort_with(
+                &spawned,
+                crate::Error::integrity("WFP preparation receipt did not bind this package"),
+            ));
+        }
+        Some(receipt)
+    } else {
+        None
+    };
+    #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+    if diagnostic {
+        // The authenticated service has already installed the package SID
+        // grants and acknowledged the per-launch policy. Keep the process
+        // suspended so no diagnostic or package image runs in the sandbox.
+        let package_policy_acknowledged = _policy_receipt.is_some();
+        spawned.kill()?;
+        let child_termination_confirmed = true;
+        job_object.wait_empty(Instant::now() + CLEANUP_GRACE)?;
+        let child_tree_empty = job_object.active_processes()? == 0;
+        if !child_tree_empty {
+            return Err(crate::Error::isolation_unavailable(
+                "diagnostic child tree remained active after termination",
+            ));
+        }
+        monitor.release_bait(&job_object);
+        let _ = monitor.finish(&job_object);
+        if let Some(grants) = grants.as_mut() {
+            grants.release()?;
+        }
+        profile.remove()?;
+        return Ok(WindowsLaunchResult::Diagnostic(
+            crate::sandbox::hardened::service::HardenedLauncherDiagnostic {
+                service_received_diagnostic_request: false,
+                service_profile_loaded: false,
+                service_environment_created: false,
+                service_launcher_created: false,
+                service_launcher_exit_confirmed: false,
+                service_profile_unloaded: false,
+                service_marker_cleared: false,
+                service_package_grants_revoked: false,
+                service_wfp_session_closed: false,
+                launcher_created: true,
+                profile_created: true,
+                child_process_created_suspended: true,
+                token_is_appcontainer: facts.is_appcontainer,
+                token_is_lpac: facts.is_lpac,
+                token_sid_matches_profile: facts.sid_matches,
+                child_assigned_to_job: true,
+                system_acknowledged_package_policy: package_policy_acknowledged,
+                child_termination_confirmed,
+                child_tree_empty,
+                profile_removed: true,
+            },
+        ));
+    }
     spawned
         .resume()
         .map_err(|error| abort_with(&spawned, error))?;
@@ -603,16 +781,18 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     }
     // Cleanup is part of the operation: a failed revoke is recorded, logged and
     // returned, so the next probe()/run() refuses while it is outstanding.
-    grants.release()?;
+    if let Some(grants) = grants.as_mut() {
+        grants.release()?;
+    }
     drop(profile);
-    Ok(JobOutcome {
+    Ok(WindowsLaunchResult::Completed(JobOutcome {
         status,
         stdout,
         stderr,
         truncated,
         exported: Vec::new(),
         report,
-    })
+    }))
 }
 
 /// Apply and verify the sandbox-account grants around a single authenticated
@@ -663,6 +843,37 @@ pub(crate) fn with_hardened_job_grants<T>(
 pub(crate) enum HardenedGrantAction<T> {
     Complete(crate::Result<T>),
     ContainmentUnconfirmed(crate::Error),
+}
+
+/// SYSTEM-owned per-package access to the caller's already validated staged
+/// inputs. The service holds this object through launcher and child teardown,
+/// then revokes every package SID ACE before returning an outcome.
+pub(crate) struct HardenedPackageGrants<'a> {
+    grants: StagingGrants<'a>,
+    // Keep the pointer stored in StagingGrants valid until grants have been
+    // dropped/released; fields drop in declaration order, so SID follows it.
+    _sid: ffi::OwnedSid,
+}
+
+impl HardenedPackageGrants<'_> {
+    pub(crate) fn release(&mut self) -> crate::Result<()> {
+        self.grants.release()
+    }
+}
+
+pub(crate) fn grant_hardened_package<'a>(
+    job: &JobSpec,
+    stage_root: &'a Path,
+    package_sid: &str,
+) -> crate::Result<HardenedPackageGrants<'a>> {
+    let paths = ValidatedPaths::new(job, stage_root)?;
+    let sid = ffi::sid_from_string(package_sid)?;
+    let mut grants = StagingGrants::new_crash_safe(sid.as_psid(), stage_root);
+    for root in &paths.read_only {
+        grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
+    }
+    grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
+    Ok(HardenedPackageGrants { grants, _sid: sid })
 }
 
 pub(crate) fn sweep_hardened_job_state(cache_root: &Path) -> crate::Result<()> {
@@ -1113,13 +1324,28 @@ impl RecordedProfile {
     fn profile(&self) -> &ffi::Profile {
         self.profile.as_ref().expect("profile present until drop")
     }
+
+    fn remove(mut self) -> crate::Result<()> {
+        let profile = self.profile.take().ok_or_else(|| {
+            crate::Error::internal("recorded AppContainer profile was already removed")
+        })?;
+        profile.remove()?;
+        fs::remove_file(&self.record).map_err(|error| {
+            crate::Error::isolation_unavailable(format!(
+                "AppContainer profile was deleted but its recovery record could not be removed: {error}"
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 impl Drop for RecordedProfile {
     fn drop(&mut self) {
         // Profile first (its Drop deletes it), then the record.
-        drop(self.profile.take());
-        let _ = fs::remove_file(&self.record);
+        if let Some(profile) = self.profile.take() {
+            drop(profile);
+            let _ = fs::remove_file(&self.record);
+        }
     }
 }
 
@@ -1165,8 +1391,6 @@ struct ValidatedPaths {
     cwd: PathBuf,
     read_only: Vec<PathBuf>,
     work_dir: PathBuf,
-    /// The one job stage directory below the fail2commit stage root.
-    stage: PathBuf,
 }
 
 impl ValidatedPaths {
@@ -1239,7 +1463,6 @@ impl ValidatedPaths {
             cwd,
             read_only,
             work_dir,
-            stage,
         })
     }
 }
@@ -1336,6 +1559,11 @@ fn stage_root() -> crate::Result<PathBuf> {
     })?;
     reject_unsafe_anchor(&root)?;
     Ok(root)
+}
+
+#[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+pub(crate) fn hardened_test_stage_root() -> crate::Result<PathBuf> {
+    stage_root()
 }
 
 /// Refuse an anchor that is a volume root, the user profile (or an ancestor of

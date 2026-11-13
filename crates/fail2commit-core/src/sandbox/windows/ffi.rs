@@ -167,7 +167,7 @@ fn local_free<T>(p: *mut T) {
 }
 
 #[allow(unsafe_code)]
-fn sid_to_string(sid: PSID) -> crate::Result<String> {
+pub(crate) fn sid_to_string(sid: PSID) -> crate::Result<String> {
     let mut out: *mut u16 = std::ptr::null_mut();
     // SAFETY: `sid` is a valid SID owned by the caller; `out` receives a
     // LocalAlloc'd NUL-terminated string freed below.
@@ -194,6 +194,7 @@ pub(super) fn sid_text(sid: PSID) -> crate::Result<String> {
 /// A freshly created, uniquely named AppContainer profile. Deleted on drop.
 pub(super) struct Profile {
     name: Vec<u16>,
+    name_text: String,
     sid: PSID,
     pub(super) sid_string: String,
 }
@@ -237,6 +238,7 @@ impl Profile {
         }
         let mut profile = Profile {
             name,
+            name_text: name_s.to_owned(),
             sid,
             sid_string: String::new(),
         };
@@ -247,6 +249,27 @@ impl Profile {
     pub(super) fn sid(&self) -> PSID {
         self.sid
     }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name_text
+    }
+
+    #[allow(unsafe_code)]
+    pub(super) fn remove(mut self) -> crate::Result<()> {
+        // SAFETY: name is NUL-terminated and this owns the profile SID.
+        let hr = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
+        if hr != 0 && hr as u32 != 0x8007_0002 {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "DeleteAppContainerProfile({}) failed: HRESULT 0x{:08X}",
+                self.name_text, hr as u32
+            )));
+        }
+        if !self.sid.is_null() {
+            unsafe { FreeSid(self.sid) };
+            self.sid = std::ptr::null_mut();
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Profile {
@@ -256,13 +279,16 @@ impl Drop for Profile {
         // CreateAppContainerProfile (FreeSid ownership) and is freed once.
         unsafe {
             DeleteAppContainerProfile(self.name.as_ptr());
-            FreeSid(self.sid);
+            if !self.sid.is_null() {
+                FreeSid(self.sid);
+                self.sid = std::ptr::null_mut();
+            }
         }
     }
 }
 
 /// Every profile this backend creates starts with this (SPEC-014 section 6).
-pub(super) const PROFILE_PREFIX: &str = "fail2commit.sbx.";
+pub(crate) const PROFILE_PREFIX: &str = "fail2commit.sbx.";
 
 /// Delete a leftover profile by name. A profile that no longer exists is
 /// success (HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) and S_OK alike).
@@ -1476,10 +1502,10 @@ pub(super) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
 }
 
 /// A SID owned through `LocalFree`, for SIDs parsed back from a state file.
-pub(super) struct OwnedSid(PSID);
+pub(crate) struct OwnedSid(PSID);
 
 impl OwnedSid {
-    pub(super) fn as_psid(&self) -> PSID {
+    pub(crate) fn as_psid(&self) -> PSID {
         self.0
     }
 }
@@ -1495,7 +1521,7 @@ impl Drop for OwnedSid {
 
 /// Parse a string SID (`S-1-15-2-...`).
 #[allow(unsafe_code)]
-pub(super) fn sid_from_string(text: &str) -> crate::Result<OwnedSid> {
+pub(crate) fn sid_from_string(text: &str) -> crate::Result<OwnedSid> {
     let text_w = wide(OsStr::new(text));
     let mut sid: PSID = std::ptr::null_mut();
     // SAFETY: NUL-terminated input; `sid` is a LocalAlloc'd SID owned by the
