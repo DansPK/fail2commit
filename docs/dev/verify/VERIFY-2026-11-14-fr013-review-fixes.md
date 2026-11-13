@@ -48,3 +48,20 @@ Two focused fixes were committed after the original review commit `c30128bd43dd7
 - **Linux window behavior:** not applicable to the Windows native progress-window implementation; native terminal PTY behavior was observed on the exact `40c512e` binary above.
 
 Exact-code review regressions and Linux PTY flows pass. Windows native GUI and current-source Windows package flows remain pending the owner unlocking the reserved guest; no host runtime sandbox tests were run.
+
+## Sol r3 follow-up: monotonic pip steps
+
+**Fix commit:** `7b775d10c6cd2d5ec74765d1ae12a1833bd1e403` (based on the review snapshot `1991f1fca09ce346e0027d659c52adb1a6cf0098`). Candidate fetch and verification messages now stay in the already-active `Resolve` step, with `done=0`; pip enters `DownloadVerify` only after it has fixed the final report and publishes the selected wheel total once. No candidate is represented as completed work in the final plan, and the frozen step ordering remains unchanged.
+
+The backtracking integration regression now records the complete event stream. It asserts every step is monotonic, candidate activity is associated with `Resolve` and always has zero completion, rejected beta 2.0 is visible, the final `DownloadVerify` total and immediate completion are exactly 3/3, and resolver completion is separate. The result-helper captured-pipe EOF regression remains intact.
+
+### Exact checks on `7b775d10c6cd2d5ec74765d1ae12a1833bd1e403`
+
+- `cargo fmt --all -- --check` — exit 0.
+- `cargo test -p fail2commit --test pip_install backtracked_candidate_activity_does_not_count_as_final_plan_completion -- --nocapture` — exit 0, 1 passed (actual pip resolver backtracking fixture).
+- `cargo test -p fail2commit --bin fail2commit result_helper_does_not_hold_captured_parent_pipes_open -- --nocapture` — exit 0, 1 passed (captured parent stdout reaches EOF while the result helper remains alive).
+- `cargo test -p fail2commit-core progress_tests -- --nocapture` — exit 0, 6 passed.
+- `git diff --check` — exit 0.
+- One overlapping cargo invocation initially failed to link because it attempted to overwrite the integration-test executable while the first test was still running (Windows linker reported `Permission denied`); after the first process completed, the focused regression was rerun sequentially and passed. No source change was needed for that transient collision.
+
+Windows native GUI and current-source Windows npm/pip runtime gates remain pending the interactive Win11 guest, as recorded above. No broad build or new VM runtime pass was attempted for this narrowly scoped source fix.
