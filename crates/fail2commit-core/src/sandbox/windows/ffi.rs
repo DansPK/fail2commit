@@ -60,6 +60,7 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, CreatePipe, PIPE_NOWAIT, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE,
 };
+use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
     GetProcessMitigationPolicy, InitializeProcThreadAttributeList, OpenProcessToken,
@@ -70,6 +71,7 @@ use windows_sys::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
+use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
 };
@@ -911,6 +913,54 @@ pub(super) fn spawn_suspended(
     capabilities: &[PSID],
     stdio: [HANDLE; 3],
 ) -> crate::Result<Spawned> {
+    spawn_suspended_with_lpac(
+        program,
+        cmdline,
+        env_block,
+        cwd,
+        sid,
+        capabilities,
+        stdio,
+        false,
+    )
+}
+
+/// Create the same restricted child with the LPAC all-application-packages
+/// policy applied. Callers must still verify `TokenIsLessPrivilegedAppContainer`
+/// before resuming it and must configure network filtering before package code.
+#[allow(dead_code)]
+pub(super) fn spawn_lpac_suspended(
+    program: &Path,
+    cmdline: &mut [u16],
+    env_block: &[u16],
+    cwd: &Path,
+    sid: PSID,
+    capabilities: &[PSID],
+    stdio: [HANDLE; 3],
+) -> crate::Result<Spawned> {
+    spawn_suspended_with_lpac(
+        program,
+        cmdline,
+        env_block,
+        cwd,
+        sid,
+        capabilities,
+        stdio,
+        true,
+    )
+}
+
+#[allow(unsafe_code)]
+fn spawn_suspended_with_lpac(
+    program: &Path,
+    cmdline: &mut [u16],
+    env_block: &[u16],
+    cwd: &Path,
+    sid: PSID,
+    capabilities: &[PSID],
+    stdio: [HANDLE; 3],
+    lpac: bool,
+) -> crate::Result<Spawned> {
     let program_w = wide(program.as_os_str());
     let cwd_w = wide(cwd.as_os_str());
     let mut cap_list: Vec<SID_AND_ATTRIBUTES> = capabilities
@@ -935,12 +985,16 @@ pub(super) fn spawn_suspended(
     let mut size = 0usize;
     // SAFETY: sizing call with a null list is documented to fail and set
     // `size`.
-    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 3, 0, &mut size) };
+    let attribute_count = if lpac { 4 } else { 3 };
+    // SAFETY: sizing call with a null list is documented to fail and set `size`.
+    unsafe {
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), attribute_count, 0, &mut size)
+    };
     // usize-aligned backing storage for the opaque attribute list.
     let mut buf = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
     let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
     // SAFETY: `buf` is at least `size` bytes and outlives the list.
-    if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &mut size) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, attribute_count, 0, &mut size) } == 0 {
         return Err(unavailable("InitializeProcThreadAttributeList"));
     }
     struct ListGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -982,6 +1036,16 @@ pub(super) fn spawn_suspended(
                 std::ptr::null_mut(),
                 std::ptr::null(),
             ) != 0
+            && (!lpac
+                || UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
+                    (&PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT as *const u32).cast(),
+                    std::mem::size_of::<u32>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                ) != 0)
     };
     if !ok {
         return Err(unavailable("UpdateProcThreadAttribute"));

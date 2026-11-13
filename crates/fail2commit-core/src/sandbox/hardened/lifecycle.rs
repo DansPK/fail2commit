@@ -1395,6 +1395,28 @@ mod windows {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            match crate::sandbox::hardened::service::launch_recovery_pending() {
+                Ok(false) => {}
+                Ok(true) => {
+                    unsafe {
+                        CloseServiceHandle(svc);
+                        CloseServiceHandle(manager);
+                    }
+                    return Err(crate::Error::isolation_unavailable(
+                        "an unresolved active launch marker prevents account and profile removal",
+                    ));
+                }
+                Err(error) => {
+                    unsafe {
+                        CloseServiceHandle(svc);
+                        CloseServiceHandle(manager);
+                    }
+                    return Err(crate::Error::integrity(format!(
+                        "active launch state cannot be validated; uninstall retained the account: {}",
+                        error.message
+                    )));
+                }
+            }
             if unsafe { DeleteService(svc) } == 0 {
                 let e = std::io::Error::last_os_error();
                 unsafe {

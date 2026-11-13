@@ -34,7 +34,6 @@ struct Response {
 pub(super) fn run_windows(
     job: &crate::isolation::JobSpec,
 ) -> crate::Result<crate::isolation::JobOutcome> {
-    use std::io::{BufRead, BufReader, Write};
     let state = super::lifecycle::installed_state()?;
     let installer_sid = state
         .installer_sid
@@ -43,6 +42,17 @@ pub(super) fn run_windows(
     let sandbox_sid = state.sandbox_sid.as_deref().ok_or_else(|| {
         crate::Error::integrity("Windows install state has no sandbox account SID")
     })?;
+    let pipe_name = format!(r"\\.\pipe\fail2commit-hardened-{installer_sid}");
+    let status = service_request(
+        &pipe_name,
+        &Request {
+            op: "STATUS".into(),
+            job_dir: None,
+        },
+    )?;
+    if !status.ok {
+        return Err(crate::Error::isolation_unavailable(status.detail));
+    }
     let paths = crate::paths::TrustedPaths::resolve()?;
     crate::fsutil::ensure_private_dir(&paths.cache_dir)?;
     crate::sandbox::windows::sweep_hardened_job_state(&paths.cache_dir)?;
@@ -53,34 +63,16 @@ pub(super) fn run_windows(
     let encoded = super::protocol::encode_job(job)?;
     std::fs::write(&jobfile, encoded)?;
     let job_dir = temp.path().to_string_lossy().into_owned();
-    let request = serde_json::to_vec(&Request {
+    let request = Request {
         op: "LAUNCH".into(),
         job_dir: Some(job_dir),
-    })
-    .map_err(|e| crate::Error::internal(format!("request serialization failed: {e}")))?;
-    let pipe_name = format!(r"\\.\pipe\fail2commit-hardened-{installer_sid}");
-    let mut pipe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe_name)
-        .map_err(|e| {
-            crate::Error::isolation_unavailable(format!("open hardened service pipe: {e}"))
-        })?;
+    };
+    let mut pipe = open_service_pipe(&pipe_name)?;
     let result = crate::sandbox::windows::with_hardened_job_grants(job, sandbox_sid, || {
-        pipe.write_all(&request)?;
-        pipe.write_all(b"\n")?;
-        pipe.flush()?;
-        let mut reader = BufReader::new(&mut pipe);
-        let mut line = Vec::new();
-        reader
-            .by_ref()
-            .take(MAX_REQUEST as u64)
-            .read_until(b'\n', &mut line)?;
-        let reply: Response = decode_response(&line)?;
+        let reply = service_request_on_pipe(&mut pipe, &request)?;
         if !reply.ok {
             return Err(crate::Error::isolation_unavailable(reply.detail));
         }
-        drop(reader);
         let outcome_path = temp.path().join("outcome.json");
         let metadata = std::fs::symlink_metadata(&outcome_path)?;
         if !metadata.is_file()
@@ -94,6 +86,39 @@ pub(super) fn run_windows(
         super::protocol::decode_outcome(&std::fs::read(outcome_path)?)
     });
     result
+}
+
+#[cfg(windows)]
+fn open_service_pipe(name: &str) -> crate::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(name)
+        .map_err(|e| {
+            crate::Error::isolation_unavailable(format!("open hardened service pipe: {e}"))
+        })
+}
+
+#[cfg(windows)]
+fn service_request(name: &str, request: &Request) -> crate::Result<Response> {
+    let mut pipe = open_service_pipe(name)?;
+    service_request_on_pipe(&mut pipe, request)
+}
+
+#[cfg(windows)]
+fn service_request_on_pipe(pipe: &mut std::fs::File, request: &Request) -> crate::Result<Response> {
+    let encoded = serde_json::to_vec(request)
+        .map_err(|e| crate::Error::internal(format!("request serialization failed: {e}")))?;
+    pipe.write_all(&encoded)?;
+    pipe.write_all(b"\n")?;
+    pipe.flush()?;
+    let mut reader = BufReader::new(pipe);
+    let mut line = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_REQUEST as u64)
+        .read_until(b'\n', &mut line)?;
+    decode_response(&line)
 }
 
 #[cfg(any(target_os = "linux", windows, test))]
@@ -523,6 +548,246 @@ static SERVICE_STOP_REQUESTED: std::sync::atomic::AtomicBool =
 static LAUNCHER_CONTAINMENT_FAILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// A durable fail-closed latch for a launch whose process/profile cleanup may
+/// have been interrupted by service termination.  The marker is intentionally
+/// not auto-recovered: startup cannot prove that no descendant or profile use
+/// remains without the recorded process identity and platform recovery path.
+#[cfg(any(windows, test))]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveLaunchMarker {
+    version: u32,
+    launch_id: String,
+    sandbox_sid: String,
+    snapshot_dir: String,
+    pid: Option<u32>,
+    creation_time_100ns: Option<u64>,
+}
+
+#[cfg(any(windows, test))]
+const ACTIVE_LAUNCH_MARKER_MAX: usize = 4096;
+
+#[cfg(any(windows, test))]
+fn decode_active_launch_marker(bytes: &[u8]) -> Result<ActiveLaunchMarker, &'static str> {
+    if bytes.is_empty() || bytes.len() > ACTIVE_LAUNCH_MARKER_MAX {
+        return Err("active launch marker has invalid size");
+    }
+    let marker: ActiveLaunchMarker =
+        serde_json::from_slice(bytes).map_err(|_| "active launch marker is malformed")?;
+    if marker.version != 1
+        || marker.launch_id.len() != 64
+        || !marker.launch_id.bytes().all(|b| b.is_ascii_hexdigit())
+        || !marker.sandbox_sid.starts_with("S-1-")
+        || marker.snapshot_dir.is_empty()
+        || marker.pid.is_some() != marker.creation_time_100ns.is_some()
+        || marker.pid == Some(0)
+    {
+        return Err("active launch marker fields are invalid");
+    }
+    Ok(marker)
+}
+
+#[cfg(windows)]
+fn active_launch_marker_path() -> crate::Result<std::path::PathBuf> {
+    Ok(super::machine_state_path()?
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("install state has no parent"))?
+        .join("active-launch.json"))
+}
+
+#[cfg(any(windows, test))]
+fn may_sweep_after_marker_check<T>(check: &std::result::Result<bool, T>) -> bool {
+    matches!(check, Ok(false))
+}
+
+#[cfg(windows)]
+fn active_launch_pending() -> crate::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    let path = active_launch_marker_path()?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let file = open_windows_object(
+        &path,
+        false,
+        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+    )?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        || metadata.len() as usize > ACTIVE_LAUNCH_MARKER_MAX
+        || crate::ipc::winsec::owner_sid(&file)? != "S-1-5-18"
+    {
+        return Err(crate::Error::integrity(
+            "active launch marker failed ownership or object checks",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    (&file)
+        .take((ACTIVE_LAUNCH_MARKER_MAX + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    decode_active_launch_marker(&bytes).map_err(crate::Error::integrity)?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+pub(super) fn launch_recovery_pending() -> crate::Result<bool> {
+    active_launch_pending()
+}
+
+#[cfg(windows)]
+struct ActiveLaunchGuard {
+    path: std::path::PathBuf,
+    launch_id: String,
+    armed: bool,
+}
+
+#[cfg(windows)]
+impl ActiveLaunchGuard {
+    fn create(sandbox_sid: &str, snapshot_dir: &Path) -> crate::Result<Self> {
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random)
+            .map_err(|_| crate::Error::internal("cannot generate launch marker identity"))?;
+        let launch_id = hex::encode(random);
+        random.fill(0);
+        let marker = ActiveLaunchMarker {
+            version: 1,
+            launch_id: launch_id.clone(),
+            sandbox_sid: sandbox_sid.to_owned(),
+            snapshot_dir: snapshot_dir.to_string_lossy().into_owned(),
+            pid: None,
+            creation_time_100ns: None,
+        };
+        let path = active_launch_marker_path()?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                crate::Error::isolation_unavailable(format!(
+                    "cannot create active launch refusal marker: {e}"
+                ))
+            })?;
+        serde_json::to_writer(&mut file, &marker)
+            .map_err(|_| crate::Error::internal("cannot encode active launch marker"))?;
+        file.sync_all()?;
+        set_system_owner(&path)?;
+        let check = open_windows_object(
+            &path,
+            false,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+        )?;
+        if crate::ipc::winsec::owner_sid(&check)? != "S-1-5-18" {
+            return Err(crate::Error::integrity(
+                "active launch marker is not SYSTEM-owned",
+            ));
+        }
+        Ok(Self {
+            path,
+            launch_id,
+            armed: true,
+        })
+    }
+
+    #[allow(unsafe_code)]
+    fn record_process(&mut self, pid: u32, creation_time_100ns: u64) -> crate::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+        let file = open_windows_object(
+            &self.path,
+            false,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+        )?;
+        let mut bytes = Vec::with_capacity(ACTIVE_LAUNCH_MARKER_MAX);
+        (&file)
+            .take((ACTIVE_LAUNCH_MARKER_MAX + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        let mut marker = decode_active_launch_marker(&bytes).map_err(crate::Error::integrity)?;
+        if marker.launch_id != self.launch_id || marker.pid.is_some() {
+            return Err(crate::Error::integrity(
+                "active launch marker identity changed",
+            ));
+        }
+        drop(file);
+        marker.pid = Some(pid);
+        marker.creation_time_100ns = Some(creation_time_100ns);
+        let temp_path = self
+            .path
+            .with_file_name(format!("active-launch-{}.tmp", self.launch_id));
+        let mut temp = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        serde_json::to_writer(&mut temp, &marker)
+            .map_err(|_| crate::Error::internal("cannot encode active launch marker"))?;
+        temp.sync_all()?;
+        drop(temp);
+        set_system_owner(&temp_path)?;
+        let target_w: Vec<u16> = self.path.as_os_str().encode_wide().chain([0]).collect();
+        let temp_w: Vec<u16> = temp_path.as_os_str().encode_wide().chain([0]).collect();
+        if unsafe {
+            ReplaceFileW(
+                target_w.as_ptr(),
+                temp_w.as_ptr(),
+                std::ptr::null(),
+                1,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(crate::Error::isolation_unavailable(format!(
+                "cannot persist launcher process identity (Win32 error {code})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Keep an interrupted launch locked. The next service instance refuses
+    /// all launches and snapshot sweeps when it finds this marker.
+    fn retain(&mut self) {
+        self.armed = false;
+    }
+
+    fn clear(&mut self) -> crate::Result<()> {
+        let file = open_windows_object(
+            &self.path,
+            false,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+        )?;
+        let mut bytes = Vec::with_capacity(ACTIVE_LAUNCH_MARKER_MAX);
+        (&file)
+            .take((ACTIVE_LAUNCH_MARKER_MAX + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        let marker = decode_active_launch_marker(&bytes).map_err(crate::Error::integrity)?;
+        if marker.launch_id != self.launch_id || crate::ipc::winsec::owner_sid(&file)? != "S-1-5-18"
+        {
+            return Err(crate::Error::integrity(
+                "active launch marker identity changed",
+            ));
+        }
+        drop(file);
+        std::fs::remove_file(&self.path)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ActiveLaunchGuard {
+    fn drop(&mut self) {
+        // Never clear on unwind. Only the normal confirmed cleanup path calls
+        // clear(); all other exits deliberately leave the durable refusal.
+        let _ = self.armed;
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub(crate) fn service_running() -> bool {
@@ -806,7 +1071,14 @@ fn service_loop_windows() -> crate::Result<()> {
         .parent()
         .ok_or_else(|| crate::Error::integrity("install state has no parent"))?
         .join("jobs");
-    sweep_stale_snapshots(&jobs)?;
+    let marker_check = active_launch_pending();
+    if may_sweep_after_marker_check(&marker_check) {
+        sweep_stale_snapshots(&jobs)?;
+    } else {
+        // Never delete snapshots or grants until a prior process has been
+        // positively reconciled. Invalid markers also remain locked.
+        LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+    }
     let name = format!(r"\\.\pipe\fail2commit-hardened-{sid_text}");
     let wide: Vec<u16> = OsStr::new(&name).encode_wide().chain([0]).collect();
     let security = PipeSecurity::new(&expected)?;
@@ -893,6 +1165,15 @@ fn service_loop_windows() -> crate::Result<()> {
             }
         };
         let reply = match request.op.as_str() {
+            "STATUS"
+                if request.job_dir.is_none()
+                    && LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst) =>
+            {
+                response(
+                    false,
+                    "an unresolved active launch marker blocks cleanup and launch",
+                )
+            }
             "STATUS" if request.job_dir.is_none() => response(
                 true,
                 "service authenticated peer; launcher and platform controls are not verified",
@@ -1257,20 +1538,22 @@ fn set_system_owner(path: &Path) -> crate::Result<()> {
 fn run_snapshot_as_sandbox(
     jobfile: &Path,
     client_pipe: windows_sys::Win32::Foundation::HANDLE,
+    sandbox_sid: &str,
 ) -> crate::Result<u32> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::Foundation::{
-        GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+        GetLastError, SetHandleInformation, FILETIME, HANDLE, HANDLE_FLAG_INHERIT,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::Threading::{
-        DeleteProcThreadAttributeList, GetExitCodeProcess, InitializeProcThreadAttributeList,
-        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
-        CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTUPINFOEXW,
+        DeleteProcThreadAttributeList, GetExitCodeProcess, GetProcessTimes,
+        InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
+        WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+        EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTUPINFOEXW,
     };
 
     #[repr(C)]
@@ -1394,17 +1677,44 @@ fn run_snapshot_as_sandbox(
             "cannot exclude watchdog writer from launcher inheritance (Win32 error {code})"
         )));
     }
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    let job_raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job_raw.is_null() {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "CreateJobObjectW failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let _job_handle = unsafe { OwnedHandle::from_raw_handle(job_raw as RawHandle) };
+    let mut job_limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    job_limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job_raw,
+            JobObjectExtendedLimitInformation,
+            (&job_limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        return Err(crate::Error::isolation_unavailable(
+            "cannot configure kill-on-close launcher job",
+        ));
+    }
     let handle_list = [read_raw];
     let mut needed = 0usize;
     // SAFETY: sizing call to obtain the required attribute-list buffer size.
-    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut needed) };
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut needed) };
     if needed == 0 || needed > 64 * 1024 {
         return Err(crate::Error::internal("cannot size process attribute list"));
     }
     let mut attr_buf = vec![0usize; needed.div_ceil(std::mem::size_of::<usize>())];
     let attr = attr_buf.as_mut_ptr().cast();
     // SAFETY: attr_buf is aligned and sized as reported by the sizing call.
-    if unsafe { InitializeProcThreadAttributeList(attr, 1, 0, &mut needed) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(attr, 2, 0, &mut needed) } == 0 {
         return Err(crate::Error::internal(
             "InitializeProcThreadAttributeList failed",
         ));
@@ -1431,6 +1741,24 @@ fn run_snapshot_as_sandbox(
     {
         return Err(crate::Error::internal(
             "cannot restrict inherited launcher handles",
+        ));
+    }
+    let job_list = [job_raw];
+    // SAFETY: the per-launch kill-on-close job remains owned through process creation.
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attr,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            job_list.as_ptr().cast(),
+            std::mem::size_of_val(&job_list),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        return Err(crate::Error::isolation_unavailable(
+            "cannot bind launcher to kill-on-close containment job",
         ));
     }
     let exe = std::env::current_exe()?;
@@ -1491,6 +1819,7 @@ fn run_snapshot_as_sandbox(
     }
     let mut retained_process = None;
     let mut containment_confirmed = true;
+    let mut active_marker = None;
     let launch_result = (|| {
         let mut environment = std::ptr::null_mut();
         // SAFETY: environment is a writable output pointer for the user token.
@@ -1511,7 +1840,14 @@ fn run_snapshot_as_sandbox(
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         startup.lpAttributeList = attr.cast();
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+        let flags = EXTENDED_STARTUPINFO_PRESENT
+            | CREATE_UNICODE_ENVIRONMENT
+            | CREATE_NO_WINDOW
+            | CREATE_SUSPENDED;
+        let snapshot_dir = jobfile
+            .parent()
+            .ok_or_else(|| crate::Error::integrity("snapshot job has no directory"))?;
+        active_marker = Some(ActiveLaunchGuard::create(sandbox_sid, snapshot_dir)?);
         // SAFETY: token is a primary batch-logon token, its profile/environment
         // are loaded, and the handle list contains only the watchdog read end.
         if unsafe {
@@ -1533,6 +1869,11 @@ fn run_snapshot_as_sandbox(
         } == 0
         {
             let code = unsafe { GetLastError() };
+            if let Some(marker) = active_marker.as_mut() {
+                if marker.clear().is_err() {
+                    LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+                }
+            }
             return Err(crate::Error::isolation_unavailable(format!(
                 "CreateProcessAsUserW failed with Win32 error {code}"
             )));
@@ -1543,6 +1884,83 @@ fn run_snapshot_as_sandbox(
             .as_ref()
             .expect("launcher process handle is present");
         let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as RawHandle) };
+        let mut created = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exited = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        if unsafe {
+            GetProcessTimes(
+                process.as_raw_handle() as HANDLE,
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        } == 0
+        {
+            let code = unsafe { GetLastError() };
+            if let Err(error) =
+                terminate_launcher_and_confirm(process.as_raw_handle() as HANDLE, 0xE004)
+            {
+                containment_confirmed = false;
+                return Err(crate::Error::isolation_unavailable(format!(
+                    "GetProcessTimes failed with Win32 error {code}; containment is unconfirmed: {error}"
+                )));
+            }
+            active_marker.as_mut().expect("marker created").clear()?;
+            return Err(crate::Error::isolation_unavailable(format!(
+                "GetProcessTimes failed with Win32 error {code}; launcher termination was confirmed"
+            )));
+        }
+        let creation_time_100ns =
+            (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        if let Err(error) = active_marker
+            .as_mut()
+            .expect("marker created")
+            .record_process(pi.dwProcessId, creation_time_100ns)
+        {
+            if let Err(termination) =
+                terminate_launcher_and_confirm(process.as_raw_handle() as HANDLE, 0xE005)
+            {
+                containment_confirmed = false;
+                return Err(crate::Error::isolation_unavailable(format!(
+                    "cannot persist launcher identity ({error}); containment is unconfirmed: {termination}"
+                )));
+            }
+            active_marker.as_mut().expect("marker created").clear()?;
+            return Err(crate::Error::isolation_unavailable(format!(
+                "cannot persist launcher identity ({error}); launcher termination was confirmed"
+            )));
+        }
+        // The process is assigned to the kill-on-close job while suspended;
+        // resume only after the durable PID and creation time are stored.
+        if unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) } == u32::MAX {
+            let code = unsafe { GetLastError() };
+            if let Err(termination) =
+                terminate_launcher_and_confirm(process.as_raw_handle() as HANDLE, 0xE006)
+            {
+                containment_confirmed = false;
+                return Err(crate::Error::isolation_unavailable(format!(
+                    "ResumeThread failed with Win32 error {code}; containment is unconfirmed: {termination}"
+                )));
+            }
+            active_marker.as_mut().expect("marker created").clear()?;
+            return Err(crate::Error::isolation_unavailable(format!(
+                "ResumeThread failed with Win32 error {code}; launcher termination was confirmed"
+            )));
+        }
         drop(thread);
         let mut watchdog = Some(write_end);
         let mut disconnected_at = None;
@@ -1622,15 +2040,25 @@ fn run_snapshot_as_sandbox(
             std::mem::forget(process);
         }
         std::mem::forget(_token);
+        if let Some(marker) = active_marker.as_mut() {
+            marker.retain();
+        }
         return launch_result;
     }
     // SAFETY: the launcher process was observed signaled or forced termination
     // was confirmed before unloading the sandbox account profile.
     if unsafe { UnloadUserProfile(token_raw, profile.profile) } == 0 {
         let code = unsafe { GetLastError() };
+        LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+        if let Some(marker) = active_marker.as_mut() {
+            marker.retain();
+        }
         return Err(crate::Error::isolation_unavailable(format!(
             "UnloadUserProfile failed with Win32 error {code}"
         )));
+    }
+    if let Some(marker) = active_marker.as_mut() {
+        marker.clear()?;
     }
     drop(username);
     drop(password_w);
@@ -1744,7 +2172,7 @@ fn launch_windows_request(
     let dir = open_user_job_dir(job_dir, peer_sid)?;
     let (snapshot_dir, _snapshot_handle) = snapshot_job(&dir, peer_sid, sandbox_sid)?;
     let jobfile = snapshot_dir.path().join("job.json");
-    let exit = run_snapshot_as_sandbox(&jobfile, client_pipe)?;
+    let exit = run_snapshot_as_sandbox(&jobfile, client_pipe, sandbox_sid)?;
     if exit != 0 {
         return Err(crate::Error::isolation_unavailable(format!(
             "hardened launcher exited with code {exit}"
@@ -1866,6 +2294,36 @@ mod tests {
         assert!(!response.ok);
         assert!(decode_response(b"{\"ok\":true}").is_err());
         assert!(decode_response(&vec![b'x'; MAX_REQUEST]).is_err());
+    }
+
+    fn marker(pid: Option<u32>, creation_time_100ns: Option<u64>) -> ActiveLaunchMarker {
+        ActiveLaunchMarker {
+            version: 1,
+            launch_id: "a".repeat(64),
+            sandbox_sid: "S-1-5-21-1-2-3-1001".into(),
+            snapshot_dir: r"C:\ProgramData\f2c\jobs\launch-1".into(),
+            pid,
+            creation_time_100ns,
+        }
+    }
+
+    #[test]
+    fn active_launch_marker_rejects_corrupt_partial_and_unpaired_identity() {
+        let valid = serde_json::to_vec(&marker(None, None)).unwrap();
+        assert!(decode_active_launch_marker(&valid).is_ok());
+        assert!(decode_active_launch_marker(b"{").is_err());
+        assert!(decode_active_launch_marker(&vec![b'x'; ACTIVE_LAUNCH_MARKER_MAX + 1]).is_err());
+        let partial = serde_json::to_vec(&marker(Some(42), None)).unwrap();
+        assert!(decode_active_launch_marker(&partial).is_err());
+        let invalid = serde_json::to_vec(&marker(Some(0), Some(10))).unwrap();
+        assert!(decode_active_launch_marker(&invalid).is_err());
+    }
+
+    #[test]
+    fn restart_sweeps_only_when_persistent_marker_is_proven_absent() {
+        assert!(may_sweep_after_marker_check::<()>(&Ok(false)));
+        assert!(!may_sweep_after_marker_check::<()>(&Ok(true)));
+        assert!(!may_sweep_after_marker_check::<()>(&Err(())));
     }
 
     #[test]
