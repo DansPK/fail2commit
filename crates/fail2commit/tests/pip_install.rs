@@ -161,21 +161,34 @@ fn backtracked_candidate_activity_does_not_count_as_final_plan_completion() {
         "unresolved candidates must not count as completed plan items"
     );
     let mut active_step = None;
-    for event in &events[..plan_step] {
+    let mut step_sequence = Vec::new();
+    for event in events.iter() {
         match event {
-            ProgressEvent::Step(step, total) => active_step = Some((*step, *total)),
-            ProgressEvent::Advance(done, _) if active_step == Some((Step::DownloadVerify, 0)) => {
-                assert_eq!(
-                    *done, 0,
-                    "an unknown-total candidate phase cannot claim package completion"
-                );
+            ProgressEvent::Step(step, total) => {
+                active_step = Some((*step, *total));
+                step_sequence.push(*step);
+            }
+            ProgressEvent::Advance(done, current) if current.contains("candidate") => {
+                assert_eq!(active_step.map(|(step, _)| step), Some(Step::Resolve));
+                assert_eq!(*done, 0, "unresolved candidates never count as complete");
             }
             _ => {}
         }
     }
+    assert!(
+        step_sequence.windows(2).all(|pair| pair[0] <= pair[1]),
+        "progress steps must be monotonic: {step_sequence:?}"
+    );
     assert!(events[..plan_step].windows(2).any(|pair| {
         matches!(pair, [ProgressEvent::Step(Step::Resolve, 1), ProgressEvent::Advance(1, current)] if current == "dependency plan resolved")
     }));
+    assert!(
+        matches!(
+            events.get(plan_step + 1),
+            Some(ProgressEvent::Advance(3, current)) if current.is_empty()
+        ),
+        "DownloadVerify completion counts only the final three-wheel plan"
+    );
     assert!(
         events[plan_step + 1..]
             .iter()

@@ -9,7 +9,7 @@
 use super::index::{IndexClient, IndexFile};
 use super::interp::normalize;
 use super::wheel::{self, WheelError};
-use crate::progress::{Progress, Step};
+use crate::progress::Progress;
 use crate::{Error, Finding, FindingAction, FindingKind};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -54,7 +54,6 @@ pub struct Shared {
     pub failure: Mutex<Option<Error>>,
     pub requests: Mutex<usize>,
     progress: Mutex<Option<Arc<dyn Progress>>>,
-    download_step_started: AtomicBool,
 }
 
 pub struct Proxy {
@@ -86,7 +85,6 @@ impl Proxy {
             failure: Mutex::new(None),
             requests: Mutex::new(0),
             progress: Mutex::new(None),
-            download_step_started: AtomicBool::new(false),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (s2, stop2) = (shared.clone(), stop.clone());
@@ -175,7 +173,6 @@ impl Shared {
         std::fs::create_dir_all(&dir)?;
         let dest = dir.join(&file.filename);
         let progress = self.progress.lock().unwrap().clone();
-        ensure_download_step(progress.as_deref(), &self.download_step_started);
         if let Some(p) = &progress {
             p.advance(
                 0,
@@ -283,14 +280,6 @@ impl Shared {
         html.push_str("</body></html>\n");
         self.projects.lock().unwrap().insert(name, stats);
         Ok(html)
-    }
-}
-
-fn ensure_download_step(progress: Option<&dyn Progress>, started: &AtomicBool) {
-    if let Some(p) = progress {
-        if !started.swap(true, Ordering::SeqCst) {
-            p.step(Step::DownloadVerify, 0);
-        }
     }
 }
 
@@ -459,10 +448,7 @@ mod progress_tests {
     #[test]
     fn proxy_reports_candidate_activity_without_counting_unresolved_plan_items() {
         let p = Recorder::default();
-        let started = AtomicBool::new(false);
-        ensure_download_step(Some(&p), &started);
-        ensure_download_step(Some(&p), &started);
-        assert_eq!(&*p.steps.lock().unwrap(), &[(Step::DownloadVerify, 0)]);
+        assert!(p.steps.lock().unwrap().is_empty());
 
         let failed: crate::Result<Verified> = Err(Error::integrity("invalid hash"));
         note_verified_candidate(Some(&p), &failed);
