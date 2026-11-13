@@ -11,6 +11,24 @@ Frozen APIs stay frozen: `isolation::{JobSpec, JobOutcome, SandboxBackend}`,
 mode is a new backend behind the same contract; `run_job` still probes, runs and
 exports, and backends still never export.
 
+## Windows launch API correction (CR-024, 2026-11-14)
+
+Preserve `SeDenyInteractiveLogonRight`. The references below to
+`CreateProcessWithLogonW(LOGON_WITH_PROFILE)` are superseded: Microsoft documents
+that this API requires local interactive logon and cannot be called by LocalSystem.
+The SYSTEM service must probe a noninteractive `LogonUserW` batch/service token,
+explicit `LoadUserProfileW` and `CreateEnvironmentBlock`, then controlled
+`CreateProcessAsUserW`. Grant only the required noninteractive right to the recorded
+owned SID; rollback and uninstall remove that right symmetrically. Credentials
+never enter arguments, environment or logs and are cleared from temporary memory.
+Profile unloading and handle/environment cleanup are mandatory on all exit paths.
+The Windows 10/11 probe must prove profile and AppContainer creation and all
+existing isolation controls before LAUNCH becomes available; no security fallback.
+This is an implementation candidate until those probes pass, not verified behavior.
+
+References: [launch API](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createprocesswithlogonw),
+[explicit profile loading](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-loaduserprofilew).
+
 ## 1. Selection and fail-closed rules
 
 `settings.sandbox.backend` (`BackendChoice`, already defined, currently unread):
