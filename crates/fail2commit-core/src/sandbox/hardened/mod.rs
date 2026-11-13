@@ -48,10 +48,18 @@ pub fn serve() -> crate::Result<()> {
 
 /// Launcher entry point deliberately refuses until all per-job isolation
 /// controls, grants, and watchdog handling have been wired and probed.
-pub fn launch(_jobfile: &std::path::Path, _watchdog: Option<u64>) -> crate::Result<()> {
-    Err(crate::Error::isolation_unavailable(
-        "hardened launcher controls are not verified; refusing to execute job",
-    ))
+pub fn launch(jobfile: &std::path::Path, watchdog: Option<u64>) -> crate::Result<()> {
+    #[cfg(windows)]
+    {
+        service::launch_hidden(jobfile, watchdog)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (jobfile, watchdog);
+        Err(crate::Error::isolation_unavailable(
+            "hardened launcher controls are not verified; refusing to execute job",
+        ))
+    }
 }
 
 /// Whether the machine-level install marker exists. A malformed marker still
@@ -210,10 +218,18 @@ impl SandboxBackend for HardenedBackend {
         }
     }
 
-    fn run(&self, _job: &JobSpec) -> crate::Result<JobOutcome> {
-        Err(crate::Error::isolation_unavailable(
-            "hardened controls are not verified; refusing to launch",
-        ))
+    fn run(&self, job: &JobSpec) -> crate::Result<JobOutcome> {
+        #[cfg(windows)]
+        {
+            service::run_windows(job)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = job;
+            Err(crate::Error::isolation_unavailable(
+                "hardened controls are not verified; refusing to launch",
+            ))
+        }
     }
 }
 

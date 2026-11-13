@@ -964,7 +964,7 @@ mod windows {
         Ok(out)
     }
 
-    fn set_interactive_logon_denied(deny: bool, sid: &mut [u64]) -> crate::Result<()> {
+    fn set_account_logon_right(add: bool, right_name: &str, sid: &mut [u64]) -> crate::Result<()> {
         let mut attrs = ObjectAttributes {
             length: std::mem::size_of::<ObjectAttributes>() as u32,
             root: std::ptr::null_mut(),
@@ -989,13 +989,13 @@ mod windows {
                 unsafe { LsaNtStatusToWinError(rc) }
             )));
         }
-        let mut right = w(std::ffi::OsStr::new("SeDenyInteractiveLogonRight"));
+        let mut right = w(std::ffi::OsStr::new(right_name));
         let mut us = UnicodeString {
             length: ((right.len() - 1) * 2) as u16,
             maximum_length: (right.len() * 2) as u16,
             buffer: right.as_mut_ptr(),
         };
-        let rc = if deny {
+        let rc = if add {
             unsafe { LsaAddAccountRights(policy, sid.as_mut_ptr().cast(), &mut us, 1) }
         } else {
             unsafe { LsaRemoveAccountRights(policy, sid.as_mut_ptr().cast(), 0, &mut us, 1) }
@@ -1007,7 +1007,7 @@ mod windows {
             // LSA maps an already-absent right/account to these Win32 codes;
             // removal is intentionally idempotent.
             let winerr = unsafe { LsaNtStatusToWinError(rc) };
-            if !deny && (winerr == 2 || winerr == 1313) {
+            if !add && (winerr == 2 || winerr == 1313) {
                 return Ok(());
             }
             return Err(crate::Error::internal(format!(
@@ -1016,6 +1016,14 @@ mod windows {
             )));
         }
         Ok(())
+    }
+
+    fn set_interactive_logon_denied(deny: bool, sid: &mut [u64]) -> crate::Result<()> {
+        set_account_logon_right(deny, "SeDenyInteractiveLogonRight", sid)
+    }
+
+    fn set_batch_logon_allowed(allowed: bool, sid: &mut [u64]) -> crate::Result<()> {
+        set_account_logon_right(allowed, "SeBatchLogonRight", sid)
     }
     fn scm() -> crate::Result<*mut c_void> {
         let h =
@@ -1161,6 +1169,7 @@ mod windows {
                     "failed to set SYSTEM/Administrators state directory ACL",
                 ));
             }
+            std::fs::write(data_dir.join("sandbox.secret"), password.as_bytes())?;
             let state = InstallState {
                 version: 1,
                 installer_uid: 0,
@@ -1179,6 +1188,7 @@ mod windows {
             // Persist the account SID before changing the local security policy:
             // an interrupted install can then remove precisely this right later.
             set_interactive_logon_denied(true, &mut sandbox_sid)?;
+            set_batch_logon_allowed(true, &mut sandbox_sid)?;
             let binary = w(std::ffi::OsStr::new(&format!(
                 "\"{}\" sandbox serve",
                 installed.display()
@@ -1226,6 +1236,12 @@ mod windows {
                 if let Err(clean_error) = right {
                     return Err(crate::Error::internal(format!(
                         "install failed: {}; account-right rollback failed: {}",
+                        e.message, clean_error.message
+                    )));
+                }
+                if let Err(clean_error) = set_batch_logon_allowed(false, &mut sandbox_sid) {
+                    return Err(crate::Error::internal(format!(
+                        "install failed: {}; batch-logon-right rollback failed: {}",
                         e.message, clean_error.message
                     )));
                 }
@@ -1393,6 +1409,7 @@ mod windows {
             }
         }
         set_interactive_logon_denied(false, &mut sandbox_sid)?;
+        set_batch_logon_allowed(false, &mut sandbox_sid)?;
         let current_sid = lookup_account_sid()?.map(|(_, sid)| sid);
         if recorded_sid_matches(Some(recorded_sid), current_sid.as_deref())? {
             let user = w(std::ffi::OsStr::new("f2c-sandbox"));

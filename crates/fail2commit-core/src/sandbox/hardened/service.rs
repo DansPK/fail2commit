@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "linux", windows, test))]
 use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 use std::path::Path;
 
 #[cfg(any(target_os = "linux", windows, test))]
@@ -13,7 +13,7 @@ const MAX_REQUEST: usize = 16 * 1024;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(any(target_os = "linux", windows, test))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request {
     op: String,
@@ -28,6 +28,83 @@ struct Response {
     service_running: bool,
     probe_available: bool,
     detail: String,
+}
+
+#[cfg(windows)]
+pub(super) fn run_windows(
+    job: &crate::isolation::JobSpec,
+) -> crate::Result<crate::isolation::JobOutcome> {
+    use std::io::{BufRead, BufReader, Write};
+    let state = super::lifecycle::installed_state()?;
+    let installer_sid = state
+        .installer_sid
+        .as_deref()
+        .ok_or_else(|| crate::Error::integrity("Windows install state has no installer SID"))?;
+    let sandbox_sid = state.sandbox_sid.as_deref().ok_or_else(|| {
+        crate::Error::integrity("Windows install state has no sandbox account SID")
+    })?;
+    let paths = crate::paths::TrustedPaths::resolve()?;
+    crate::fsutil::ensure_private_dir(&paths.cache_dir)?;
+    crate::sandbox::windows::sweep_hardened_job_state(&paths.cache_dir)?;
+    let temp = tempfile::Builder::new()
+        .prefix("hardened-job-")
+        .tempdir_in(&paths.cache_dir)?;
+    let jobfile = temp.path().join("job.json");
+    let encoded = super::protocol::encode_job(job)?;
+    std::fs::write(&jobfile, encoded)?;
+    let job_dir = temp.path().to_string_lossy().into_owned();
+    let request = serde_json::to_vec(&Request {
+        op: "LAUNCH".into(),
+        job_dir: Some(job_dir),
+    })
+    .map_err(|e| crate::Error::internal(format!("request serialization failed: {e}")))?;
+    let pipe_name = format!(r"\\.\pipe\fail2commit-hardened-{installer_sid}");
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pipe_name)
+        .map_err(|e| {
+            crate::Error::isolation_unavailable(format!("open hardened service pipe: {e}"))
+        })?;
+    let result = crate::sandbox::windows::with_hardened_job_grants(job, sandbox_sid, || {
+        pipe.write_all(&request)?;
+        pipe.write_all(b"\n")?;
+        pipe.flush()?;
+        let mut reader = BufReader::new(&mut pipe);
+        let mut line = Vec::new();
+        reader
+            .by_ref()
+            .take(MAX_REQUEST as u64)
+            .read_until(b'\n', &mut line)?;
+        let reply: Response = decode_response(&line)?;
+        if !reply.ok {
+            return Err(crate::Error::isolation_unavailable(reply.detail));
+        }
+        drop(reader);
+        let outcome_path = temp.path().join("outcome.json");
+        let metadata = std::fs::symlink_metadata(&outcome_path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > super::protocol::MAX_OUTCOME_BYTES as u64
+        {
+            return Err(crate::Error::integrity(
+                "hardened outcome file is unsafe or oversized",
+            ));
+        }
+        super::protocol::decode_outcome(&std::fs::read(outcome_path)?)
+    });
+    result
+}
+
+#[cfg(any(target_os = "linux", windows, test))]
+fn decode_response(line: &[u8]) -> crate::Result<Response> {
+    if line.len() >= MAX_REQUEST || !line.ends_with(b"\n") {
+        return Err(crate::Error::integrity(
+            "hardened service response is incomplete or oversized",
+        ));
+    }
+    serde_json::from_slice(line)
+        .map_err(|e| crate::Error::integrity(format!("invalid hardened service response: {e}")))
 }
 
 #[cfg(any(target_os = "linux", windows, test))]
@@ -677,6 +754,15 @@ fn service_loop_windows() -> crate::Result<()> {
         .ok_or_else(|| crate::Error::integrity("Windows install state has no installer SID"))?;
     let expected = winsec::sid_from_string(sid_text)
         .ok_or_else(|| crate::Error::integrity("Windows installer SID is malformed"))?;
+    let sandbox_sid = state.sandbox_sid.clone().ok_or_else(|| {
+        crate::Error::integrity("Windows install state has no sandbox account SID")
+    })?;
+    let state_path = super::machine_state_path()?;
+    let jobs = state_path
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("install state has no parent"))?
+        .join("jobs");
+    sweep_stale_snapshots(&jobs)?;
     let name = format!(r"\\.\pipe\fail2commit-hardened-{sid_text}");
     let wide: Vec<u16> = OsStr::new(&name).encode_wide().chain([0]).collect();
     let security = PipeSecurity::new(&expected)?;
@@ -770,10 +856,18 @@ fn service_loop_windows() -> crate::Result<()> {
             "LAUNCH" if request.job_dir.is_none() => {
                 response(false, "job_dir is required; job was not started")
             }
-            "LAUNCH" => response(
-                false,
-                "launcher controls are not verified; job was not started",
-            ),
+            "LAUNCH" => match launch_windows_request(
+                raw,
+                request.job_dir.as_deref().unwrap(),
+                &expected,
+                &sandbox_sid,
+            ) {
+                Ok(()) => response(true, "launcher completed; outcome was verified"),
+                Err(_) => response(
+                    false,
+                    "launcher failed or mandatory controls are unavailable; job was not accepted",
+                ),
+            },
             _ => response(false, "unknown or malformed operation"),
         };
         let _ = write_pipe_response(raw, &reply);
@@ -786,9 +880,809 @@ fn windows_peer_allowed(peer: &[u8], expected: &[u8], app_container: bool) -> bo
     !app_container && peer == expected
 }
 
+#[cfg(windows)]
+struct UserJobDir {
+    _handle: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+fn open_windows_object(path: &Path, directory: bool, share: u32) -> crate::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).share_mode(share).custom_flags(
+        FILE_FLAG_OPEN_REPARSE_POINT
+            | if directory {
+                FILE_FLAG_BACKUP_SEMANTICS
+            } else {
+                0
+            },
+    );
+    options
+        .open(path)
+        .map_err(|e| crate::Error::rejected(format!("cannot safely open hardened job path: {e}")))
+}
+
+#[cfg(windows)]
+fn open_user_job_dir(path: &str, peer_sid: &[u8]) -> crate::Result<UserJobDir> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(crate::Error::rejected("job_dir must be absolute"));
+    }
+    let canonical = path.canonicalize()?;
+    if !same_windows_path(&canonical, path) {
+        return Err(crate::Error::rejected("job_dir must be canonical"));
+    }
+    let handle = open_windows_object(&canonical, true, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(crate::Error::rejected("job_dir is not a plain directory"));
+    }
+    let expected = crate::ipc::winsec::sid_string(peer_sid);
+    if crate::ipc::winsec::owner_sid(&handle)? != expected {
+        return Err(crate::Error::rejected(
+            "job_dir is not owned by the authenticated peer",
+        ));
+    }
+    Ok(UserJobDir {
+        _handle: handle,
+        path: canonical,
+    })
+}
+
+#[cfg(any(windows, test))]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    fn normalized(path: &Path) -> String {
+        let mut value = path.to_string_lossy().replace('/', "\\");
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            value = format!(r"\\{}", rest);
+        } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+            value = rest.to_owned();
+        }
+        value.to_lowercase()
+    }
+    normalized(left) == normalized(right)
+}
+
+#[cfg(windows)]
+fn snapshot_job(
+    dir: &UserJobDir,
+    peer_sid: &[u8],
+    sandbox_sid: &str,
+) -> crate::Result<(tempfile::TempDir, std::fs::File)> {
+    use std::io::Read;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ};
+    let source_path = dir.path.join("job.json");
+    let source = open_windows_object(&source_path, false, FILE_SHARE_READ)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || crate::sandbox::link_count(&metadata, &source_path)? != 1
+        || metadata.len() > super::protocol::MAX_JOB_BYTES as u64
+        || crate::ipc::winsec::owner_sid(&source)? != crate::ipc::winsec::sid_string(peer_sid)
+    {
+        return Err(crate::Error::rejected(
+            "job.json is unsafe, oversized, or not peer-owned",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    source
+        .take((super::protocol::MAX_JOB_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > super::protocol::MAX_JOB_BYTES {
+        return Err(crate::Error::rejected(
+            "job.json exceeds the hardened job limit",
+        ));
+    }
+
+    let state_path = super::machine_state_path()?;
+    let data_dir = state_path
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("install state has no parent"))?;
+    let jobs = ensure_snapshot_store(&data_dir.join("jobs"))?;
+    let temp = tempfile::Builder::new().prefix("job-").tempdir_in(&jobs)?;
+    set_snapshot_acl(temp.path(), sandbox_sid, "RX")?;
+    let input_dir = temp.path().join("input");
+    let output_dir = temp.path().join("output");
+    std::fs::create_dir(&input_dir)?;
+    std::fs::create_dir(&output_dir)?;
+    set_snapshot_acl(&input_dir, sandbox_sid, "RX")?;
+    set_snapshot_acl(&output_dir, sandbox_sid, "M")?;
+    let snapshot = input_dir.join("job.json");
+    std::fs::write(&snapshot, bytes)?;
+    let snapshot = open_windows_object(&snapshot, false, FILE_SHARE_READ)?;
+    Ok((temp, snapshot))
+}
+
+#[cfg(windows)]
+fn ensure_snapshot_store(path: &Path) -> crate::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(path)?;
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| crate::Error::isolation_unavailable("SystemRoot is unavailable"))?;
+    let output = std::process::Command::new(root.join("System32\\icacls.exe"))
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(crate::Error::integrity(
+            "cannot secure hardened snapshot store",
+        ));
+    }
+    let dir = open_windows_object(
+        path,
+        true,
+        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+            | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+    )?;
+    if crate::ipc::winsec::owner_sid(&dir)? != "S-1-5-18" {
+        return Err(crate::Error::integrity(
+            "hardened snapshot store is not SYSTEM-owned",
+        ));
+    }
+    let mut system = false;
+    let mut admins = false;
+    for (allow, sid, _) in crate::ipc::winsec::dacl_entries(&dir)? {
+        if allow && sid == "S-1-5-18" {
+            system = true;
+        } else if allow && sid == "S-1-5-32-544" {
+            admins = true;
+        } else if allow {
+            return Err(crate::Error::integrity(
+                "hardened snapshot store ACL grants an unexpected identity",
+            ));
+        }
+    }
+    if !system || !admins {
+        return Err(crate::Error::integrity(
+            "hardened snapshot store ACL did not read back",
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn sweep_stale_snapshots(path: &Path) -> crate::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const REPARSE: u32 = 0x400;
+    let path = ensure_snapshot_store(path)?;
+    for entry in std::fs::read_dir(&path)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("job-") {
+            continue;
+        }
+        let dir = entry.path();
+        let meta = std::fs::symlink_metadata(&dir)?;
+        if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
+            return Err(crate::Error::integrity(
+                "stale service snapshot is not a plain directory",
+            ));
+        }
+        let opened = open_windows_object(
+            &dir,
+            true,
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+        )?;
+        if crate::ipc::winsec::owner_sid(&opened)? != "S-1-5-18" {
+            return Err(crate::Error::integrity(
+                "stale service snapshot is not SYSTEM-owned",
+            ));
+        }
+        for subdir in ["input", "output"] {
+            let child = dir.join(subdir);
+            match std::fs::symlink_metadata(&child) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+                Ok(md) if md.is_dir() && md.file_attributes() & REPARSE == 0 => {}
+                Ok(_) => {
+                    return Err(crate::Error::integrity(
+                        "stale snapshot child is not a plain directory",
+                    ))
+                }
+            }
+            for file in std::fs::read_dir(&child)? {
+                let file = file?;
+                let expected = if subdir == "input" {
+                    "job.json"
+                } else {
+                    "outcome.json"
+                };
+                if file.file_name() != expected {
+                    return Err(crate::Error::integrity(
+                        "stale snapshot contains an unexpected file",
+                    ));
+                }
+                let md = std::fs::symlink_metadata(file.path())?;
+                if !md.is_file() || md.file_attributes() & REPARSE != 0 {
+                    return Err(crate::Error::integrity(
+                        "stale snapshot file is not a plain file",
+                    ));
+                }
+                std::fs::remove_file(file.path())?;
+            }
+            std::fs::remove_dir(child)?;
+        }
+        std::fs::remove_dir(dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_snapshot_acl(path: &Path, sandbox_sid: &str, sandbox_access: &str) -> crate::Result<()> {
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| crate::Error::isolation_unavailable("SystemRoot is unavailable"))?;
+    let sandbox_ace = format!("*{sandbox_sid}:(OI)(CI){sandbox_access}");
+    let output = std::process::Command::new(root.join("System32\\icacls.exe"))
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",
+            &sandbox_ace,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(crate::Error::isolation_unavailable(
+            "failed to restrict hardened job snapshot ACL",
+        ));
+    }
+    let directory = open_windows_object(
+        path,
+        true,
+        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+            | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+            | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+    )?;
+    if crate::ipc::winsec::owner_sid(&directory)? != "S-1-5-18" {
+        return Err(crate::Error::integrity(
+            "job snapshot directory is not SYSTEM-owned",
+        ));
+    }
+    let aces = crate::ipc::winsec::dacl_entries(&directory)?;
+    let mut has_system = false;
+    let mut has_sandbox = false;
+    for (allow, sid, _mask) in aces {
+        if !allow {
+            return Err(crate::Error::integrity(
+                "job snapshot ACL has an unexpected deny entry",
+            ));
+        } else if sid == "S-1-5-18" {
+            has_system = true;
+        } else if sid == sandbox_sid {
+            has_sandbox = true;
+        } else {
+            return Err(crate::Error::integrity(
+                "job snapshot ACL grants an unexpected identity",
+            ));
+        }
+    }
+    if !has_system || !has_sandbox {
+        return Err(crate::Error::integrity(
+            "job snapshot ACL did not read back",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn run_snapshot_as_sandbox(
+    jobfile: &Path,
+    client_pipe: windows_sys::Win32::Foundation::HANDLE,
+) -> crate::Result<u32> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Threading::{
+        DeleteProcThreadAttributeList, GetExitCodeProcess, InitializeProcThreadAttributeList,
+        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
+        CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTUPINFOEXW,
+    };
+
+    #[repr(C)]
+    struct ProfileInfo {
+        size: u32,
+        flags: u32,
+        username: *mut u16,
+        profile_path: *mut u16,
+        default_path: *mut u16,
+        server_name: *mut u16,
+        policy_path: *mut u16,
+        profile: HANDLE,
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn LogonUserW(
+            username: *const u16,
+            domain: *const u16,
+            password: *const u16,
+            logon_type: u32,
+            provider: u32,
+            token: *mut HANDLE,
+        ) -> i32;
+        fn CreateProcessAsUserW(
+            token: HANDLE,
+            application: *const u16,
+            command_line: *mut u16,
+            process_attributes: *const c_void,
+            thread_attributes: *const c_void,
+            inherit_handles: i32,
+            creation_flags: u32,
+            environment: *const c_void,
+            current_directory: *const u16,
+            startup_info: *mut c_void,
+            process_info: *mut PROCESS_INFORMATION,
+        ) -> i32;
+    }
+    #[link(name = "userenv")]
+    unsafe extern "system" {
+        fn LoadUserProfileW(token: HANDLE, profile_info: *mut ProfileInfo) -> i32;
+        fn UnloadUserProfile(token: HANDLE, profile: HANDLE) -> i32;
+        fn CreateEnvironmentBlock(
+            environment: *mut *mut c_void,
+            token: HANDLE,
+            inherit: i32,
+        ) -> i32;
+        fn DestroyEnvironmentBlock(environment: *mut c_void) -> i32;
+    }
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+
+    let state_path = super::machine_state_path()?;
+    let data_dir = state_path
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("install state has no parent"))?;
+    let secret_path = data_dir.join("sandbox.secret");
+    use std::os::windows::fs::MetadataExt;
+    let secret_meta = std::fs::symlink_metadata(&secret_path)?;
+    if !secret_meta.is_file()
+        || secret_meta.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    {
+        return Err(crate::Error::integrity(
+            "sandbox account secret is not a regular file",
+        ));
+    }
+    let secret_file = std::fs::File::open(&secret_path)?;
+    let mut system = false;
+    let mut admins = false;
+    for (allow, sid, _) in crate::ipc::winsec::dacl_entries(&secret_file)? {
+        if allow && sid == "S-1-5-18" {
+            system = true;
+        } else if allow && sid == "S-1-5-32-544" {
+            admins = true;
+        } else if allow {
+            return Err(crate::Error::integrity(
+                "sandbox account secret ACL grants an unexpected identity",
+            ));
+        }
+    }
+    if !system || !admins {
+        return Err(crate::Error::integrity(
+            "sandbox account secret ACL did not read back",
+        ));
+    }
+    let password = zeroize::Zeroizing::new(std::fs::read_to_string(&secret_path)?);
+    if password.len() != 64 || !password.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(crate::Error::integrity(
+            "sandbox account secret has invalid format",
+        ));
+    }
+    let mut password_w: zeroize::Zeroizing<Vec<u16>> = zeroize::Zeroizing::new(
+        std::ffi::OsStr::new(&*password)
+            .encode_wide()
+            .chain([0])
+            .collect(),
+    );
+
+    let mut sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    let (mut read_raw, mut write_raw): (HANDLE, HANDLE) =
+        (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: output handles and security descriptor are valid; both handles are fresh.
+    if unsafe { CreatePipe(&mut read_raw, &mut write_raw, &mut sa, 0) } == 0 {
+        return Err(crate::Error::internal(format!(
+            "CreatePipe(watchdog) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: CreatePipe returned two owned handles.
+    let read_end = unsafe { OwnedHandle::from_raw_handle(read_raw as RawHandle) };
+    // SAFETY: CreatePipe returned two owned handles.
+    let write_end = unsafe { OwnedHandle::from_raw_handle(write_raw as RawHandle) };
+    // Only the read end is inherited by the launcher.
+    unsafe { SetHandleInformation(write_raw, HANDLE_FLAG_INHERIT, 0) };
+    let handle_list = [read_raw];
+    let mut needed = 0usize;
+    // SAFETY: sizing call to obtain the required attribute-list buffer size.
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut needed) };
+    if needed == 0 || needed > 64 * 1024 {
+        return Err(crate::Error::internal("cannot size process attribute list"));
+    }
+    let mut attr_buf = vec![0usize; needed.div_ceil(std::mem::size_of::<usize>())];
+    let attr = attr_buf.as_mut_ptr().cast();
+    // SAFETY: attr_buf is aligned and sized as reported by the sizing call.
+    if unsafe { InitializeProcThreadAttributeList(attr, 1, 0, &mut needed) } == 0 {
+        return Err(crate::Error::internal(
+            "InitializeProcThreadAttributeList failed",
+        ));
+    }
+    struct AttrGuard(*mut c_void);
+    impl Drop for AttrGuard {
+        fn drop(&mut self) {
+            unsafe { DeleteProcThreadAttributeList(self.0.cast()) }
+        }
+    }
+    let _attr_guard = AttrGuard(attr);
+    // SAFETY: one valid inherited handle, stored in handle_list for the call.
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attr,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handle_list.as_ptr().cast(),
+            std::mem::size_of_val(&handle_list),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        return Err(crate::Error::internal(
+            "cannot restrict inherited launcher handles",
+        ));
+    }
+    let exe = std::env::current_exe()?;
+    let exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let raw_handle = read_raw as usize;
+    let cmd = format!(
+        "{} sandbox launch {} --watchdog {}",
+        quote_windows_arg(&exe.to_string_lossy()),
+        quote_windows_arg(&jobfile.to_string_lossy()),
+        raw_handle
+    );
+    let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(&cmd)
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let mut username: Vec<u16> = std::ffi::OsStr::new("f2c-sandbox")
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let mut token_raw: HANDLE = std::ptr::null_mut();
+    // SAFETY: output token pointer is valid; LOGON32_LOGON_BATCH is granted
+    // only to the protected f2c-sandbox SID during install.
+    if unsafe {
+        LogonUserW(
+            username.as_ptr(),
+            std::ptr::null(),
+            password_w.as_mut_ptr(),
+            4,
+            0,
+            &mut token_raw,
+        )
+    } == 0
+    {
+        let code = unsafe { GetLastError() };
+        return Err(crate::Error::isolation_unavailable(format!(
+            "LogonUserW(batch) failed with Win32 error {code}"
+        )));
+    }
+    // SAFETY: LogonUserW returned a fresh token handle.
+    let _token = unsafe { OwnedHandle::from_raw_handle(token_raw as RawHandle) };
+    let mut profile = ProfileInfo {
+        size: std::mem::size_of::<ProfileInfo>() as u32,
+        flags: 1,
+        username: username.as_mut_ptr(),
+        profile_path: std::ptr::null_mut(),
+        default_path: std::ptr::null_mut(),
+        server_name: std::ptr::null_mut(),
+        policy_path: std::ptr::null_mut(),
+        profile: std::ptr::null_mut(),
+    };
+    // Batch logon plus an explicit profile load lets the service verify profile
+    // and AppContainer creation without granting interactive logon.
+    if unsafe { LoadUserProfileW(token_raw, &mut profile) } == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(crate::Error::isolation_unavailable(format!(
+            "LoadUserProfileW failed with Win32 error {code}"
+        )));
+    }
+    let launch_result = (|| {
+        let mut environment = std::ptr::null_mut();
+        // SAFETY: environment is a writable output pointer for the user token.
+        if unsafe { CreateEnvironmentBlock(&mut environment, token_raw, 0) } == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(crate::Error::isolation_unavailable(format!(
+                "CreateEnvironmentBlock failed with Win32 error {code}"
+            )));
+        }
+        struct EnvironmentGuard(*mut c_void);
+        impl Drop for EnvironmentGuard {
+            fn drop(&mut self) {
+                unsafe { DestroyEnvironmentBlock(self.0) };
+            }
+        }
+        let _environment_guard = EnvironmentGuard(environment);
+        let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attr.cast();
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+        // SAFETY: token is a primary batch-logon token, its profile/environment
+        // are loaded, and the handle list contains only the watchdog read end.
+        if unsafe {
+            CreateProcessAsUserW(
+                token_raw,
+                exe_w.as_ptr(),
+                cmd_w.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                environment,
+                std::ptr::null(),
+                (&mut startup.StartupInfo
+                    as *mut windows_sys::Win32::System::Threading::STARTUPINFOW)
+                    .cast::<c_void>(),
+                &mut pi,
+            )
+        } == 0
+        {
+            let code = unsafe { GetLastError() };
+            return Err(crate::Error::isolation_unavailable(format!(
+                "CreateProcessAsUserW failed with Win32 error {code}"
+            )));
+        }
+        drop(read_end);
+        let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as RawHandle) };
+        let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as RawHandle) };
+        drop(thread);
+        let mut watchdog = Some(write_end);
+        let mut disconnected_at = None;
+        loop {
+            if unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 100) } == 0 {
+                break;
+            }
+            let mut available = 0u32;
+            if unsafe {
+                windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                    client_pipe,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                watchdog.take();
+                disconnected_at.get_or_insert_with(std::time::Instant::now);
+            }
+            if disconnected_at.is_some_and(|at| at.elapsed() > std::time::Duration::from_secs(10)) {
+                unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 0xE002) };
+            }
+        }
+        let mut exit = 1u32;
+        if unsafe { GetExitCodeProcess(process.as_raw_handle() as HANDLE, &mut exit) } == 0 {
+            return Err(crate::Error::internal(
+                "GetExitCodeProcess(launcher) failed",
+            ));
+        }
+        Ok(exit)
+    })();
+    // SAFETY: profile handle belongs to the loaded user profile; no child is
+    // left running because the closure waits for launcher termination.
+    if unsafe { UnloadUserProfile(token_raw, profile.profile) } == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(crate::Error::isolation_unavailable(format!(
+            "UnloadUserProfile failed with Win32 error {code}"
+        )));
+    }
+    drop(username);
+    drop(password_w);
+    launch_result
+}
+
+#[cfg(any(windows, test))]
+fn quote_windows_arg(arg: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            slashes += 1;
+        } else if ch == '"' {
+            out.push_str(&"\\".repeat(slashes * 2 + 1));
+            out.push(ch);
+            slashes = 0;
+        } else {
+            out.push_str(&"\\".repeat(slashes));
+            out.push(ch);
+            slashes = 0;
+        }
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+fn launch_windows_request(
+    client_pipe: windows_sys::Win32::Foundation::HANDLE,
+    job_dir: &str,
+    peer_sid: &[u8],
+    sandbox_sid: &str,
+) -> crate::Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ};
+
+    let dir = open_user_job_dir(job_dir, peer_sid)?;
+    let (snapshot_dir, _snapshot_handle) = snapshot_job(&dir, peer_sid, sandbox_sid)?;
+    let jobfile = snapshot_dir.path().join("job.json");
+    let exit = run_snapshot_as_sandbox(&jobfile, client_pipe)?;
+    if exit != 0 {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "hardened launcher exited with code {exit}"
+        )));
+    }
+    let outcome_path = snapshot_dir.path().join("output").join("outcome.json");
+    use std::os::windows::fs::MetadataExt;
+    let outcome = open_windows_object(&outcome_path, false, FILE_SHARE_READ)?;
+    let metadata = outcome.metadata()?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || crate::sandbox::link_count(&metadata, &outcome_path)? != 1
+        || metadata.len() > super::protocol::MAX_OUTCOME_BYTES as u64
+    {
+        return Err(crate::Error::integrity(
+            "launcher outcome is unsafe or oversized",
+        ));
+    }
+    let bytes = std::fs::read(&outcome_path)?;
+    super::protocol::decode_outcome(&bytes)?;
+    let output = dir.path.join("outcome.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(output)
+        .map_err(|e| {
+            crate::Error::integrity(format!("cannot safely publish hardened outcome: {e}"))
+        })?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(super) fn launch_hidden(jobfile: &Path, watchdog: Option<u64>) -> crate::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, FILE_ATTRIBUTE_REPARSE_POINT};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    let watchdog = watchdog
+        .ok_or_else(|| crate::Error::rejected("hardened launcher requires a watchdog handle"))?;
+    let handle_value = watchdog as usize;
+    let handle = handle_value as HANDLE;
+    if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(crate::Error::rejected(
+            "hardened launcher watchdog handle is invalid",
+        ));
+    }
+    let watchdog_thread = std::thread::spawn(move || {
+        let handle = handle_value as HANDLE;
+        loop {
+            let mut byte = 0u8;
+            let mut read = 0u32;
+            // SAFETY: the inherited anonymous-pipe handle remains owned by this thread.
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || read == 0 {
+                // SAFETY: terminating the launcher closes the AppContainer job handle,
+                // whose kill-on-close policy terminates the untrusted process tree.
+                unsafe { TerminateProcess(GetCurrentProcess(), 0xE001) };
+                break;
+            }
+        }
+    });
+    let metadata = std::fs::symlink_metadata(jobfile)?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > super::protocol::MAX_JOB_BYTES as u64
+    {
+        return Err(crate::Error::integrity(
+            "hardened launcher job file is unsafe or oversized",
+        ));
+    }
+    let bytes = std::fs::read(jobfile)?;
+    let job = super::protocol::decode_job(&bytes)?;
+    use crate::isolation::SandboxBackend;
+    let report = crate::sandbox::windows::AppContainer::default().probe();
+    if !report.available {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "AppContainer controls are unavailable: {}",
+            report.detail
+        )));
+    }
+    // The standard AppContainer does not yet enable LPAC, and the hardened
+    // service has no verified per-profile WFP controls. Never start package code
+    // until both mandatory controls have real read-back and self-test evidence.
+    let _ = job;
+    drop(watchdog_thread);
+    Err(crate::Error::isolation_unavailable(
+        "LPAC and per-job WFP controls are unverified; package code was not started",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_decoder_requires_bounded_newline_terminated_json() {
+        let response = decode_response(b"{\"ok\":false,\"service_running\":true,\"probe_available\":false,\"detail\":\"not ready\"}\n").unwrap();
+        assert!(!response.ok);
+        assert!(decode_response(b"{\"ok\":true}").is_err());
+        assert!(decode_response(&vec![b'x'; MAX_REQUEST]).is_err());
+    }
+
+    #[test]
+    fn windows_path_comparison_handles_case_and_verbatim_prefix_only() {
+        assert!(same_windows_path(
+            Path::new(r"C:\Users\Tester\stage"),
+            Path::new(r"c:\users\tester\STAGE")
+        ));
+        assert!(same_windows_path(
+            Path::new(r"\\?\C:\Users\Tester\stage"),
+            Path::new(r"C:\Users\Tester\stage")
+        ));
+        assert!(!same_windows_path(
+            Path::new(r"C:\Users\Tester\stage"),
+            Path::new(r"C:\Users\Tester\..\Other")
+        ));
+    }
+
+    #[test]
+    fn windows_command_arguments_are_quoted_without_shell_interpretation() {
+        assert_eq!(
+            quote_windows_arg(r"C:\Program Files\tool.exe"),
+            r#""C:\Program Files\tool.exe""#
+        );
+        assert_eq!(quote_windows_arg(r#"a\"b"#), r#""a\\\"b""#);
+    }
 
     #[test]
     fn only_installer_uid_is_accepted_and_sandbox_identity_is_denied() {

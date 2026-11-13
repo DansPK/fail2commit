@@ -615,6 +615,85 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     })
 }
 
+/// Apply and verify the sandbox-account grants around a single authenticated
+/// hardened-service transaction. Paths are checked by the same handle-based
+/// stage validator used by the ordinary AppContainer backend.
+pub(crate) fn with_hardened_job_grants<T>(
+    job: &JobSpec,
+    account_sid: &str,
+    action: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    let stage_root = stage_root()?;
+    clear_pending_revokes(&stage_root)?;
+    clear_stale_profiles(&stage_root)?;
+    let paths = ValidatedPaths::new(job, &stage_root)?;
+    let account_sid = ffi::sid_from_string(account_sid)?;
+    let mut grants = StagingGrants::new_crash_safe(account_sid.as_psid(), &stage_root);
+    for root in &paths.read_only {
+        grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
+    }
+    grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
+    let result = action();
+    let cleanup = grants.release();
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(crate::Error::isolation_unavailable(format!(
+            "hardened job failed: {}; account grants could not be revoked: {}",
+            error.message, cleanup.message
+        ))),
+    }
+}
+
+pub(crate) fn sweep_hardened_job_state(cache_root: &Path) -> crate::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const REPARSE: u32 = 0x400;
+    let stage_root = stage_root()?;
+    clear_pending_revokes(&stage_root)?;
+    let root = fs::symlink_metadata(cache_root)?;
+    if !root.is_dir() || root.file_attributes() & REPARSE != 0 {
+        return Err(crate::Error::integrity(
+            "hardened job cache is not a plain directory",
+        ));
+    }
+    for entry in fs::read_dir(cache_root)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("hardened-job-")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() || metadata.file_attributes() & REPARSE != 0 {
+            return Err(crate::Error::integrity(
+                "stale hardened job path is not a plain directory",
+            ));
+        }
+        for child in fs::read_dir(&path)? {
+            let child = child?;
+            let name = child.file_name();
+            if name != "job.json" && name != "outcome.json" {
+                return Err(crate::Error::integrity(
+                    "stale hardened job directory contains an unexpected entry",
+                ));
+            }
+            let child_meta = fs::symlink_metadata(child.path())?;
+            if !child_meta.is_file() || child_meta.file_attributes() & REPARSE != 0 {
+                return Err(crate::Error::integrity(
+                    "stale hardened job file is not a plain file",
+                ));
+            }
+            fs::remove_file(child.path())?;
+        }
+        fs::remove_dir(path)?;
+    }
+    Ok(())
+}
+
 /// Kill a suspended or failed root process, keeping the original error and
 /// appending the kill failure when that also fails.
 fn abort_with(spawned: &ffi::Spawned, error: crate::Error) -> crate::Error {
@@ -1359,6 +1438,8 @@ struct StagingGrants<'a> {
     sid: PSID,
     stage_root: &'a Path,
     granted: Vec<PathBuf>,
+    recorded_paths: Vec<PathBuf>,
+    crash_safe: bool,
 }
 
 impl<'a> StagingGrants<'a> {
@@ -1367,6 +1448,18 @@ impl<'a> StagingGrants<'a> {
             sid,
             stage_root,
             granted: Vec::new(),
+            recorded_paths: Vec::new(),
+            crash_safe: false,
+        }
+    }
+
+    fn new_crash_safe(sid: PSID, stage_root: &'a Path) -> Self {
+        Self {
+            sid,
+            stage_root,
+            granted: Vec::new(),
+            recorded_paths: Vec::new(),
+            crash_safe: true,
         }
     }
 
@@ -1378,6 +1471,13 @@ impl<'a> StagingGrants<'a> {
             paths.push(object.path().to_path_buf());
             Ok(())
         })?;
+        if self.crash_safe {
+            let sid = ffi::sid_text(self.sid)?;
+            record_pending_revoke_roots(self.stage_root, &[root.to_path_buf()], &sid)?;
+            if !self.recorded_paths.iter().any(|path| path == root) {
+                self.recorded_paths.push(root.to_path_buf());
+            }
+        }
         for path in paths {
             let object = ffi::StagedObject::open(&path)?;
             require_plain(&object, self.stage_root)?;
@@ -1405,19 +1505,52 @@ impl<'a> StagingGrants<'a> {
     fn release(&mut self) -> crate::Result<()> {
         let granted = std::mem::take(&mut self.granted);
         let mut failures = Vec::new();
-        for path in granted.iter().rev() {
-            if fs::symlink_metadata(path).is_err() {
-                // The staged object is already gone: no ACE can remain on it.
-                continue;
+        if self.crash_safe {
+            let mut paths = Vec::new();
+            for root in &self.recorded_paths {
+                match fs::symlink_metadata(root) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        failures.push((root.clone(), e.to_string()));
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+                if let Err(error) = walk_stage(root, self.stage_root, |object| {
+                    paths.push(object.path().to_path_buf());
+                    Ok(())
+                }) {
+                    failures.push((root.clone(), error.message));
+                }
             }
-            let result = ffi::StagedObject::open(path)
-                .and_then(|object| require_plain(&object, self.stage_root).map(|()| object))
-                .and_then(|object| object.revoke(self.sid));
-            if let Err(error) = result {
-                failures.push((path.clone(), error.message));
+            for path in paths.iter().rev() {
+                let result = ffi::StagedObject::open(path)
+                    .and_then(|object| require_plain(&object, self.stage_root).map(|()| object))
+                    .and_then(|object| object.revoke(self.sid));
+                if let Err(error) = result {
+                    failures.push((path.clone(), error.message));
+                }
+            }
+        } else {
+            for path in granted.iter().rev() {
+                if fs::symlink_metadata(path).is_err() {
+                    // The staged object is already gone: no ACE can remain on it.
+                    continue;
+                }
+                let result = ffi::StagedObject::open(path)
+                    .and_then(|object| require_plain(&object, self.stage_root).map(|()| object))
+                    .and_then(|object| object.revoke(self.sid));
+                if let Err(error) = result {
+                    failures.push((path.clone(), error.message));
+                }
             }
         }
         if failures.is_empty() {
+            if self.crash_safe && !self.recorded_paths.is_empty() {
+                let sid = ffi::sid_text(self.sid)?;
+                remove_pending_revokes(self.stage_root, &self.recorded_paths, &sid)?;
+                self.recorded_paths.clear();
+            }
             return Ok(());
         }
         for (path, message) in &failures {
@@ -1428,7 +1561,9 @@ impl<'a> StagingGrants<'a> {
             );
         }
         let sid = ffi::sid_text(self.sid)?;
-        record_pending_revokes(self.stage_root, &failures, &sid)?;
+        if !self.crash_safe {
+            record_pending_revokes(self.stage_root, &failures, &sid)?;
+        }
         Err(crate::Error::isolation_unavailable(format!(
             "{} staged ACL revocation(s) failed; recorded in {} and the next sandbox operation \
              will refuse until they are cleared",
@@ -1440,7 +1575,7 @@ impl<'a> StagingGrants<'a> {
 
 impl Drop for StagingGrants<'_> {
     fn drop(&mut self) {
-        if !self.granted.is_empty() {
+        if !self.granted.is_empty() || !self.recorded_paths.is_empty() {
             let _ = self.release();
         }
     }
@@ -1493,7 +1628,11 @@ struct PendingRevoke {
     path: String,
     sid: String,
     detail: String,
+    #[serde(default)]
+    recursive: bool,
 }
+
+const MAX_PENDING_REVOKES_BYTES: usize = 256 * 1024;
 
 fn revoke_state_file(stage_root: &Path) -> PathBuf {
     stage_root.join(REVOKE_STATE_FILE)
@@ -1517,10 +1656,56 @@ fn record_pending_revokes(
                     path,
                     sid: sid.to_string(),
                     detail: detail.clone(),
+                    recursive: false,
                 });
             }
         }
         write_pending_revokes(stage_root, &entries)
+    })
+}
+
+fn record_pending_revoke_roots(
+    stage_root: &Path,
+    roots: &[PathBuf],
+    sid: &str,
+) -> crate::Result<()> {
+    let file = revoke_state_file(stage_root);
+    crate::fsutil::with_lock(&file, || {
+        let mut entries = read_pending_revokes(stage_root)?;
+        for root in roots {
+            let path = root.to_string_lossy().into_owned();
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.path == path && entry.sid == sid)
+            {
+                entry.detail = "in-progress hardened job; recursively revoke on restart".into();
+                entry.recursive = true;
+            } else {
+                entries.push(PendingRevoke {
+                    path,
+                    sid: sid.to_string(),
+                    detail: "in-progress hardened job; recursively revoke on restart".into(),
+                    recursive: true,
+                });
+            }
+        }
+        write_pending_revokes(stage_root, &entries)
+    })
+}
+
+fn remove_pending_revokes(stage_root: &Path, paths: &[PathBuf], sid: &str) -> crate::Result<()> {
+    let wanted: std::collections::HashSet<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let file = revoke_state_file(stage_root);
+    crate::fsutil::with_lock(&file, || {
+        let entries = read_pending_revokes(stage_root)?;
+        let remaining: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| !(entry.sid == sid && wanted.contains(&entry.path)))
+            .collect();
+        write_pending_revokes(stage_root, &remaining)
     })
 }
 
@@ -1555,6 +1740,11 @@ fn write_pending_revokes(stage_root: &Path, entries: &[PendingRevoke]) -> crate:
     } else {
         let json = serde_json::to_vec_pretty(entries)
             .map_err(|e| crate::Error::internal(format!("serialize pending revokes: {e}")))?;
+        if json.len() > MAX_PENDING_REVOKES_BYTES {
+            return Err(crate::Error::isolation_unavailable(
+                "pending ACL revocation state exceeds its safety limit",
+            ));
+        }
         crate::fsutil::atomic_write(&file, &json)
     }
 }
@@ -1576,15 +1766,30 @@ fn clear_pending_revokes(stage_root: &Path) -> crate::Result<()> {
                 continue;
             }
             let result = ffi::sid_from_string(&entry.sid).and_then(|sid| {
-                ffi::StagedObject::open(&path)
-                    .and_then(|object| require_plain(&object, stage_root).map(|()| object))
-                    .and_then(|object| object.revoke(sid.as_psid()))
+                if entry.recursive {
+                    let mut paths = Vec::new();
+                    walk_stage(&path, stage_root, |object| {
+                        paths.push(object.path().to_path_buf());
+                        Ok(())
+                    })?;
+                    for child in paths.iter().rev() {
+                        ffi::StagedObject::open(child)
+                            .and_then(|object| require_plain(&object, stage_root).map(|()| object))
+                            .and_then(|object| object.revoke(sid.as_psid()))?;
+                    }
+                    Ok(())
+                } else {
+                    ffi::StagedObject::open(&path)
+                        .and_then(|object| require_plain(&object, stage_root).map(|()| object))
+                        .and_then(|object| object.revoke(sid.as_psid()))
+                }
             });
             if let Err(error) = result {
                 failed.push(PendingRevoke {
                     path: entry.path.clone(),
                     sid: entry.sid.clone(),
                     detail: error.message,
+                    recursive: entry.recursive,
                 });
             }
         }
@@ -1865,6 +2070,38 @@ fn random_bytes_16() -> crate::Result<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardened_grant_journal_is_write_ahead_and_removed_after_cleanup() {
+        let state = tempfile::tempdir().unwrap();
+        let granted = state.path().join("input.bin");
+        fs::write(&granted, b"stage").unwrap();
+        let sid = "S-1-5-21-1-2-3-1001";
+        record_pending_revoke_roots(state.path(), std::slice::from_ref(&granted), sid).unwrap();
+        let recorded = read_pending_revokes(state.path()).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].path, granted.to_string_lossy());
+        assert_eq!(recorded[0].sid, sid);
+        assert!(recorded[0].recursive);
+        remove_pending_revokes(state.path(), &[granted], sid).unwrap();
+        assert!(read_pending_revokes(state.path()).unwrap().is_empty());
+        assert!(!revoke_state_file(state.path()).exists());
+    }
+
+    #[test]
+    fn hardened_grant_journal_refuses_unbounded_cleanup_state() {
+        let state = tempfile::tempdir().unwrap();
+        let entries: Vec<_> = (0..5000)
+            .map(|i| {
+                (
+                    state.path().join(format!("{i:04}-{}", "p".repeat(96))),
+                    "crash cleanup".into(),
+                )
+            })
+            .collect();
+        assert!(record_pending_revokes(state.path(), &entries, "S-1-5-21-1-2-3-1001").is_err());
+        assert!(read_pending_revokes(state.path()).unwrap().is_empty());
+    }
 
     /// A disposable job stage directly below the real fail2commit stage root,
     /// which is what the stager contract requires.

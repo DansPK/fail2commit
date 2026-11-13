@@ -17,7 +17,7 @@ pub mod report;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 /// Linux backend, public so tests can simulate a missing install
 /// (`Bubblewrap::with_bwrap`) or force the rlimit-only path.
