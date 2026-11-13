@@ -27,7 +27,14 @@ struct Response {
     ok: bool,
     service_running: bool,
     probe_available: bool,
+    #[serde(default = "default_true")]
+    containment_confirmed: bool,
     detail: String,
+}
+
+#[cfg(any(target_os = "linux", windows, test))]
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(windows)]
@@ -69,21 +76,36 @@ pub(super) fn run_windows(
     };
     let mut pipe = open_service_pipe(&pipe_name)?;
     let result = crate::sandbox::windows::with_hardened_job_grants(job, sandbox_sid, || {
-        let reply = service_request_on_pipe(&mut pipe, &request)?;
-        if !reply.ok {
-            return Err(crate::Error::isolation_unavailable(reply.detail));
+        let result = (|| {
+            let reply = service_request_on_pipe(&mut pipe, &request)?;
+            if !reply.ok {
+                return Err(crate::Error::isolation_unavailable(reply.detail));
+            }
+            let outcome_path = temp.path().join("outcome.json");
+            let metadata = std::fs::symlink_metadata(&outcome_path)?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > super::protocol::MAX_OUTCOME_BYTES as u64
+            {
+                return Err(crate::Error::integrity(
+                    "hardened outcome file is unsafe or oversized",
+                ));
+            }
+            super::protocol::decode_outcome(&std::fs::read(outcome_path)?)
+        })();
+        match result {
+            Ok(outcome) => crate::sandbox::windows::HardenedGrantAction::Complete(Ok(outcome)),
+            Err(error) => {
+                // If the response itself was lost, the service may still have a
+                // live tree. The durable marker is authoritative for cleanup.
+                let contained = launch_recovery_pending().unwrap_or(true);
+                if contained {
+                    crate::sandbox::windows::HardenedGrantAction::ContainmentUnconfirmed(error)
+                } else {
+                    crate::sandbox::windows::HardenedGrantAction::Complete(Err(error))
+                }
+            }
         }
-        let outcome_path = temp.path().join("outcome.json");
-        let metadata = std::fs::symlink_metadata(&outcome_path)?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.len() > super::protocol::MAX_OUTCOME_BYTES as u64
-        {
-            return Err(crate::Error::integrity(
-                "hardened outcome file is unsafe or oversized",
-            ));
-        }
-        super::protocol::decode_outcome(&std::fs::read(outcome_path)?)
     });
     result
 }
@@ -138,6 +160,7 @@ fn response(ok: bool, detail: impl Into<String>) -> Response {
         ok,
         service_running: true,
         probe_available: false,
+        containment_confirmed: true,
         detail: detail.into(),
     }
 }
@@ -595,11 +618,6 @@ fn active_launch_marker_path() -> crate::Result<std::path::PathBuf> {
         .join("active-launch.json"))
 }
 
-#[cfg(any(windows, test))]
-fn may_sweep_after_marker_check<T>(check: &std::result::Result<bool, T>) -> bool {
-    matches!(check, Ok(false))
-}
-
 #[cfg(windows)]
 fn active_launch_pending() -> crate::Result<bool> {
     use std::os::windows::fs::MetadataExt;
@@ -630,13 +648,132 @@ fn active_launch_pending() -> crate::Result<bool> {
     (&file)
         .take((ACTIVE_LAUNCH_MARKER_MAX + 1) as u64)
         .read_to_end(&mut bytes)?;
-    decode_active_launch_marker(&bytes).map_err(crate::Error::integrity)?;
+    let marker = decode_active_launch_marker(&bytes).map_err(crate::Error::integrity)?;
+    validate_marker_snapshot_root(&marker)?;
     Ok(true)
 }
 
 #[cfg(windows)]
-pub(super) fn launch_recovery_pending() -> crate::Result<bool> {
+fn validate_marker_snapshot_root(marker: &ActiveLaunchMarker) -> crate::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let root_path = Path::new(&marker.snapshot_dir);
+    if !root_path.is_absolute()
+        || !root_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("job-"))
+    {
+        return Err(crate::Error::integrity(
+            "active launch snapshot path is not a service job root",
+        ));
+    }
+    let canonical = root_path.canonicalize()?;
+    let jobs_path = active_launch_marker_path()?
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("active marker has no data directory"))?
+        .join("jobs")
+        .canonicalize()?;
+    if !same_windows_path(&canonical, root_path)
+        || !canonical
+            .parent()
+            .is_some_and(|parent| same_windows_path(parent, &jobs_path))
+    {
+        return Err(crate::Error::integrity(
+            "active launch snapshot path escaped the service jobs directory",
+        ));
+    }
+    let directory = open_windows_object(
+        &canonical,
+        true,
+        windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+    )?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        || crate::ipc::winsec::owner_sid(&directory)? != "S-1-5-18"
+    {
+        return Err(crate::Error::integrity(
+            "active launch snapshot root failed ownership or object checks",
+        ));
+    }
+    let mut has_system = false;
+    let mut has_sandbox = false;
+    for (allow, sid, _) in crate::ipc::winsec::dacl_entries(&directory)? {
+        if !allow {
+            return Err(crate::Error::integrity(
+                "active launch snapshot root has an unexpected deny ACL",
+            ));
+        } else if sid == "S-1-5-18" {
+            has_system = true;
+        } else if sid == marker.sandbox_sid {
+            has_sandbox = true;
+        } else {
+            return Err(crate::Error::integrity(
+                "active launch snapshot root grants an unexpected identity",
+            ));
+        }
+    }
+    if !has_system || !has_sandbox {
+        return Err(crate::Error::integrity(
+            "active launch snapshot root ACL did not read back",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn launch_recovery_pending() -> crate::Result<bool> {
     active_launch_pending()
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn marker_blocks_cleanup<T>(check: &std::result::Result<bool, T>) -> bool {
+    !matches!(check, Ok(false))
+}
+
+#[cfg(any(windows, test))]
+fn snapshot_root_for_jobfile(jobfile: &Path) -> Option<std::path::PathBuf> {
+    jobfile.parent()?.parent().map(Path::to_path_buf)
+}
+
+#[cfg(any(windows, test))]
+fn retain_snapshot_if_unconfirmed(
+    snapshot: tempfile::TempDir,
+    containment_unconfirmed: bool,
+) -> Option<std::path::PathBuf> {
+    containment_unconfirmed.then(|| snapshot.keep())
+}
+
+#[cfg(any(windows, test))]
+fn process_tree_barrier(
+    mut query_active: impl FnMut() -> std::result::Result<u32, u32>,
+    terminate_tree: impl FnOnce() -> std::result::Result<(), u32>,
+    mut wait_interval: impl FnMut(),
+    max_polls: usize,
+) -> std::result::Result<bool, String> {
+    let mut count = query_active().map_err(|code| {
+        format!("cannot query launcher job active-process count (Win32 error {code})")
+    })?;
+    if count == 0 {
+        return Ok(false);
+    }
+    let termination_error = terminate_tree().err();
+    for _ in 0..max_polls {
+        count = query_active().map_err(|code| match termination_error {
+            Some(terminate) => format!(
+                "TerminateJobObject failed with Win32 error {terminate}; process count query failed with Win32 error {code}"
+            ),
+            None => format!("cannot confirm launcher job termination (Win32 error {code})"),
+        })?;
+        if count == 0 {
+            return Ok(true);
+        }
+        wait_interval();
+    }
+    Err(format!(
+        "launcher job still has {count} active process(es) after {max_polls} bounded polls"
+    ))
 }
 
 #[cfg(windows)]
@@ -1072,7 +1209,7 @@ fn service_loop_windows() -> crate::Result<()> {
         .ok_or_else(|| crate::Error::integrity("install state has no parent"))?
         .join("jobs");
     let marker_check = active_launch_pending();
-    if may_sweep_after_marker_check(&marker_check) {
+    if !marker_blocks_cleanup(&marker_check) {
         sweep_stale_snapshots(&jobs)?;
     } else {
         // Never delete snapshots or grants until a prior process has been
@@ -1181,10 +1318,14 @@ fn service_loop_windows() -> crate::Result<()> {
             "LAUNCH" if request.job_dir.is_none() => {
                 response(false, "job_dir is required; job was not started")
             }
-            "LAUNCH" if LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst) => response(
-                false,
-                "a prior launcher termination was not confirmed; service is locked fail-closed",
-            ),
+            "LAUNCH" if LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst) => {
+                let mut reply = response(
+                    false,
+                    "a prior launcher termination was not confirmed; service is locked fail-closed",
+                );
+                reply.containment_confirmed = false;
+                reply
+            }
             "LAUNCH" => match launch_windows_request(
                 raw,
                 request.job_dir.as_deref().unwrap(),
@@ -1197,7 +1338,10 @@ fn service_loop_windows() -> crate::Result<()> {
                     // user-facing control error so failed platform checks can be diagnosed;
                     // never log passwords, process output, or unbounded error text.
                     let detail = bounded_error_detail(&error.message);
-                    response(false, format!("launcher rejected the job: {detail}"))
+                    let mut reply = response(false, format!("launcher rejected the job: {detail}"));
+                    reply.containment_confirmed =
+                        !LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst);
+                    reply
                 }
             },
             _ => response(false, "unknown or malformed operation"),
@@ -1688,7 +1832,7 @@ fn run_snapshot_as_sandbox(
             std::io::Error::last_os_error()
         )));
     }
-    let _job_handle = unsafe { OwnedHandle::from_raw_handle(job_raw as RawHandle) };
+    let job_handle = unsafe { OwnedHandle::from_raw_handle(job_raw as RawHandle) };
     let mut job_limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     job_limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if unsafe {
@@ -1820,7 +1964,7 @@ fn run_snapshot_as_sandbox(
     let mut retained_process = None;
     let mut containment_confirmed = true;
     let mut active_marker = None;
-    let launch_result = (|| {
+    let mut launch_result = (|| {
         let mut environment = std::ptr::null_mut();
         // SAFETY: environment is a writable output pointer for the user token.
         if unsafe { CreateEnvironmentBlock(&mut environment, token_raw, 0) } == 0 {
@@ -1844,10 +1988,17 @@ fn run_snapshot_as_sandbox(
             | CREATE_UNICODE_ENVIRONMENT
             | CREATE_NO_WINDOW
             | CREATE_SUSPENDED;
-        let snapshot_dir = jobfile
-            .parent()
-            .ok_or_else(|| crate::Error::integrity("snapshot job has no directory"))?;
-        active_marker = Some(ActiveLaunchGuard::create(sandbox_sid, snapshot_dir)?);
+        let snapshot_dir = snapshot_root_for_jobfile(jobfile)
+            .ok_or_else(|| crate::Error::integrity("snapshot job has no root directory"))?;
+        active_marker = match ActiveLaunchGuard::create(sandbox_sid, &snapshot_dir) {
+            Ok(marker) => Some(marker),
+            Err(error) => {
+                if active_launch_pending().unwrap_or(true) {
+                    LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+                }
+                return Err(error);
+            }
+        };
         // SAFETY: token is a primary batch-logon token, its profile/environment
         // are loaded, and the handle list contains only the watchdog read end.
         if unsafe {
@@ -2031,6 +2182,19 @@ fn run_snapshot_as_sandbox(
         }
         Ok(exit)
     })();
+    match terminate_job_tree_and_confirm(job_raw) {
+        Ok(had_residual_processes) => {
+            containment_confirmed = true;
+            // Confirmed zero active processes before closing the last handle.
+            drop(job_handle);
+            if had_residual_processes && launch_result.is_ok() {
+                launch_result = Err(crate::Error::isolation_unavailable(
+                    "launcher exited while child processes remained; tree was terminated and outcome rejected",
+                ));
+            }
+        }
+        Err(_) => containment_confirmed = false,
+    }
     if !containment_confirmed {
         // Keep the process and token handles, plus the loaded profile, until
         // the service exits; do not unload a profile that a live process may
@@ -2058,11 +2222,56 @@ fn run_snapshot_as_sandbox(
         )));
     }
     if let Some(marker) = active_marker.as_mut() {
-        marker.clear()?;
+        if let Err(error) = marker.clear() {
+            LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+            marker.retain();
+            return Err(error);
+        }
     }
     drop(username);
     drop(password_w);
     launch_result
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn terminate_job_tree_and_confirm(
+    job: windows_sys::Win32::Foundation::HANDLE,
+) -> std::result::Result<bool, String> {
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectBasicAccountingInformation, QueryInformationJobObject, TerminateJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    };
+    const POLLS: usize = 200;
+    let mut active = || -> std::result::Result<u32, u32> {
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            Err(unsafe { windows_sys::Win32::Foundation::GetLastError() })
+        } else {
+            Ok(info.ActiveProcesses)
+        }
+    };
+    process_tree_barrier(
+        &mut active,
+        || {
+            if unsafe { TerminateJobObject(job, 0xE007) } == 0 {
+                Err(unsafe { windows_sys::Win32::Foundation::GetLastError() })
+            } else {
+                Ok(())
+            }
+        },
+        || std::thread::sleep(std::time::Duration::from_millis(25)),
+        POLLS,
+    )
 }
 
 #[cfg(windows)]
@@ -2167,12 +2376,22 @@ fn launch_windows_request(
 ) -> crate::Result<()> {
     use std::io::{Read, Write};
     use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::Ordering;
     use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ};
 
     let dir = open_user_job_dir(job_dir, peer_sid)?;
     let (snapshot_dir, _snapshot_handle) = snapshot_job(&dir, peer_sid, sandbox_sid)?;
     let jobfile = snapshot_dir.path().join("job.json");
-    let exit = run_snapshot_as_sandbox(&jobfile, client_pipe, sandbox_sid)?;
+    let exit = match run_snapshot_as_sandbox(&jobfile, client_pipe, sandbox_sid) {
+        Ok(exit) => exit,
+        Err(error) if LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst) => {
+            // Preserve every snapshot file as long as a process-tree cleanup
+            // barrier was unconfirmed; the SYSTEM marker records this root.
+            let _retained_root = retain_snapshot_if_unconfirmed(snapshot_dir, true);
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     if exit != 0 {
         return Err(crate::Error::isolation_unavailable(format!(
             "hardened launcher exited with code {exit}"
@@ -2320,10 +2539,85 @@ mod tests {
     }
 
     #[test]
-    fn restart_sweeps_only_when_persistent_marker_is_proven_absent() {
-        assert!(may_sweep_after_marker_check::<()>(&Ok(false)));
-        assert!(!may_sweep_after_marker_check::<()>(&Ok(true)));
-        assert!(!may_sweep_after_marker_check::<()>(&Err(())));
+    fn snapshot_marker_owns_the_top_level_job_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        std::fs::create_dir(&input).unwrap();
+        let jobfile = input.join("job.json");
+        assert_eq!(
+            snapshot_root_for_jobfile(&jobfile).as_deref(),
+            Some(temp.path())
+        );
+    }
+
+    #[test]
+    fn unconfirmed_containment_keeps_the_snapshot_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        std::fs::write(root.join("job.json"), b"snapshot").unwrap();
+        let retained = retain_snapshot_if_unconfirmed(temp, true).unwrap();
+        assert_eq!(retained, root);
+        assert_eq!(
+            std::fs::read(retained.join("job.json")).unwrap(),
+            b"snapshot"
+        );
+        std::fs::remove_dir_all(retained).unwrap();
+    }
+
+    #[test]
+    fn confirmed_containment_keeps_tempdir_cleanup_armed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().to_path_buf();
+        std::fs::write(path.join("job.json"), b"snapshot").unwrap();
+        assert!(retain_snapshot_if_unconfirmed(temp, false).is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn process_tree_cleanup_requires_a_confirmed_zero_process_count() {
+        use std::cell::Cell;
+        use std::collections::VecDeque;
+        let terminate_called = Cell::new(false);
+        let mut counts = VecDeque::from([3, 2, 1, 0]);
+        let had_residual = process_tree_barrier(
+            || Ok(counts.pop_front().unwrap()),
+            || {
+                terminate_called.set(true);
+                Ok(())
+            },
+            || {},
+            3,
+        )
+        .unwrap();
+        assert!(had_residual);
+        assert!(terminate_called.get());
+
+        let terminate_called = Cell::new(false);
+        let had_residual = process_tree_barrier(
+            || Ok(0),
+            || {
+                terminate_called.set(true);
+                Ok(())
+            },
+            || {},
+            3,
+        )
+        .unwrap();
+        assert!(!had_residual);
+        assert!(!terminate_called.get());
+
+        let error = process_tree_barrier(|| Ok(1), || Ok(()), || {}, 2).unwrap_err();
+        assert!(error.contains("still has 1 active process"));
+        assert!(process_tree_barrier(|| Err(5), || Ok(()), || {}, 2)
+            .unwrap_err()
+            .contains("Win32 error 5"));
+    }
+
+    #[test]
+    fn persistent_marker_blocks_restart_sweep_and_uninstall_cleanup() {
+        assert!(!marker_blocks_cleanup::<()>(&Ok(false)));
+        assert!(marker_blocks_cleanup::<()>(&Ok(true)));
+        assert!(marker_blocks_cleanup::<()>(&Err(())));
     }
 
     #[test]

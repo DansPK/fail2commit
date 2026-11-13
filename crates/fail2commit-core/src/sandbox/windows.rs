@@ -621,9 +621,14 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
 pub(crate) fn with_hardened_job_grants<T>(
     job: &JobSpec,
     account_sid: &str,
-    action: impl FnOnce() -> crate::Result<T>,
+    action: impl FnOnce() -> HardenedGrantAction<T>,
 ) -> crate::Result<T> {
     let stage_root = stage_root()?;
+    if crate::sandbox::hardened::service::launch_recovery_pending().unwrap_or(true) {
+        return Err(crate::Error::isolation_unavailable(
+            "an unresolved hardened launch marker blocks staging ACL cleanup and launch",
+        ));
+    }
     clear_pending_revokes(&stage_root)?;
     clear_stale_profiles(&stage_root)?;
     let paths = ValidatedPaths::new(job, &stage_root)?;
@@ -633,7 +638,16 @@ pub(crate) fn with_hardened_job_grants<T>(
         grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
     }
     grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
-    let result = action();
+    let result = match action() {
+        HardenedGrantAction::Complete(result) => result,
+        HardenedGrantAction::ContainmentUnconfirmed(error) => {
+            // The launcher may still have a live descendant. Persisted revocation
+            // state and the grants themselves must remain intact until recovery can
+            // prove the process tree is gone.
+            std::mem::forget(grants);
+            return Err(error);
+        }
+    };
     let cleanup = grants.release();
     match (result, cleanup) {
         (Ok(value), Ok(())) => Ok(value),
@@ -644,6 +658,11 @@ pub(crate) fn with_hardened_job_grants<T>(
             error.message, cleanup.message
         ))),
     }
+}
+
+pub(crate) enum HardenedGrantAction<T> {
+    Complete(crate::Result<T>),
+    ContainmentUnconfirmed(crate::Error),
 }
 
 pub(crate) fn sweep_hardened_job_state(cache_root: &Path) -> crate::Result<()> {
@@ -1752,6 +1771,11 @@ fn write_pending_revokes(stage_root: &Path, entries: &[PendingRevoke]) -> crate:
 /// Retry outstanding revocations and refuse while any remain. Called by every
 /// `probe()` and `run()` so a leaked ACE is never silently ignored (S7B-006).
 fn clear_pending_revokes(stage_root: &Path) -> crate::Result<()> {
+    if crate::sandbox::hardened::service::launch_recovery_pending().unwrap_or(true) {
+        return Err(crate::Error::isolation_unavailable(
+            "an unresolved hardened launch marker blocks pending ACL revocation cleanup",
+        ));
+    }
     let entries = read_pending_revokes(stage_root)?;
     if entries.is_empty() {
         return Ok(());
