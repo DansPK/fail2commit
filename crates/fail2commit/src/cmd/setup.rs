@@ -157,7 +157,7 @@ fn command_resolution(ctx: &Ctx) -> (serde_json::Value, Vec<(String, String)>) {
 pub fn status(ctx: &Ctx) -> CmdResult {
     let sctx = setup_ctx(ctx, true)?;
     let integrations: Vec<_> = integrations().iter().map(|i| i.status(&sctx)).collect();
-    let probe = fail2commit_core::sandbox::platform_backend().probe();
+    let probe = fail2commit_core::sandbox::select_backend(&ctx.settings).probe();
     let (resolution, unguarded) = command_resolution(ctx);
     let mut text = format!(
         "sandbox {} ({}: {})",

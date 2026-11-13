@@ -2,7 +2,7 @@
 //! extension toggle the same trusted setting through this command.
 
 use super::{CmdResult, Ctx, Outcome};
-use fail2commit_core::sandbox::platform_backend;
+use fail2commit_core::sandbox::select_backend;
 use fail2commit_core::settings::Settings;
 
 #[derive(clap::Args, Debug)]
@@ -11,7 +11,7 @@ pub struct Args {
     pub action: Action,
 }
 
-#[derive(clap::Subcommand, Debug, Clone, Copy)]
+#[derive(clap::Subcommand, Debug)]
 pub enum Action {
     /// Run required package scripts in the sandbox (default).
     On,
@@ -19,20 +19,35 @@ pub enum Action {
     Off,
     /// Show the setting and the isolation backend probe.
     Status,
+    /// Service entry point (socket activation on Linux; SCM on Windows).
+    #[command(hide = true)]
+    Serve,
+    /// Service-only launcher entry point; never exposed in CLI help.
+    #[command(hide = true)]
+    Launch {
+        jobfile: std::path::PathBuf,
+        #[arg(long)]
+        watchdog: Option<u64>,
+    },
 }
 
 pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
-    let enabled = match args.action {
+    let enabled = match &args.action {
         Action::Status => ctx.settings.sandbox.enabled,
         Action::On | Action::Off => {
-            let on = matches!(args.action, Action::On);
+            let on = matches!(&args.action, Action::On);
             ctx.paths.ensure()?;
             Settings::update(&ctx.paths, |s| s.sandbox.enabled = on)?
                 .sandbox
                 .enabled
         }
+        Action::Serve | Action::Launch { .. } => {
+            return Err(fail2commit_core::Error::rejected(
+                "private sandbox entry point was not routed",
+            ));
+        }
     };
-    let probe = platform_backend().probe();
+    let probe = select_backend(&ctx.settings).probe();
     let mut text = format!(
         "sandbox: {}\nbackend: {} ({})",
         if enabled { "on" } else { "off" },
@@ -52,7 +67,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
             if *ok { "ok" } else { "missing" }
         ));
     }
-    if !matches!(args.action, Action::Status) && !enabled {
+    if !matches!(&args.action, Action::Status) && !enabled {
         text.push_str(
             "\nscripts will be skipped by default; a required script needs a separate \
              \"Run on host once\" approval. Dependency scans, integrity and Git checks stay active.",
@@ -74,4 +89,12 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         }),
         ..Default::default()
     })
+}
+
+pub fn serve() -> fail2commit_core::Result<()> {
+    fail2commit_core::sandbox::hardened::serve()
+}
+
+pub fn launch(jobfile: &std::path::Path, watchdog: Option<u64>) -> fail2commit_core::Result<()> {
+    fail2commit_core::sandbox::hardened::launch(jobfile, watchdog)
 }

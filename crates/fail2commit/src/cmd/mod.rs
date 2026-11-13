@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod git;
+pub mod hardened;
 pub mod hook;
 pub mod machine;
 pub mod malware_list;

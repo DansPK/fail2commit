@@ -1,3 +1,207 @@
 //! Hardened-mode wire contract and backends (FR-027, SPEC-018).
 
+pub mod lifecycle;
 pub mod protocol;
+pub mod service;
+
+use crate::isolation::{JobOutcome, JobSpec, ProbeReport, SandboxBackend};
+use crate::settings::{BackendChoice, Settings};
+
+/// Select an installed hardened backend in `auto` mode. An installed but
+/// unverified backend is represented by a backend whose probe always fails;
+/// it must never silently fall back to the platform sandbox.
+pub(crate) fn selected(settings: &Settings) -> Option<Box<dyn SandboxBackend>> {
+    if should_select_hardened(settings.sandbox.backend, installed()) {
+        return Some(Box::new(HardenedBackend));
+    }
+    None
+}
+
+fn should_select_hardened(choice: BackendChoice, installed: bool) -> bool {
+    choice == BackendChoice::Auto && installed
+}
+
+pub fn install() -> crate::Result<serde_json::Value> {
+    lifecycle::install()
+}
+pub fn uninstall() -> crate::Result<serde_json::Value> {
+    lifecycle::uninstall()
+}
+pub fn status() -> serde_json::Value {
+    lifecycle::status()
+}
+
+pub fn serve() -> crate::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        service::serve_linux()
+    }
+    #[cfg(windows)]
+    {
+        service::serve_windows()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Err(crate::Error::isolation_unavailable("unsupported platform"))
+    }
+}
+
+/// Launcher entry point deliberately refuses until all per-job isolation
+/// controls, grants, and watchdog handling have been wired and probed.
+pub fn launch(_jobfile: &std::path::Path, _watchdog: Option<u64>) -> crate::Result<()> {
+    Err(crate::Error::isolation_unavailable(
+        "hardened launcher controls are not verified; refusing to execute job",
+    ))
+}
+
+/// Whether the machine-level install marker exists. A malformed marker still
+/// counts as installed so a damaged install fails closed rather than falling
+/// back to a weaker backend.
+pub fn installed() -> bool {
+    #[cfg(windows)]
+    {
+        return match machine_state_path() {
+            Ok(p) => match std::fs::symlink_metadata(p) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            },
+            Err(_) => true,
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        machine_state_path().is_file()
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn machine_state_path() -> crate::Result<std::path::PathBuf> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt;
+    #[repr(C)]
+    struct Guid {
+        d1: u32,
+        d2: u16,
+        d3: u16,
+        d4: [u8; 8],
+    }
+    const PROGRAM_DATA: Guid = Guid {
+        d1: 0x62ab5d82,
+        d2: 0xfdc1,
+        d3: 0x4dc3,
+        d4: [0xa9, 0xdd, 0x07, 0x0d, 0x1d, 0x49, 0x5d, 0x97],
+    };
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHGetKnownFolderPath(
+            id: *const Guid,
+            flags: u32,
+            token: *mut c_void,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoTaskMemFree(ptr: *mut c_void);
+    }
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: valid known-folder GUID and writable out pointer; NULL selects
+    // the current process token and flags=0 requests the default path.
+    let hr = unsafe { SHGetKnownFolderPath(&PROGRAM_DATA, 0, std::ptr::null_mut(), &mut raw) };
+    if hr < 0 || raw.is_null() {
+        return Err(crate::Error::isolation_unavailable(
+            "cannot resolve trusted ProgramData known folder",
+        ));
+    }
+    // SAFETY: SHGetKnownFolderPath returned a NUL-terminated CoTaskMem string.
+    let path = unsafe {
+        let mut n = 0usize;
+        while *raw.add(n) != 0 {
+            n += 1;
+        }
+        let s = std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, n));
+        CoTaskMemFree(raw.cast());
+        std::path::PathBuf::from(s)
+    };
+    Ok(path.join("fail2commit-hardened").join("install.json"))
+}
+
+#[cfg(target_os = "linux")]
+fn machine_state_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/etc/fail2commit-hardened.json")
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn machine_state_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/nonexistent/fail2commit-hardened.json")
+}
+
+struct HardenedBackend;
+
+impl SandboxBackend for HardenedBackend {
+    fn probe(&self) -> ProbeReport {
+        #[cfg(target_os = "linux")]
+        let (service, peer_auth, detail) = service::probe_linux();
+        #[cfg(windows)]
+        let (service, peer_auth, detail) = service::probe_windows();
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let (service, peer_auth, detail) = (
+            false,
+            false,
+            String::from("service transport is not verified"),
+        );
+        ProbeReport {
+            backend: if cfg!(windows) {
+                "hardened-appcontainer"
+            } else {
+                "hardened-bubblewrap"
+            },
+            available: false,
+            detail: format!("{detail}; launcher and platform controls are not verified"),
+            controls: vec![
+                ("service_running".into(), service),
+                ("peer_authentication".into(), peer_auth),
+                ("launcher_watchdog".into(), false),
+                ("platform_controls".into(), false),
+            ],
+        }
+    }
+
+    fn run(&self, _job: &JobSpec) -> crate::Result<JobOutcome> {
+        Err(crate::Error::isolation_unavailable(
+            "hardened controls are not verified; refusing to launch",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::settings::Settings;
+
+    #[test]
+    fn an_installed_hardened_backend_never_reports_available_before_controls_pass() {
+        let probe = HardenedBackend.probe();
+        assert!(!probe.available);
+        assert!(probe
+            .controls
+            .iter()
+            .any(|(name, ok)| name == "peer_authentication" && !ok));
+    }
+
+    #[test]
+    fn vm_choice_remains_platform_fallback_until_vm_backend_exists() {
+        let mut settings = Settings::default();
+        settings.sandbox.backend = BackendChoice::Vm;
+        assert!(selected(&settings).is_none());
+    }
+
+    #[test]
+    fn only_auto_selects_hardened_when_a_machine_install_exists() {
+        assert!(!should_select_hardened(BackendChoice::Auto, false));
+        assert!(should_select_hardened(BackendChoice::Auto, true));
+        assert!(!should_select_hardened(BackendChoice::Vm, true));
+    }
+}

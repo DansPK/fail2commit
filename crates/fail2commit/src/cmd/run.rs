@@ -43,7 +43,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         }
     }
     // Explicit runs need a verified sandbox whatever the sandbox toggle says.
-    let backend = sandbox::platform_backend();
+    let backend = sandbox::select_backend(&ctx.settings);
     let probe = backend.probe();
     policy::explicit_run_allowed(probe.available).map_err(|mut e| {
         e.message = format!("{} ({}: {})", e.message, probe.backend, probe.detail);

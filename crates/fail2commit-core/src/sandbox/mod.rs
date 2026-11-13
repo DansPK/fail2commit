@@ -40,6 +40,14 @@ pub fn platform_backend() -> Box<dyn SandboxBackend> {
     Box::new(Unavailable)
 }
 
+/// Backend selected by trusted sandbox settings. `auto` uses hardened mode
+/// whenever its machine install marker exists; an unhealthy install is kept
+/// selected so `run_job` fails closed rather than dropping to the platform
+/// default. `vm` remains the SPEC-019 fallback until that feature lands.
+pub fn select_backend(settings: &crate::settings::Settings) -> Box<dyn SandboxBackend> {
+    hardened::selected(settings).unwrap_or_else(platform_backend)
+}
+
 /// Probe, run, then export declared paths only after a clean exit.
 /// Backends never export themselves.
 pub fn run_job(backend: &dyn SandboxBackend, job: &JobSpec) -> crate::Result<JobOutcome> {

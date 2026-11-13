@@ -76,6 +76,8 @@ enum Command {
     Run(cmd::run::Args),
     /// Sandbox on / off / status (T-008).
     Sandbox(cmd::sandbox::Args),
+    /// Install, inspect or remove hardened system sandbox mode (FR-027).
+    Hardened(cmd::hardened::Args),
     /// npm registry signing keys: `forget <registry-url>` re-trusts a registry (CR-018).
     Signatures(cmd::signatures::Args),
     /// Windows, administrators: guard machine-wide npm and pip (CR-013).
@@ -123,6 +125,15 @@ fn main() -> ExitCode {
         return exit(cmd::api::run());
     }
     let json = cli.json;
+    if let Command::Sandbox(args) = &cli.command {
+        match &args.action {
+            cmd::sandbox::Action::Serve => return exit(cmd::sandbox::serve().map_or(70, |_| 0)),
+            cmd::sandbox::Action::Launch { jobfile, watchdog } => {
+                return exit(cmd::sandbox::launch(jobfile, *watchdog).map_or(70, |_| 0));
+            }
+            _ => {}
+        }
+    }
     let response = execute(cli, None);
     cmd::print_response(&response, json);
     exit(response.exit_status())
@@ -147,6 +158,7 @@ pub fn execute(cli: Cli, id: Option<String>) -> Response {
         Command::Rules(a) => cmd::rules::run(&ctx, a),
         Command::Run(a) => cmd::run::run(&ctx, a),
         Command::Sandbox(a) => cmd::sandbox::run(&ctx, a),
+        Command::Hardened(a) => cmd::hardened::run(&ctx, a),
         Command::Signatures(a) => cmd::signatures::run(&ctx, a),
         Command::MachineShims(a) => cmd::machine::run(&ctx, a),
         Command::Password(a) => cmd::password::run(&ctx, a),
