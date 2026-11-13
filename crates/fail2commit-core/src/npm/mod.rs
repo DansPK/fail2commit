@@ -34,6 +34,7 @@ use crate::integration::Integration;
 use crate::isolation::SandboxBackend;
 use crate::paths::TrustedPaths;
 use crate::policy::ScriptSituation;
+use crate::progress::{End as ProgressEnd, Progress, Silent, Step};
 use crate::protocol::{
     ApprovalKind, ApprovalRequest, Decision, Finding, FindingAction, FindingKind,
 };
@@ -65,6 +66,7 @@ type InspectFn<'a> =
 pub struct Deps<'a> {
     pub paths: &'a TrustedPaths,
     pub settings: &'a Settings,
+    pub progress: &'a dyn Progress,
     pub backend: &'a dyn SandboxBackend,
     pub approve: ApproveFn<'a>,
     pub authorize: AuthorizeFn<'a>,
@@ -82,6 +84,7 @@ impl<'a> Deps<'a> {
         Deps {
             paths: ctx.paths,
             settings: ctx.settings,
+            progress: &Silent,
             backend,
             approve: Box::new(move |req| crate::approval::approve(ctx, req)),
             authorize: Box::new(move |sit, summary, digest| {
@@ -191,8 +194,29 @@ fn unsupported_manifest(pj: &serde_json::Value) -> Result<()> {
 /// Execute one guarded install. Serialized per project; an interrupted
 /// earlier apply is recovered first.
 pub fn execute(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
+    deps.progress.step(Step::Resolve, 1);
     let lock = commit::lock_path(deps.paths, &req.project);
-    crate::fsutil::with_lock(&lock, || execute_locked(deps, req))
+    let result = crate::fsutil::with_lock(&lock, || execute_locked(deps, req));
+    match &result {
+        Ok(o) => {
+            for f in &o.findings {
+                deps.progress.finding(f);
+            }
+            let end = if o.findings.is_empty() {
+                ProgressEnd::Clean
+            } else {
+                ProgressEnd::Findings
+            };
+            deps.progress.finish(end, &o.message);
+        }
+        Err(e) => {
+            for f in &e.findings {
+                deps.progress.finding(f);
+            }
+            deps.progress.finish(ProgressEnd::Stopped, &e.message);
+        }
+    }
+    result
 }
 
 fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
@@ -281,8 +305,12 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
 
     // 3. Review the exact graph: verified tarballs, extracted by npm itself
     //    (scripts off) into the staging tree, reviewed from disk.
+    deps.progress.advance(1, "dependency graph resolved");
     let plan = lockfile::parse(&final_lock, &registry, deps.settings.limits.graph_max_nodes)?;
+    deps.progress
+        .step(Step::DownloadVerify, plan.pkgs.len() as u64);
     let mut reviewed = review::review(deps, &registry, &plan, &sd.join("tarballs"))?;
+    deps.progress.advance(plan.pkgs.len() as u64, "");
     apply::seed_cache(deps, &tc, &st, &reviewed)?;
     apply::npm_step(deps, &tc, &st, &proj_stage, &["ci"], &["--offline".into()])?;
     // Hashed before the review reads anything: a later difference is a change.
@@ -293,22 +321,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         .iter()
         .filter(|p| p.file.is_some() && found.contains(&p.plan.path))
         .collect();
-    // FR-013: Step::ScanCode — YARA rules over every installed file (FR-019).
     let mut extra = refreshed;
-    if let Some(m) = &matcher {
-        let mut budget = crate::scan::yara::Budget::default();
-        for rp in &installed {
-            let install: std::collections::BTreeSet<String> =
-                rp.inputs.iter().map(|(p, _)| p.clone()).collect();
-            extra.extend(crate::scan::yara::scan_package(
-                m,
-                &review::package_id(&rp.plan),
-                &proj_stage.join(&rp.plan.path),
-                &install,
-                &mut budget,
-            ));
-        }
-    }
     // FR-013: Step::PreInstallChecks — registry and reviewed files (FR-025).
     let mut cands: Vec<crate::scan::checks::Candidate> = Vec::new();
     for rp in &installed {
@@ -321,6 +334,8 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
             });
         }
     }
+    deps.progress
+        .step(Step::PreInstallChecks, cands.len() as u64);
     extra.extend(crate::scan::checks::run(
         paths,
         deps.settings,
@@ -331,6 +346,29 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         },
         &cands,
     ));
+    for finding in &extra {
+        deps.progress.finding(finding);
+    }
+    deps.progress.advance(cands.len() as u64, "");
+    // FR-013: Step::ScanCode — YARA rules over every installed file (FR-019).
+    deps.progress.step(Step::ScanCode, installed.len() as u64);
+    if let Some(m) = &matcher {
+        let mut budget = crate::scan::yara::Budget::default();
+        for (i, rp) in installed.iter().enumerate() {
+            let install: std::collections::BTreeSet<String> =
+                rp.inputs.iter().map(|(p, _)| p.clone()).collect();
+            extra.extend(crate::scan::yara::scan_package(
+                m,
+                &review::package_id(&rp.plan),
+                &proj_stage.join(&rp.plan.path),
+                &install,
+                &mut budget,
+            ));
+            deps.progress.advance((i + 1) as u64, &rp.plan.name);
+        }
+    } else {
+        deps.progress.advance(installed.len() as u64, "");
+    }
     reviewed.findings.extend(extra);
     // FR-013: Step::Advisories
     let ids: Vec<PackageId> = {
@@ -339,7 +377,12 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         v.dedup();
         v
     };
+    deps.progress.step(Step::Advisories, ids.len() as u64);
     let report = (deps.advisories)(&ids);
+    deps.progress.advance(ids.len() as u64, "");
+    for finding in &report.findings {
+        deps.progress.finding(finding);
+    }
     let mut findings = reviewed.findings.clone();
     findings.extend(report.findings);
     if !report.complete
@@ -458,6 +501,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
             false,
             vec![Decision::ApproveOnce],
         )?;
+        deps.progress.pause();
         match (deps.approve)(&request)? {
             Decision::ApproveOnce => {}
             _ => {
@@ -534,6 +578,13 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         tree::recheck(&proj_stage, &reviewed)?;
         tree::verify_unchanged(&proj_stage, &snap)?;
         // FR-013: Step::Scripts
+        let script_count = reviewed
+            .pkgs
+            .iter()
+            .filter(|p| p.file.is_some())
+            .map(|p| p.scripts.len() as u64)
+            .sum();
+        deps.progress.step(Step::Scripts, script_count);
         let (ran, activity) =
             apply::run_scripts(deps, &tc, sd, &proj_stage, &reviewed, &found, mode, &|| {
                 tree::recheck(&proj_stage, &reviewed)
@@ -545,6 +596,8 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         };
         let _ = std::fs::remove_dir_all(proj_stage.join(".f2c-tmp"));
         // FR-013: Step::ScanOutput — FR-028, before anything reaches the project.
+        deps.progress.step(Step::ScanOutput, output.len() as u64);
+        deps.progress.advance(output.len() as u64, "");
         let produced = review_output(
             deps,
             &plan_digest,
@@ -554,7 +607,12 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
             &output,
             matcher.as_ref(),
         )?;
+        for finding in &produced {
+            deps.progress.finding(finding);
+        }
+        deps.progress.advance(output.len() as u64, "");
         // FR-013: Step::Apply
+        deps.progress.step(Step::Apply, 1);
         apply::move_tree(
             &proj_stage.join("node_modules"),
             &apply_dir.join("node_modules"),
@@ -578,6 +636,7 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         },
         deps.crash,
     )?;
+    deps.progress.advance(1, "");
 
     let mut message = format!(
         "installed {} package(s)",

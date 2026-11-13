@@ -425,6 +425,7 @@ pub fn clean_advisories() -> AdvisoryReport {
 /// the test supplies its own.
 pub fn seams<'a>(index: &TestIndex) -> Seams<'a> {
     Seams {
+        progress: &fail2commit_core::progress::Silent,
         advisories: Box::new(|_| clean_advisories()),
         approve: Box::new(|_| panic!("approval must not be requested for a clean install")),
         cancel: Arc::new(AtomicBool::new(false)),

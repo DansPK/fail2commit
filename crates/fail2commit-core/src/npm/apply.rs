@@ -578,6 +578,7 @@ pub fn run_scripts(
             )));
         }
         ran.push(label);
+        deps.progress.advance(ran.len() as u64, &l.name);
     }
     Ok((ran, activity))
 }

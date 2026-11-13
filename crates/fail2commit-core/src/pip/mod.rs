@@ -38,6 +38,7 @@ pub use plan::PlanWheel;
 
 use crate::approval::ApprovalCtx;
 use crate::integration::Integration;
+use crate::progress::{End as ProgressEnd, Progress, Silent, Step};
 use crate::protocol::{ApprovalKind, ApprovalRequest, Decision};
 use crate::scan::{AdvisoryReport, PackageId};
 use crate::{Error, Finding, FindingAction, FindingKind, ResultCode};
@@ -57,6 +58,7 @@ type ApproveFn<'a> = Box<dyn Fn(&ApprovalRequest) -> crate::Result<Decision> + '
 /// Everything a test needs to replace. [`Seams::production`] wires the
 /// real approval channel and advisory scanner.
 pub struct Seams<'a> {
+    pub progress: &'a dyn Progress,
     pub advisories: AdvisoryFn<'a>,
     pub approve: ApproveFn<'a>,
     pub cancel: Cancel,
@@ -70,6 +72,7 @@ pub struct Seams<'a> {
 impl<'a> Seams<'a> {
     pub fn production(ctx: &'a ApprovalCtx<'a>, cancel: Cancel) -> Seams<'a> {
         Seams {
+            progress: &Silent,
             advisories: Box::new(move |pkgs| {
                 crate::scan::check_advisories(ctx.paths, &ctx.settings.advisories, pkgs)
             }),
@@ -140,6 +143,44 @@ pub fn default_python(paths: &crate::paths::TrustedPaths) -> crate::Result<PathB
 
 /// Guarded `pip install`. `args` is everything after the word `install`.
 pub fn install(
+    ctx: &ApprovalCtx<'_>,
+    python: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    seams: &Seams<'_>,
+) -> crate::Result<InstallReport> {
+    seams.progress.step(Step::Resolve, 1);
+    let result = install_inner(ctx, python, args, cwd, seams);
+    match &result {
+        Ok(r) => {
+            for f in &r.findings {
+                seams.progress.finding(f);
+            }
+            let end = if r.findings.is_empty() {
+                ProgressEnd::Clean
+            } else {
+                ProgressEnd::Findings
+            };
+            seams.progress.finish(
+                end,
+                if r.findings.is_empty() {
+                    "Install review completed"
+                } else {
+                    "Install review completed with findings"
+                },
+            );
+        }
+        Err(e) => {
+            for f in &e.findings {
+                seams.progress.finding(f);
+            }
+            seams.progress.finish(ProgressEnd::Stopped, &e.message);
+        }
+    }
+    result
+}
+
+fn install_inner(
     ctx: &ApprovalCtx<'_>,
     python: &Path,
     args: &[OsString],
@@ -230,12 +271,17 @@ pub fn install(
     let report =
         std::fs::read(&report_path).map_err(|_| Error::internal("pip produced no report"))?;
     let staged = plan::from_report(&report, &proxy)?;
+    seams.progress.advance(1, "dependency plan resolved");
     if let Some(e) = proxy.shared.failure.lock().unwrap().clone() {
         return Err(e);
     }
     proxy.stop(); // from here on nothing can reach the network
 
     let wheels: Vec<PlanWheel> = staged.iter().map(|(w, _)| w.clone()).collect();
+    seams
+        .progress
+        .step(Step::DownloadVerify, wheels.len() as u64);
+    seams.progress.advance(wheels.len() as u64, "");
     check_pins(&req, &wheels)?;
     let digest = plan::plan_digest(&interp, &policy.url, &req.canonical(), &wheels)?;
     if wheels.is_empty() {
@@ -254,7 +300,6 @@ pub fn install(
     let requested = req.canonical();
     // FR-018: refresh stale threat data first when the user asked for it.
     let mut extra = crate::scan::malware_list::auto_refresh(ctx.paths, ctx.settings);
-    extra.extend(match_wheels(matcher.as_ref(), &reviewed, &wheels));
     // FR-013: Step::PreInstallChecks — registry metadata and the reviewed wheels (FR-025).
     let cands: Vec<crate::scan::checks::Candidate> = wheels
         .iter()
@@ -264,6 +309,9 @@ pub fn install(
             install_script: false,
         })
         .collect();
+    seams
+        .progress
+        .step(Step::PreInstallChecks, cands.len() as u64);
     extra.extend(crate::scan::checks::run(
         ctx.paths,
         ctx.settings,
@@ -274,6 +322,14 @@ pub fn install(
         },
         &cands,
     ));
+    for finding in &extra {
+        seams.progress.finding(finding);
+    }
+    seams.progress.advance(cands.len() as u64, "");
+    seams.progress.step(Step::ScanCode, wheels.len() as u64);
+    let scan_findings = match_wheels(matcher.as_ref(), &reviewed, &wheels, seams.progress);
+    extra.extend(scan_findings);
+    seams.progress.advance(wheels.len() as u64, "");
     // FR-028: pip installs wheels only and runs no package code (no sandboxed
     // scripts, `has_scripts = false` below), so there is no script output to
     // scan before apply.
@@ -316,17 +372,24 @@ fn match_wheels(
     matcher: Option<&crate::scan::yara::Matcher>,
     dir: &Path,
     wheels: &[PlanWheel],
+    progress: &dyn Progress,
 ) -> Vec<Finding> {
     let Some(m) = matcher else {
+        progress.advance(wheels.len() as u64, "");
         return Vec::new();
     };
     let mut budget = crate::scan::yara::Budget::default();
-    wheels
-        .iter()
-        .flat_map(|w| {
-            crate::scan::yara::scan_wheel(m, &w.package(), &dir.join(&w.filename), &mut budget)
-        })
-        .collect()
+    let mut findings = Vec::new();
+    for (i, w) in wheels.iter().enumerate() {
+        let found =
+            crate::scan::yara::scan_wheel(m, &w.package(), &dir.join(&w.filename), &mut budget);
+        for finding in &found {
+            progress.finding(finding);
+        }
+        findings.extend(found);
+        progress.advance((i + 1) as u64, &format!("{}=={}", w.name, w.version));
+    }
+    findings
 }
 
 /// What inspecting the reviewed copies found: approvable startup files, and a
@@ -406,9 +469,17 @@ fn review_and_apply(
 ) -> crate::Result<(Vec<Finding>, bool)> {
     // Layout denies and startup files come from the reviewed copies (RP-003/4).
     let startup = scan_wheels(reviewed, wheels, interp)?.startup;
+    for finding in &startup {
+        seams.progress.finding(finding);
+    }
     // FR-013: Step::Advisories
     let pkgs: Vec<PackageId> = wheels.iter().map(PlanWheel::package).collect();
+    seams.progress.step(Step::Advisories, pkgs.len() as u64);
     let adv = (seams.advisories)(&pkgs);
+    seams.progress.advance(pkgs.len() as u64, "");
+    for finding in &adv.findings {
+        seams.progress.finding(finding);
+    }
     if adv.findings.iter().any(|f| f.action == FindingAction::Deny) {
         return Err(
             Error::rejected("blocked by a deny finding; nothing was installed")
@@ -451,6 +522,7 @@ fn review_and_apply(
             false,
             vec![Decision::ApproveOnce],
         )?;
+        seams.progress.pause();
         match (seams.approve)(&req)? {
             Decision::ApproveOnce => approved = true,
             _ => {
@@ -483,6 +555,7 @@ fn review_and_apply(
         return Err(Error::rejected("canceled; nothing was installed"));
     }
     // FR-013: Step::Apply
+    seams.progress.step(Step::Apply, wheels.len() as u64);
     apply::apply(
         cx,
         &apply::PlanInputs {
@@ -493,6 +566,7 @@ fn review_and_apply(
         reviewed,
         wheels,
     )?;
+    seams.progress.advance(wheels.len() as u64, "");
     Ok((findings, approved))
 }
 
@@ -596,7 +670,7 @@ fn recover_locked(
     findings.extend(startup.iter().cloned());
     // FR-019: the remaining wheels are matched again before the fresh approval.
     let matcher = crate::scan::yara::Matcher::load(ctx.paths, &ctx.settings.rules)?;
-    findings.extend(match_wheels(matcher.as_ref(), &j.reviewed, &left));
+    findings.extend(match_wheels(matcher.as_ref(), &j.reviewed, &left, &Silent));
     let digest = plan::recover_digest(interp, &left)?;
     let details: Vec<String> = std::iter::once(format!(
         "interpreter {} ({}, {}); finishing an unfinished plan: {} of {} wheel(s) already installed",

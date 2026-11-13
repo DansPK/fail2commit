@@ -667,6 +667,7 @@ impl<'a> Run<'a> {
         Deps {
             paths: &self.env.paths,
             settings: &self.env.settings,
+            progress: &fail2commit_core::progress::Silent,
             backend,
             approve: Box::new(move |req| {
                 requests.lock().unwrap().push(req.clone());

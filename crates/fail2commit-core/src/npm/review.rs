@@ -145,6 +145,10 @@ pub fn review(deps: &Deps<'_>, registry: &Registry, plan: &Plan, dir: &Path) -> 
                     break;
                 };
                 let r = fetch_one(limits, &plan.pkgs[*first], n, dir);
+                deps.progress.advance(
+                    (n + 1) as u64,
+                    &format!("{}@{}", plan.pkgs[*first].name, plan.pkgs[*first].version),
+                );
                 *slots[n].lock().expect("slot") = Some(r);
             });
         }
