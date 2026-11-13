@@ -69,9 +69,50 @@ pub fn installed() -> bool {
             Err(_) => true,
         };
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        machine_state_path().is_file()
+        let remnants = [
+            std::path::PathBuf::from("/etc/systemd/system/fail2commit-hardened.socket"),
+            std::path::PathBuf::from("/etc/systemd/system/fail2commit-hardened.service"),
+            std::path::PathBuf::from(
+                "/etc/systemd/system/sockets.target.wants/fail2commit-hardened.socket",
+            ),
+            std::path::PathBuf::from("/etc/fail2commit-hardened.json.new"),
+            std::path::PathBuf::from("/usr/lib/fail2commit-hardened"),
+            std::path::PathBuf::from("/run/fail2commit-hardened"),
+            std::path::PathBuf::from("/var/lib/fail2commit-hardened"),
+        ];
+        let account_present = match std::fs::read_to_string("/etc/passwd") {
+            Ok(passwd) => passwd
+                .lines()
+                .any(|line| line.split(':').next() == Some("f2c-sandbox")),
+            Err(_) => true,
+        };
+        marker_or_remnants(&machine_state_path(), &remnants, account_present)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn marker_or_remnants(
+    marker: &std::path::Path,
+    remnants: &[std::path::PathBuf],
+    account_present: bool,
+) -> bool {
+    match std::fs::symlink_metadata(marker) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            account_present
+                || remnants.iter().any(|p| match std::fs::symlink_metadata(p) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(_) => true,
+                })
+        }
+        Err(_) => true,
     }
 }
 
@@ -203,5 +244,22 @@ mod selection_tests {
         assert!(!should_select_hardened(BackendChoice::Auto, false));
         assert!(should_select_hardened(BackendChoice::Auto, true));
         assert!(!should_select_hardened(BackendChoice::Vm, true));
+    }
+
+    #[test]
+    fn damaged_or_missing_marker_with_linux_remnants_fails_closed() {
+        let td = tempfile::tempdir().unwrap();
+        let marker = td.path().join("install.json");
+        let unit = td.path().join("fail2commit-hardened.socket");
+        let remnants = vec![unit.clone()];
+        assert!(!marker_or_remnants(&marker, &remnants, false));
+        std::fs::write(&unit, b"managed unit").unwrap();
+        assert!(marker_or_remnants(&marker, &remnants, false));
+        std::fs::remove_file(&unit).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(marker_or_remnants(&marker, &remnants, false));
+        std::fs::remove_dir(&marker).unwrap();
+        assert!(marker_or_remnants(&marker, &remnants, true));
+        assert!(marker_or_remnants(std::path::Path::new("\0"), &[], false));
     }
 }

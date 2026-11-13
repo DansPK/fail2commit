@@ -9,6 +9,8 @@ use std::path::Path;
 
 #[cfg(any(target_os = "linux", windows, test))]
 const MAX_REQUEST: usize = 16 * 1024;
+#[cfg(any(target_os = "linux", windows))]
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(any(target_os = "linux", windows, test))]
 #[derive(Debug, Deserialize)]
@@ -36,6 +38,17 @@ fn response(ok: bool, detail: &'static str) -> Response {
         probe_available: false,
         detail: detail.to_owned(),
     }
+}
+
+#[cfg(any(target_os = "linux", windows, test))]
+fn decode_request(line: &[u8]) -> crate::Result<Request> {
+    if line.len() >= MAX_REQUEST || !line.ends_with(b"\n") {
+        return Err(crate::Error::invalid(
+            "request is incomplete or exceeds size limit",
+        ));
+    }
+    serde_json::from_slice::<Request>(line)
+        .map_err(|_| crate::Error::invalid("malformed hardened service request"))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -127,9 +140,21 @@ pub fn serve_linux() -> crate::Result<()> {
         ));
     }
     for conn in listener.incoming() {
-        let mut stream = conn?;
-        let peer_uid = peer_uid(&stream)?;
-        serve_one(&mut stream, peer_uid, state.installer_uid, sandbox_uid)?;
+        let Ok(mut stream) = conn else { continue };
+        if stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()
+            || stream.set_write_timeout(Some(REQUEST_TIMEOUT)).is_err()
+        {
+            continue;
+        }
+        let Ok(peer_uid) = peer_uid(&stream) else {
+            continue;
+        };
+        if serve_one(&mut stream, peer_uid, state.installer_uid, sandbox_uid).is_err() {
+            let rejected = response(false, "malformed or timed-out service request");
+            let _ = serde_json::to_writer(&mut stream, &rejected);
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+        }
     }
     Ok(())
 }
@@ -311,21 +336,60 @@ fn peer_uid(stream: &std::os::unix::net::UnixStream) -> crate::Result<u32> {
 }
 
 #[cfg(target_os = "linux")]
+fn read_request_deadline(
+    stream: &mut std::os::unix::net::UnixStream,
+    timeout: std::time::Duration,
+) -> crate::Result<Vec<u8>> {
+    use std::io::Read;
+    stream.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + timeout;
+    let result = (|| {
+        let mut line = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(crate::Error::invalid("service request timed out"));
+            }
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    return Err(crate::Error::invalid(
+                        "peer closed before request completed",
+                    ))
+                }
+                Ok(n) => {
+                    line.extend_from_slice(&buf[..n]);
+                    if line.contains(&b'\n') {
+                        break;
+                    }
+                    if line.len() >= MAX_REQUEST {
+                        return Err(crate::Error::invalid("service request exceeds size limit"));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(line)
+    })();
+    let restore = stream.set_nonblocking(false);
+    if let Err(e) = restore {
+        return Err(e.into());
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
 fn serve_one(
     stream: &mut std::os::unix::net::UnixStream,
     uid: u32,
     installer: u32,
     sandbox: u32,
 ) -> crate::Result<()> {
-    let mut line = Vec::new();
-    BufReader::new(stream.try_clone()?)
-        .take(MAX_REQUEST as u64)
-        .read_until(b'\n', &mut line)?;
-    if line.len() >= MAX_REQUEST || !line.ends_with(b"\n") {
-        return Err(crate::Error::invalid("request exceeds size limit"));
-    }
-    let req = serde_json::from_slice::<Request>(&line)
-        .map_err(|_| crate::Error::invalid("malformed service request"))?;
+    let line = read_request_deadline(stream, REQUEST_TIMEOUT)?;
+    let req = decode_request(&line)?;
     let result = dispatch(req, uid, installer, sandbox);
     serde_json::to_writer(&mut *stream, &result)
         .map_err(|e| crate::Error::internal(e.to_string()))?;
@@ -496,6 +560,99 @@ pub fn serve_windows() -> crate::Result<()> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
+fn read_pipe_request(pipe: windows_sys::Win32::Foundation::HANDLE) -> crate::Result<Vec<u8>> {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+    let mut line = Vec::new();
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(crate::Error::invalid("service request timed out"));
+        }
+        let mut available = 0u32;
+        // SAFETY: pipe is a connected local named-pipe handle, and available is writable.
+        if unsafe {
+            PeekNamedPipe(
+                pipe,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(crate::Error::invalid(
+                "cannot peek authenticated request pipe",
+            ));
+        }
+        if available == 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(crate::Error::invalid("service request timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        let count = available.min(4096).min((MAX_REQUEST - line.len()) as u32);
+        let mut buf = vec![0u8; count as usize];
+        let mut read = 0u32;
+        // SAFETY: buf has count writable bytes; pipe is nonblocking and data is available.
+        if unsafe {
+            ReadFile(
+                pipe,
+                buf.as_mut_ptr(),
+                count,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        } == 0
+            || read == 0
+        {
+            return Err(crate::Error::invalid(
+                "cannot read authenticated request pipe",
+            ));
+        }
+        line.extend_from_slice(&buf[..read as usize]);
+        if line.contains(&b'\n') {
+            return Ok(line);
+        }
+        if line.len() >= MAX_REQUEST {
+            return Err(crate::Error::invalid("service request exceeds size limit"));
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn write_pipe_response(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    reply: &Response,
+) -> crate::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    let mut bytes = serde_json::to_vec(reply).map_err(|e| crate::Error::internal(e.to_string()))?;
+    bytes.push(b'\n');
+    let mut written = 0u32;
+    // SAFETY: bytes is a valid readable buffer; the response is bounded by MAX_REQUEST.
+    if unsafe {
+        WriteFile(
+            pipe,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    } == 0
+        || written as usize != bytes.len()
+    {
+        return Err(crate::Error::internal(
+            "cannot write authenticated service response",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
 fn service_loop_windows() -> crate::Result<()> {
     use crate::ipc::winsec::{self, PipeSecurity};
     use std::ffi::OsStr;
@@ -510,7 +667,7 @@ fn service_loop_windows() -> crate::Result<()> {
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, SetNamedPipeHandleState,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
     };
 
     let state = super::lifecycle::installed_state()?;
@@ -565,7 +722,7 @@ fn service_loop_windows() -> crate::Result<()> {
             }
             continue;
         }
-        let mut mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+        let mut mode = PIPE_READMODE_BYTE | 0x00000001;
         // SAFETY: valid connected server pipe and writable mode value.
         if unsafe {
             SetNamedPipeHandleState(raw, &mut mode, std::ptr::null_mut(), std::ptr::null_mut())
@@ -585,31 +742,42 @@ fn service_loop_windows() -> crate::Result<()> {
         if !windows_peer_allowed(&facts.user, &expected, facts.app_container) {
             continue;
         }
-        let mut pipe = std::fs::File::from(handle);
-        let mut line = Vec::new();
-        BufReader::new(pipe.try_clone()?)
-            .take(MAX_REQUEST as u64)
-            .read_until(b'\n', &mut line)?;
-        if line.len() >= MAX_REQUEST || !line.ends_with(b"\n") {
-            continue;
-        }
-        let request = serde_json::from_slice::<Request>(&line)
-            .map_err(|_| crate::Error::invalid("malformed hardened service request"))?;
+        let line = match read_pipe_request(raw) {
+            Ok(line) => line,
+            Err(_) => {
+                let _ = write_pipe_response(
+                    raw,
+                    &response(false, "malformed or timed-out service request"),
+                );
+                continue;
+            }
+        };
+        let request = match decode_request(&line) {
+            Ok(request) => request,
+            Err(_) => {
+                let _ = write_pipe_response(
+                    raw,
+                    &response(false, "malformed or timed-out service request"),
+                );
+                continue;
+            }
+        };
         let reply = match request.op.as_str() {
             "STATUS" if request.job_dir.is_none() => response(
                 true,
                 "service authenticated peer; launcher and platform controls are not verified",
             ),
+            "LAUNCH" if request.job_dir.is_none() => {
+                response(false, "job_dir is required; job was not started")
+            }
             "LAUNCH" => response(
                 false,
                 "launcher controls are not verified; job was not started",
             ),
             _ => response(false, "unknown or malformed operation"),
         };
-        serde_json::to_writer(&mut pipe, &reply)
-            .map_err(|e| crate::Error::internal(e.to_string()))?;
-        pipe.write_all(b"\n")?;
-        pipe.flush()?;
+        let _ = write_pipe_response(raw, &reply);
+        drop(handle);
     }
 }
 
@@ -647,6 +815,39 @@ mod tests {
         let r = dispatch(req, 1001, 1000, 999);
         assert!(!r.ok);
         assert_eq!(r.detail, "peer uid is not authorized");
+    }
+
+    #[test]
+    fn malformed_or_unterminated_request_is_rejected_without_dispatch() {
+        assert!(decode_request(b"{ definitely not json }\n").is_err());
+        assert!(decode_request(b"{\"op\":\"STATUS\"}").is_err());
+        let oversized = vec![b'a'; MAX_REQUEST];
+        assert!(decode_request(&oversized).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn silent_linux_peer_hits_absolute_request_deadline() {
+        let (mut server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        assert!(read_request_deadline(&mut server, std::time::Duration::from_millis(40)).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authenticated_launch_still_refuses_before_execution_when_controls_are_absent() {
+        let td = tempfile::tempdir().unwrap();
+        let canonical = td.path().canonicalize().unwrap();
+        let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&canonical).unwrap());
+        let request = Request {
+            op: "LAUNCH".into(),
+            job_dir: Some(canonical.to_string_lossy().into_owned()),
+        };
+        let reply = dispatch(request, uid, uid, u32::MAX);
+        assert!(!reply.ok);
+        assert!(!reply.probe_available);
+        assert!(reply.detail.contains("job was not started"));
     }
 
     #[cfg(target_os = "linux")]

@@ -24,6 +24,10 @@ pub struct InstallState {
     pub installer_uid: u32,
     #[serde(default)]
     pub installer_sid: Option<String>,
+    #[serde(default)]
+    pub sandbox_sid: Option<String>,
+    #[serde(default)]
+    pub sandbox_uid: Option<u32>,
     pub executable: String,
     pub account: String,
 }
@@ -98,7 +102,13 @@ fn read_state() -> crate::Result<Option<InstallState>> {
         let state: InstallState = serde_json::from_slice(&std::fs::read(path)?).map_err(|e| {
             crate::Error::integrity(format!("hardened install state is invalid: {e}"))
         })?;
-        if state.version != 1 || state.account != SANDBOX_USER || state.installer_uid == 0 {
+        if state.version != 1
+            || state.account != SANDBOX_USER
+            || state.installer_uid == 0
+            || state.sandbox_uid == Some(0)
+            || state.installer_sid.is_some()
+            || state.sandbox_sid.is_some()
+        {
             return Err(crate::Error::integrity(
                 "hardened install state has unsupported identity fields",
             ));
@@ -142,9 +152,38 @@ fn recorded_executable_matches(recorded: &str, expected: &std::path::Path) -> bo
     std::path::Path::new(recorded) == expected
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn cleanup_then_remove_state(
+    state_path: &std::path::Path,
+    cleanup: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<()> {
+    cleanup()?;
+    match std::fs::remove_file(state_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn owned_service_config(
+    binary: &str,
+    account: &str,
+    service_type: u32,
+    start_type: u32,
+    expected_binary: &str,
+) -> bool {
+    binary == expected_binary
+        && (account.eq_ignore_ascii_case("LocalSystem")
+            || account.eq_ignore_ascii_case(r"NT AUTHORITY\LocalSystem"))
+        && service_type == 0x10
+        && start_type == 2
+}
+
 #[cfg(test)]
 mod tests {
-    use super::recorded_executable_matches;
+    use super::{
+        cleanup_then_remove_state, owned_service_config, recorded_executable_matches, InstallState,
+    };
     use std::path::Path;
 
     #[test]
@@ -162,6 +201,73 @@ mod tests {
             r"C:\Program Files\fail2commit-hardened\..\other.exe",
             managed
         ));
+    }
+
+    #[test]
+    fn v1_state_retains_account_sid_for_interrupted_cleanup_and_reads_legacy_records() {
+        let legacy = br#"{"version":1,"installer_uid":0,"installer_sid":"S-1-5-21-7-8-9-1000","executable":"C:\\Program Files\\fail2commit-hardened\\fail2commit.exe","account":"f2c-sandbox"}"#;
+        let old: InstallState = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(old.sandbox_sid, None);
+        let current = InstallState {
+            version: 1,
+            installer_uid: 0,
+            installer_sid: Some("S-1-5-21-7-8-9-1000".into()),
+            sandbox_sid: Some("S-1-5-21-7-8-9-1001".into()),
+            sandbox_uid: None,
+            executable: r"C:\Program Files\fail2commit-hardened\fail2commit.exe".into(),
+            account: "f2c-sandbox".into(),
+        };
+        let encoded = serde_json::to_vec(&current).unwrap();
+        let decoded: InstallState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.sandbox_sid.as_deref(), Some("S-1-5-21-7-8-9-1001"));
+    }
+
+    #[test]
+    fn service_ownership_requires_expected_binary_identity_and_start_mode() {
+        let binary = r#""C:\Program Files\fail2commit-hardened\fail2commit.exe" sandbox serve"#;
+        assert!(owned_service_config(binary, "LocalSystem", 0x10, 2, binary));
+        assert!(owned_service_config(
+            binary,
+            r"NT AUTHORITY\LOCALSYSTEM",
+            0x10,
+            2,
+            binary
+        ));
+        assert!(!owned_service_config(
+            "other.exe",
+            "LocalSystem",
+            0x10,
+            2,
+            binary
+        ));
+        assert!(!owned_service_config(
+            binary,
+            ".\\f2c-sandbox",
+            0x10,
+            2,
+            binary
+        ));
+        assert!(!owned_service_config(
+            binary,
+            "LocalSystem",
+            0x10,
+            3,
+            binary
+        ));
+    }
+
+    #[test]
+    fn uninstall_cleanup_failure_preserves_marker_for_retry() {
+        let td = tempfile::tempdir().unwrap();
+        let marker = td.path().join("install.json");
+        std::fs::write(&marker, b"trusted state").unwrap();
+        let failure = cleanup_then_remove_state(&marker, || {
+            Err(crate::Error::internal("injected systemctl failure"))
+        });
+        assert!(failure.is_err());
+        assert!(marker.is_file());
+        cleanup_then_remove_state(&marker, || Ok(())).unwrap();
+        assert!(!marker.exists());
     }
 }
 
@@ -245,10 +351,12 @@ mod linux {
                 Err(e) => return Err(e.into()),
             }
         }
-        let state = InstallState {
+        let mut state = InstallState {
             version: 1,
             installer_uid,
             installer_sid: None,
+            sandbox_sid: None,
+            sandbox_uid: None,
             executable: installed_exe.to_string_lossy().into_owned(),
             account: SANDBOX_USER.into(),
         };
@@ -275,9 +383,13 @@ mod linux {
                     SANDBOX_USER,
                 ],
             )?;
-            std::fs::create_dir_all(LINUX_DATA_DIR)?;
             let uid = run("id", &["-u", SANDBOX_USER])?;
             let account_uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+            state.sandbox_uid = Some(account_uid.parse().map_err(|_| {
+                crate::Error::integrity("created sandbox account returned an invalid uid")
+            })?);
+            write_state(&state)?;
+            std::fs::create_dir_all(LINUX_DATA_DIR)?;
             run("chown", &[&account_uid, LINUX_DATA_DIR])?;
             std::fs::set_permissions(LINUX_DATA_DIR, std::fs::Permissions::from_mode(0o700))?;
             std::fs::create_dir_all(LINUX_RUN_DIR)?;
@@ -303,8 +415,13 @@ mod linux {
             Ok::<(), crate::Error>(())
         })();
         if let Err(e) = result {
-            let _ = uninstall();
-            return Err(e);
+            return match uninstall() {
+                Ok(_) => Err(e),
+                Err(cleanup) => Err(crate::Error::internal(format!(
+                    "install failed: {}; rollback incomplete and trusted state retained for retry: {}",
+                    e.message, cleanup.message
+                ))),
+            };
         }
         Ok(status())
     }
@@ -332,27 +449,175 @@ mod linux {
         let Some(state) = read_state()? else {
             return Ok(serde_json::json!({"installed": false, "removed": true}));
         };
-        let _ = Command::new("systemctl")
-            .args([
-                "disable",
-                "--now",
+        if state.executable
+            != Path::new(LINUX_BIN_DIR)
+                .join("fail2commit")
+                .to_string_lossy()
+                .as_ref()
+        {
+            return Err(crate::Error::integrity(
+                "recorded executable is outside hardened install directory",
+            ));
+        }
+        cleanup_then_remove_state(Path::new(LINUX_STATE), || {
+            let units = [
                 "fail2commit-hardened.socket",
                 "fail2commit-hardened.service",
-            ])
-            .status();
-        for path in [
-            PathBuf::from(LINUX_UNIT_DIR).join("fail2commit-hardened.socket"),
-            PathBuf::from(LINUX_UNIT_DIR).join("fail2commit-hardened.service"),
-        ] {
-            let _ = std::fs::remove_file(path);
-        }
-        let _ = Command::new("systemctl").args(["daemon-reload"]).status();
-        let _ = Command::new("userdel").args([SANDBOX_USER]).status();
-        let _ = std::fs::remove_dir_all(LINUX_DATA_DIR);
-        let _ = std::fs::remove_dir_all(LINUX_RUN_DIR);
-        let _ = std::fs::remove_dir_all(LINUX_BIN_DIR);
-        std::fs::remove_file(LINUX_STATE)?;
+            ];
+            let expected_socket =
+                include_str!("../../../../../packaging/linux/fail2commit-hardened.socket")
+                    .replace("@INSTALLER_UID@", &state.installer_uid.to_string());
+            let expected_service =
+                include_str!("../../../../../packaging/linux/fail2commit-hardened.service")
+                    .replace("@EXECUTABLE@", &state.executable);
+            let unit_paths = [
+                Path::new(LINUX_UNIT_DIR).join(units[0]),
+                Path::new(LINUX_UNIT_DIR).join(units[1]),
+            ];
+            verify_unit_file(&unit_paths[0], &expected_socket)?;
+            verify_unit_file(&unit_paths[1], &expected_service)?;
+            run("systemctl", &["daemon-reload"])?;
+            for (unit, unit_path) in units.into_iter().zip(&unit_paths) {
+                let loaded = run(
+                    "systemctl",
+                    &["show", "--property=LoadState", "--value", unit],
+                )?;
+                match String::from_utf8_lossy(&loaded.stdout).trim() {
+                    "loaded" => {
+                        let fragment = run(
+                            "systemctl",
+                            &["show", "--property=FragmentPath", "--value", unit],
+                        )?;
+                        if Path::new(String::from_utf8_lossy(&fragment.stdout).trim()) != unit_path
+                        {
+                            return Err(crate::Error::integrity(format!(
+                                "systemd unit {unit} is not loaded from its managed path"
+                            )));
+                        }
+                        run("systemctl", &["disable", "--now", unit])?;
+                    }
+                    "not-found" => {}
+                    other => {
+                        return Err(crate::Error::integrity(format!(
+                            "unexpected systemd LoadState for {unit}: {other}"
+                        )))
+                    }
+                }
+            }
+            for path in &unit_paths {
+                remove_unit_file(path)?;
+            }
+            run("systemctl", &["daemon-reload"])?;
+
+            let account = Command::new("getent")
+                .args(["passwd", SANDBOX_USER])
+                .output()?;
+            if account.status.success() {
+                let line = String::from_utf8_lossy(&account.stdout);
+                let uid = line
+                    .split(':')
+                    .nth(2)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        crate::Error::integrity("cannot parse sandbox account uid during uninstall")
+                    })?;
+                if state.sandbox_uid != Some(uid) {
+                    return Err(crate::Error::integrity(
+                        "sandbox account does not match the uid recorded by this installation",
+                    ));
+                }
+                run("userdel", &[SANDBOX_USER])?;
+            } else if account.status.code() != Some(2) {
+                return Err(crate::Error::internal(format!(
+                    "getent failed while checking sandbox account: {}",
+                    account.status
+                )));
+            }
+            remove_owned_dir(Path::new(LINUX_DATA_DIR), state.sandbox_uid)?;
+            remove_owned_dir(Path::new(LINUX_RUN_DIR), Some(0))?;
+            remove_owned_dir(Path::new(LINUX_BIN_DIR), Some(0))?;
+            remove_state_temp()?;
+            Ok(())
+        })?;
         Ok(serde_json::json!({"installed": false, "removed": true, "executable": state.executable}))
+    }
+
+    fn remove_unit_file(path: &Path) -> crate::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+            Ok(md) if md.is_file() && !md.file_type().is_symlink() && md.uid() == 0 => {
+                std::fs::remove_file(path)?;
+                Ok(())
+            }
+            Ok(_) => Err(crate::Error::integrity(format!(
+                "refusing to remove untrusted hardened unit path {}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn verify_unit_file(path: &Path, expected: &str) -> crate::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+            Ok(md) if md.is_file() && !md.file_type().is_symlink() && md.uid() == 0 => {
+                let actual = std::fs::read_to_string(path)?;
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(crate::Error::integrity(format!(
+                        "managed systemd unit contents changed: {}",
+                        path.display()
+                    )))
+                }
+            }
+            Ok(_) => Err(crate::Error::integrity(format!(
+                "managed systemd unit path is untrusted: {}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn remove_owned_dir(path: &Path, owner: Option<u32>) -> crate::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+            Ok(md)
+                if md.is_dir()
+                    && !md.file_type().is_symlink()
+                    && owner.is_some_and(|uid| md.uid() == uid || md.uid() == 0) =>
+            {
+                std::fs::remove_dir_all(path)?;
+                Ok(())
+            }
+            Ok(_) => Err(crate::Error::integrity(format!(
+                "refusing to remove untrusted hardened directory {}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn remove_state_temp() -> crate::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let path = Path::new(LINUX_STATE).with_extension("json.new");
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+            Ok(md)
+                if md.is_file()
+                    && !md.file_type().is_symlink()
+                    && md.uid() == 0
+                    && md.mode() & 0o077 == 0 =>
+            {
+                std::fs::remove_file(path)?;
+                Ok(())
+            }
+            Ok(_) => Err(crate::Error::integrity(
+                "refusing to remove an untrusted temporary hardened state file",
+            )),
+        }
     }
 }
 
@@ -385,6 +650,18 @@ mod windows {
         specific: u32,
         checkpoint: u32,
         hint: u32,
+    }
+    #[repr(C)]
+    struct ServiceConfig {
+        service_type: u32,
+        start_type: u32,
+        error_control: u32,
+        binary_path: *const u16,
+        load_order_group: *const u16,
+        tag_id: u32,
+        dependencies: *const u16,
+        service_start_name: *const u16,
+        display_name: *const u16,
     }
     #[repr(C)]
     struct UnicodeString {
@@ -428,6 +705,12 @@ mod windows {
         fn StartServiceW(s: *mut c_void, n: u32, args: *const *const u16) -> i32;
         fn ControlService(s: *mut c_void, c: u32, status: *mut ServiceStatus) -> i32;
         fn QueryServiceStatus(s: *mut c_void, status: *mut ServiceStatus) -> i32;
+        fn QueryServiceConfigW(
+            s: *mut c_void,
+            config: *mut c_void,
+            size: u32,
+            needed: *mut u32,
+        ) -> i32;
         fn DeleteService(s: *mut c_void) -> i32;
         fn CloseServiceHandle(s: *mut c_void) -> i32;
     }
@@ -471,7 +754,7 @@ mod windows {
     fn w(s: &std::ffi::OsStr) -> Vec<u16> {
         s.encode_wide().chain([0]).collect()
     }
-    fn set_interactive_logon_denied(deny: bool) -> crate::Result<()> {
+    fn account_sid() -> crate::Result<(Vec<u64>, String)> {
         let account = w(std::ffi::OsStr::new("f2c-sandbox"));
         let mut sid_len = 0u32;
         let mut domain_len = 0u32;
@@ -512,6 +795,22 @@ mod windows {
                 "cannot resolve hardened account SID",
             ));
         }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(sid.as_ptr().cast::<u8>(), sid_len as usize) };
+        Ok((sid, crate::ipc::winsec::sid_string(bytes)))
+    }
+
+    fn sid_words(text: &str) -> crate::Result<Vec<u64>> {
+        let bytes = crate::ipc::winsec::sid_from_string(text)
+            .ok_or_else(|| crate::Error::integrity("recorded hardened account SID is invalid"))?;
+        let mut out = vec![0u64; bytes.len().div_ceil(8)];
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr().cast(), bytes.len());
+        }
+        Ok(out)
+    }
+
+    fn set_interactive_logon_denied(deny: bool, sid: &mut [u64]) -> crate::Result<()> {
         let mut attrs = ObjectAttributes {
             length: std::mem::size_of::<ObjectAttributes>() as u32,
             root: std::ptr::null_mut(),
@@ -576,6 +875,45 @@ mod windows {
             Ok(h)
         }
     }
+    fn service_config_matches(service: *mut c_void, expected_binary: &str) -> bool {
+        let mut needed = 0u32;
+        unsafe { QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 || needed > 64 * 1024 {
+            return false;
+        }
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        if unsafe {
+            QueryServiceConfigW(
+                service,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                &mut needed,
+            )
+        } == 0
+        {
+            return false;
+        }
+        let config = unsafe { &*buffer.as_ptr().cast::<ServiceConfig>() };
+        unsafe fn string(p: *const u16) -> String {
+            if p.is_null() {
+                return String::new();
+            }
+            let mut n = 0usize;
+            while unsafe { *p.add(n) } != 0 {
+                n += 1;
+            }
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) })
+        }
+        let binary = unsafe { string(config.binary_path) };
+        let account = unsafe { string(config.service_start_name) };
+        owned_service_config(
+            &binary,
+            &account,
+            config.service_type,
+            config.start_type,
+            expected_binary,
+        )
+    }
 
     pub(super) fn install() -> crate::Result<serde_json::Value> {
         // SAFETY: IsUserAnAdmin takes no arguments and checks the current token.
@@ -636,14 +974,17 @@ mod windows {
                 "NetUserAdd failed with code {rc}"
             )));
         }
-        if let Err(e) = set_interactive_logon_denied(true) {
-            let user = w(std::ffi::OsStr::new("f2c-sandbox"));
-            unsafe {
-                NetUserDel(std::ptr::null(), user.as_ptr());
-                CloseServiceHandle(manager);
+        let (mut sandbox_sid, sandbox_sid_text) = match account_sid() {
+            Ok(value) => value,
+            Err(e) => {
+                let user = w(std::ffi::OsStr::new("f2c-sandbox"));
+                unsafe {
+                    NetUserDel(std::ptr::null(), user.as_ptr());
+                    CloseServiceHandle(manager);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
         let result = (|| {
             std::fs::create_dir_all(&bin_dir)?;
             let installed = bin_dir.join("fail2commit.exe");
@@ -672,6 +1013,8 @@ mod windows {
                 installer_sid: Some(crate::ipc::winsec::sid_string(
                     &crate::ipc::winsec::current_user_sid()?,
                 )),
+                sandbox_sid: Some(sandbox_sid_text.clone()),
+                sandbox_uid: None,
                 executable: installed.to_string_lossy().into_owned(),
                 account: "f2c-sandbox".into(),
             };
@@ -679,6 +1022,9 @@ mod windows {
                 &state_path,
                 serde_json::to_vec(&state).map_err(|e| crate::Error::internal(e.to_string()))?,
             )?;
+            // Persist the account SID before changing the local security policy:
+            // an interrupted install can then remove precisely this right later.
+            set_interactive_logon_denied(true, &mut sandbox_sid)?;
             let binary = w(std::ffi::OsStr::new(&format!(
                 "\"{}\" sandbox serve",
                 installed.display()
@@ -711,10 +1057,7 @@ mod windows {
             }
             if unsafe { StartServiceW(svc, 0, std::ptr::null()) } == 0 {
                 let e = std::io::Error::last_os_error();
-                unsafe {
-                    DeleteService(svc);
-                    CloseServiceHandle(svc)
-                };
+                unsafe { CloseServiceHandle(svc) };
                 return Err(crate::Error::internal(format!("StartServiceW failed: {e}")));
             }
             unsafe { CloseServiceHandle(svc) };
@@ -722,11 +1065,51 @@ mod windows {
         })();
         unsafe { CloseServiceHandle(manager) };
         if let Err(e) = result {
-            let _ = std::fs::remove_dir_all(&bin_dir);
-            let _ = std::fs::remove_dir_all(&data_dir);
-            let user = w(std::ffi::OsStr::new("f2c-sandbox"));
-            unsafe { NetUserDel(std::ptr::null(), user.as_ptr()) };
-            return Err(e);
+            let cleanup = if state_path.exists() {
+                uninstall().map(|_| ())
+            } else {
+                let right = set_interactive_logon_denied(false, &mut sandbox_sid);
+                if let Err(clean_error) = right {
+                    return Err(crate::Error::internal(format!(
+                        "install failed: {}; account-right rollback failed: {}",
+                        e.message, clean_error.message
+                    )));
+                }
+                let user = w(std::ffi::OsStr::new("f2c-sandbox"));
+                let user_rc = unsafe { NetUserDel(std::ptr::null(), user.as_ptr()) };
+                if user_rc != 0 && user_rc != 2221 {
+                    Err(crate::Error::internal(format!(
+                        "install failed: {}; rollback NetUserDel failed with code {user_rc}",
+                        e.message
+                    )))
+                } else {
+                    match std::fs::remove_dir_all(&bin_dir) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(crate::Error::internal(format!(
+                                "install failed: {}; rollback payload removal failed: {err}",
+                                e.message
+                            )))
+                        }
+                    }
+                    match std::fs::remove_dir_all(&data_dir) {
+                        Ok(()) => Ok(()),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(err) => Err(crate::Error::internal(format!(
+                            "install failed: {}; rollback data removal failed: {err}",
+                            e.message
+                        ))),
+                    }
+                }
+            };
+            return match cleanup {
+                Ok(()) => Err(e),
+                Err(clean_error) => Err(crate::Error::internal(format!(
+                    "install failed: {}; rollback incomplete and retained trusted state for retry: {}",
+                    e.message, clean_error.message
+                ))),
+            };
         }
         Ok(status())
     }
@@ -737,86 +1120,138 @@ mod windows {
                 "hardened uninstall requires an elevated administrator token",
             ));
         }
-        let state = read_state()?;
-        if let Ok(manager) = scm() {
-            let svc = unsafe {
-                OpenServiceW(manager, SERVICE_NAME.as_ptr(), 0x0004 | 0x0020 | 0x00010000)
-            };
-            if !svc.is_null() {
-                let mut s = ServiceStatus {
-                    kind: 0,
-                    state: 0,
-                    accepted: 0,
-                    win32: 0,
-                    specific: 0,
-                    checkpoint: 0,
-                    hint: 0,
-                };
+        let Some(state) = read_state()? else {
+            // A service-name collision without our protected install record is
+            // not authority to touch SCM or the local account.
+            return Ok(serde_json::json!({"installed":false,"removed":true}));
+        };
+        let expected = std::env::var_os("ProgramFiles")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| crate::Error::isolation_unavailable("ProgramFiles is unavailable"))?
+            .join("fail2commit-hardened")
+            .join("fail2commit.exe");
+        if !recorded_executable_matches(&state.executable, &expected) {
+            return Err(crate::Error::integrity(
+                "recorded executable is outside hardened install directory",
+            ));
+        }
+        let manager = scm()?;
+        let svc = unsafe {
+            OpenServiceW(
+                manager,
+                SERVICE_NAME.as_ptr(),
+                0x0001 | 0x0004 | 0x0020 | 0x00010000,
+            )
+        };
+        if svc.is_null() {
+            // ERROR_SERVICE_DOES_NOT_EXIST; a missing service is an expected
+            // partial-install/removal state, other SCM failures are not.
+            let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            unsafe { CloseServiceHandle(manager) };
+            if code != 1060 {
+                return Err(crate::Error::internal(format!(
+                    "OpenServiceW failed during owned uninstall with code {code}"
+                )));
+            }
+        } else {
+            let expected_command = format!("\"{}\" sandbox serve", expected.display());
+            if !service_config_matches(svc, &expected_command) {
                 unsafe {
-                    if QueryServiceStatus(svc, &mut s) != 0 && s.state == 4 {
-                        ControlService(svc, 1, &mut s);
-                    }
+                    CloseServiceHandle(svc);
+                    CloseServiceHandle(manager);
                 }
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-                loop {
-                    if unsafe { QueryServiceStatus(svc, &mut s) } == 0 || s.state == 1 {
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        unsafe {
-                            CloseServiceHandle(svc);
-                            CloseServiceHandle(manager);
-                        }
-                        return Err(crate::Error::internal(
-                            "timed out waiting for hardened service to stop",
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                return Err(crate::Error::integrity(
+                    "SCM service configuration does not match the protected install record",
+                ));
+            }
+            let mut s = ServiceStatus {
+                kind: 0,
+                state: 0,
+                accepted: 0,
+                win32: 0,
+                specific: 0,
+                checkpoint: 0,
+                hint: 0,
+            };
+            if unsafe { QueryServiceStatus(svc, &mut s) } == 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe {
+                    CloseServiceHandle(svc);
+                    CloseServiceHandle(manager);
                 }
-                if unsafe { DeleteService(svc) } == 0 {
+                return Err(crate::Error::internal(format!(
+                    "QueryServiceStatus failed: {e}"
+                )));
+            }
+            if s.state == 4 && unsafe { ControlService(svc, 1, &mut s) } == 0 {
+                let e = std::io::Error::last_os_error();
+                unsafe {
+                    CloseServiceHandle(svc);
+                    CloseServiceHandle(manager);
+                }
+                return Err(crate::Error::internal(format!(
+                    "ControlService(STOP) failed: {e}"
+                )));
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if unsafe { QueryServiceStatus(svc, &mut s) } == 0 {
                     let e = std::io::Error::last_os_error();
                     unsafe {
                         CloseServiceHandle(svc);
                         CloseServiceHandle(manager);
                     }
-                    return Err(crate::Error::internal(format!("DeleteService failed: {e}")));
+                    return Err(crate::Error::internal(format!(
+                        "QueryServiceStatus failed while stopping: {e}"
+                    )));
                 }
+                if s.state == 1 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    unsafe {
+                        CloseServiceHandle(svc);
+                        CloseServiceHandle(manager);
+                    }
+                    return Err(crate::Error::internal(
+                        "timed out waiting for hardened service to stop",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if unsafe { DeleteService(svc) } == 0 {
+                let e = std::io::Error::last_os_error();
                 unsafe {
                     CloseServiceHandle(svc);
+                    CloseServiceHandle(manager);
                 }
+                return Err(crate::Error::internal(format!("DeleteService failed: {e}")));
             }
             unsafe {
+                CloseServiceHandle(svc);
                 CloseServiceHandle(manager);
             }
         }
-        if let Some(state) = state {
-            let expected = std::env::var_os("ProgramFiles")
-                .map(std::path::PathBuf::from)
-                .ok_or_else(|| crate::Error::isolation_unavailable("ProgramFiles is unavailable"))?
-                .join("fail2commit-hardened")
-                .join("fail2commit.exe");
-            if !recorded_executable_matches(&state.executable, &expected) {
-                return Err(crate::Error::integrity(
-                    "recorded executable is outside hardened install directory",
-                ));
-            }
-            set_interactive_logon_denied(false)?;
-            let user = w(std::ffi::OsStr::new("f2c-sandbox"));
-            let rc = unsafe { NetUserDel(std::ptr::null(), user.as_ptr()) };
-            if rc != 0 && rc != 2221 {
-                return Err(crate::Error::internal(format!(
-                    "NetUserDel failed with code {rc}"
-                )));
-            }
-            std::fs::remove_dir_all(expected.parent().unwrap())?;
-            let p = crate::sandbox::hardened::machine_state_path()?;
-            if p.exists() {
-                std::fs::remove_file(&p)?;
-            }
-            if let Some(d) = p.parent() {
-                if d.exists() {
-                    std::fs::remove_dir(d)?;
-                }
+        let mut sandbox_sid = match state.sandbox_sid.as_deref() {
+            Some(sid) => sid_words(sid)?,
+            None => account_sid()?.0,
+        };
+        set_interactive_logon_denied(false, &mut sandbox_sid)?;
+        let user = w(std::ffi::OsStr::new("f2c-sandbox"));
+        let rc = unsafe { NetUserDel(std::ptr::null(), user.as_ptr()) };
+        if rc != 0 && rc != 2221 {
+            return Err(crate::Error::internal(format!(
+                "NetUserDel failed with code {rc}"
+            )));
+        }
+        std::fs::remove_dir_all(expected.parent().unwrap())?;
+        let p = crate::sandbox::hardened::machine_state_path()?;
+        if p.exists() {
+            std::fs::remove_file(&p)?;
+        }
+        if let Some(d) = p.parent() {
+            if d.exists() {
+                std::fs::remove_dir(d)?;
             }
         }
         Ok(serde_json::json!({"installed":false,"removed":true}))
@@ -857,11 +1292,16 @@ mod windows {
             .map_err(|e| crate::Error::integrity(format!("hardened state is invalid: {e}")))?;
         if state.version != 1
             || state.account != "f2c-sandbox"
+            || state.sandbox_uid.is_some()
             || state
                 .installer_sid
                 .as_deref()
                 .and_then(crate::ipc::winsec::sid_from_string)
                 .is_none()
+            || state
+                .sandbox_sid
+                .as_deref()
+                .is_some_and(|sid| crate::ipc::winsec::sid_from_string(sid).is_none())
         {
             return Err(crate::Error::integrity(
                 "hardened state identity fields are invalid",
