@@ -55,9 +55,12 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
     }
     let cwd = std::env::current_dir()?;
     let actx = ctx.approval();
-    let progress = super::progress_ui::ProgressUi::new(ctx.json, ctx.settings.ui.progress_window);
+    let progress = Arc::new(super::progress_ui::ProgressUi::new(
+        ctx.json,
+        ctx.settings.ui.progress_window,
+    ));
     let mut seams = pip::Seams::production(&actx, Arc::new(AtomicBool::new(false)));
-    seams.progress = &progress;
+    seams.progress = progress;
     let r = pip::install(&actx, &python, &rest, &cwd, &seams)?;
     let message = if r.packages.is_empty() {
         "nothing to install; requirements already satisfied".to_string()

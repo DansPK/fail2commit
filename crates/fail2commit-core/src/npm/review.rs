@@ -82,6 +82,22 @@ fn unique(plan: &Plan) -> Vec<(usize, Vec<usize>)> {
     out
 }
 
+pub fn unique_artifact_count(plan: &Plan) -> u64 {
+    unique(plan).len() as u64
+}
+
+fn note_successful_fetch(
+    progress: &dyn crate::progress::Progress,
+    completed: &AtomicUsize,
+    result: &Result<PathBuf>,
+    current: &str,
+) {
+    if result.is_ok() {
+        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+        progress.advance(done as u64, current);
+    }
+}
+
 fn fetch_one(
     limits: &crate::settings::Limits,
     p: &PlanPkg,
@@ -135,6 +151,7 @@ pub fn review(deps: &Deps<'_>, registry: &Registry, plan: &Plan, dir: &Path) -> 
     let uniq = unique(plan);
     let limits = &deps.settings.limits;
     let next = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
     let slots: Vec<Mutex<Option<Result<PathBuf>>>> =
         uniq.iter().map(|_| Mutex::new(None)).collect();
     std::thread::scope(|s| {
@@ -144,10 +161,17 @@ pub fn review(deps: &Deps<'_>, registry: &Registry, plan: &Plan, dir: &Path) -> 
                 let Some((first, _)) = uniq.get(n) else {
                     break;
                 };
-                let r = fetch_one(limits, &plan.pkgs[*first], n, dir);
+                let pkg = &plan.pkgs[*first];
                 deps.progress.advance(
-                    (n + 1) as u64,
-                    &format!("{}@{}", plan.pkgs[*first].name, plan.pkgs[*first].version),
+                    completed.load(Ordering::SeqCst) as u64,
+                    &format!("Downloading {}@{}", pkg.name, pkg.version),
+                );
+                let r = fetch_one(limits, &plan.pkgs[*first], n, dir);
+                note_successful_fetch(
+                    deps.progress,
+                    &completed,
+                    &r,
+                    &format!("Verified {}@{}", pkg.name, pkg.version),
                 );
                 *slots[n].lock().expect("slot") = Some(r);
             });
@@ -198,4 +222,83 @@ pub fn review(deps: &Deps<'_>, registry: &Registry, plan: &Plan, dir: &Path) -> 
         })
         .collect();
     Ok(Reviewed { pkgs, findings })
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use crate::progress::{End, Progress, Step};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(u64, String)>>);
+    impl Progress for Recorder {
+        fn advance(&self, done: u64, current: &str) {
+            self.0.lock().unwrap().push((done, current.to_owned()));
+        }
+    }
+
+    fn pkg(path: &str, resolved: &str, integrity: &str, skip_platform: bool) -> PlanPkg {
+        PlanPkg {
+            path: path.to_owned(),
+            name: path.to_owned(),
+            version: "1.0.0".into(),
+            resolved: resolved.into(),
+            integrity: integrity.into(),
+            optional: false,
+            skip_platform,
+        }
+    }
+
+    #[test]
+    fn download_total_counts_unique_artifacts_and_skips_unfetched_platform_packages() {
+        let plan = Plan {
+            pkgs: vec![
+                pkg("a", "https://r/a.tgz", "sha512-x", false),
+                pkg("b", "https://r/a.tgz", "sha512-x", false),
+                pkg("c", "https://r/c.tgz", "sha512-c", false),
+                pkg("d", "https://r/d.tgz", "sha512-d", true),
+            ],
+        };
+        assert_eq!(unique_artifact_count(&plan), 2);
+    }
+
+    #[test]
+    fn concurrent_download_progress_counts_only_successful_verifications() {
+        let recorder = Arc::new(Recorder::default());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let failed: Result<PathBuf> = Err(crate::Error::integrity("bad hash"));
+        note_successful_fetch(recorder.as_ref(), &completed, &failed, "broken@1");
+        std::thread::scope(|s| {
+            for n in 0..8 {
+                let recorder = recorder.clone();
+                let completed = completed.clone();
+                s.spawn(move || {
+                    let success = Ok(PathBuf::from(format!("artifact-{n}")));
+                    note_successful_fetch(recorder.as_ref(), &completed, &success, "verified");
+                });
+            }
+        });
+        assert_eq!(completed.load(Ordering::SeqCst), 8);
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 8);
+        assert_eq!(events.iter().map(|(n, _)| *n).max(), Some(8));
+        assert!(!events.iter().any(|(_, name)| name == "broken@1"));
+    }
+
+    #[test]
+    fn progress_recorder_remains_compatible_with_frozen_trait() {
+        let p = Recorder::default();
+        p.step(Step::DownloadVerify, 2);
+        p.advance(1, "a@1");
+        p.finding(&crate::protocol::Finding::new(
+            crate::protocol::FindingKind::YaraMatch,
+            crate::protocol::FindingAction::Approve,
+            "test",
+            "sample",
+        ));
+        p.pause();
+        p.finish(End::Findings, "done");
+        assert_eq!(p.0.lock().unwrap().len(), 1);
+    }
 }

@@ -45,6 +45,7 @@ use crate::{Error, Finding, FindingAction, FindingKind, ResultCode};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// pip shim integration for `fail2commit setup`.
@@ -58,7 +59,7 @@ type ApproveFn<'a> = Box<dyn Fn(&ApprovalRequest) -> crate::Result<Decision> + '
 /// Everything a test needs to replace. [`Seams::production`] wires the
 /// real approval channel and advisory scanner.
 pub struct Seams<'a> {
-    pub progress: &'a dyn Progress,
+    pub progress: Arc<dyn Progress>,
     pub advisories: AdvisoryFn<'a>,
     pub approve: ApproveFn<'a>,
     pub cancel: Cancel,
@@ -72,7 +73,7 @@ pub struct Seams<'a> {
 impl<'a> Seams<'a> {
     pub fn production(ctx: &'a ApprovalCtx<'a>, cancel: Cancel) -> Seams<'a> {
         Seams {
-            progress: &Silent,
+            progress: Arc::new(Silent),
             advisories: Box::new(move |pkgs| {
                 crate::scan::check_advisories(ctx.paths, &ctx.settings.advisories, pkgs)
             }),
@@ -238,6 +239,7 @@ fn install_inner(
         run_dir.join("staging"),
         ctx.settings.limits.artifact_max_bytes,
     )?;
+    proxy.set_progress(seams.progress.clone());
     let report_path = run_dir.join("report.json");
     std::fs::write(run_dir.join("requirements.txt"), req.requirements_txt())?;
     let mut cmd = guard.pip(&["--isolated", "--disable-pip-version-check", "--no-input"])?;
@@ -281,6 +283,8 @@ fn install_inner(
     seams
         .progress
         .step(Step::DownloadVerify, wheels.len() as u64);
+    // The report contains only wheels the staging proxy fetched and verified.
+    // Reconcile from the unknown streaming count to the full resolved package plan.
     seams.progress.advance(wheels.len() as u64, "");
     check_pins(&req, &wheels)?;
     let digest = plan::plan_digest(&interp, &policy.url, &req.canonical(), &wheels)?;
@@ -327,7 +331,12 @@ fn install_inner(
     }
     seams.progress.advance(cands.len() as u64, "");
     seams.progress.step(Step::ScanCode, wheels.len() as u64);
-    let scan_findings = match_wheels(matcher.as_ref(), &reviewed, &wheels, seams.progress);
+    let scan_findings = match_wheels(
+        matcher.as_ref(),
+        &reviewed,
+        &wheels,
+        seams.progress.as_ref(),
+    );
     extra.extend(scan_findings);
     seams.progress.advance(wheels.len() as u64, "");
     // FR-028: pip installs wheels only and runs no package code (no sandboxed

@@ -308,9 +308,10 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
     deps.progress.advance(1, "dependency graph resolved");
     let plan = lockfile::parse(&final_lock, &registry, deps.settings.limits.graph_max_nodes)?;
     deps.progress
-        .step(Step::DownloadVerify, plan.pkgs.len() as u64);
+        .step(Step::DownloadVerify, review::unique_artifact_count(&plan));
     let mut reviewed = review::review(deps, &registry, &plan, &sd.join("tarballs"))?;
-    deps.progress.advance(plan.pkgs.len() as u64, "");
+    deps.progress
+        .advance(review::unique_artifact_count(&plan), "");
     apply::seed_cache(deps, &tc, &st, &reviewed)?;
     apply::npm_step(deps, &tc, &st, &proj_stage, &["ci"], &["--offline".into()])?;
     // Hashed before the review reads anything: a later difference is a change.
@@ -357,13 +358,15 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         for (i, rp) in installed.iter().enumerate() {
             let install: std::collections::BTreeSet<String> =
                 rp.inputs.iter().map(|(p, _)| p.clone()).collect();
-            extra.extend(crate::scan::yara::scan_package(
+            let scan_findings = crate::scan::yara::scan_package(
                 m,
                 &review::package_id(&rp.plan),
                 &proj_stage.join(&rp.plan.path),
                 &install,
                 &mut budget,
-            ));
+            );
+            report_progress_findings(deps.progress, &scan_findings);
+            extra.extend(scan_findings);
             deps.progress.advance((i + 1) as u64, &rp.plan.name);
         }
     } else {
@@ -597,20 +600,20 @@ fn execute_locked(deps: &Deps<'_>, req: &Request) -> Result<NpmOutcome> {
         let _ = std::fs::remove_dir_all(proj_stage.join(".f2c-tmp"));
         // FR-013: Step::ScanOutput — FR-028, before anything reaches the project.
         deps.progress.step(Step::ScanOutput, output.len() as u64);
-        deps.progress.advance(output.len() as u64, "");
-        let produced = review_output(
-            deps,
-            &plan_digest,
-            &summary,
-            &proj_stage,
-            &reviewed,
-            &output,
-            matcher.as_ref(),
-        )?;
+        let produced = scan_output_complete(deps.progress, output.len() as u64, || {
+            review_output(
+                deps,
+                &plan_digest,
+                &summary,
+                &proj_stage,
+                &reviewed,
+                &output,
+                matcher.as_ref(),
+            )
+        })?;
         for finding in &produced {
             deps.progress.finding(finding);
         }
-        deps.progress.advance(output.len() as u64, "");
         // FR-013: Step::Apply
         deps.progress.step(Step::Apply, 1);
         apply::move_tree(
@@ -747,7 +750,96 @@ fn review_output(
     }
 }
 
+fn report_progress_findings(progress: &dyn crate::progress::Progress, findings: &[Finding]) {
+    for finding in findings {
+        progress.finding(finding);
+    }
+}
+
+fn scan_output_complete<T>(
+    progress: &dyn crate::progress::Progress,
+    total: u64,
+    scan: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let result = scan();
+    if result.is_ok() {
+        progress.advance(total, "");
+    }
+    result
+}
+
 /// Project directory used by the CLI: nearest ancestor with a package.json.
 pub fn project_for(cwd: &Path) -> Result<PathBuf> {
     cmdline::find_project(cwd)
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use crate::progress::Progress;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Recorder {
+        events: Mutex<Vec<String>>,
+        findings: Mutex<Vec<Finding>>,
+        before_advance: Option<Arc<std::sync::atomic::AtomicBool>>,
+    }
+    impl Progress for Recorder {
+        fn advance(&self, done: u64, _current: &str) {
+            if let Some(flag) = &self.before_advance {
+                self.events.lock().unwrap().push(
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        "advance-after-scan"
+                    } else {
+                        "advance-before-scan"
+                    }
+                    .to_owned(),
+                );
+            } else {
+                self.events.lock().unwrap().push(format!("advance:{done}"));
+            }
+        }
+        fn finding(&self, finding: &Finding) {
+            self.findings.lock().unwrap().push(finding.clone());
+        }
+    }
+
+    #[test]
+    fn output_scan_progress_completes_only_after_scan_returns() {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let p = Recorder {
+            before_advance: Some(done.clone()),
+            ..Default::default()
+        };
+        let value = scan_output_complete(&p, 4, || {
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("scanned")
+        })
+        .unwrap();
+        assert_eq!(value, "scanned");
+        assert_eq!(&*p.events.lock().unwrap(), &["advance-after-scan"]);
+
+        let failed: Result<()> =
+            scan_output_complete(&p, 4, || Err(crate::Error::internal("scan failed")));
+        assert!(failed.is_err());
+        assert_eq!(
+            p.events.lock().unwrap().len(),
+            1,
+            "failed scan must not report completion"
+        );
+    }
+
+    #[test]
+    fn live_code_scan_findings_are_forwarded_to_the_sink() {
+        let p = Recorder::default();
+        let finding = Finding::new(
+            FindingKind::YaraMatch,
+            FindingAction::Approve,
+            "test.yara",
+            "sample match",
+        );
+        report_progress_findings(&p, std::slice::from_ref(&finding));
+        assert_eq!(&*p.findings.lock().unwrap(), &[finding]);
+    }
 }

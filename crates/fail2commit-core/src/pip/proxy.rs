@@ -9,12 +9,13 @@
 use super::index::{IndexClient, IndexFile};
 use super::interp::normalize;
 use super::wheel::{self, WheelError};
+use crate::progress::{Progress, Step};
 use crate::{Error, Finding, FindingAction, FindingKind};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -52,6 +53,9 @@ pub struct Shared {
     /// Integrity or limit failure seen while serving: reported by name.
     pub failure: Mutex<Option<Error>>,
     pub requests: Mutex<usize>,
+    progress: Mutex<Option<Arc<dyn Progress>>>,
+    completed_downloads: AtomicU64,
+    download_step_started: AtomicBool,
 }
 
 pub struct Proxy {
@@ -82,6 +86,9 @@ impl Proxy {
             projects: Mutex::new(BTreeMap::new()),
             failure: Mutex::new(None),
             requests: Mutex::new(0),
+            progress: Mutex::new(None),
+            completed_downloads: AtomicU64::new(0),
+            download_step_started: AtomicBool::new(false),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (s2, stop2) = (shared.clone(), stop.clone());
@@ -109,6 +116,10 @@ impl Proxy {
     /// `--index-url` for pip.
     pub fn index_url(&self) -> String {
         format!("http://{}/{}/simple/", self.addr, self.shared.token)
+    }
+
+    pub fn set_progress(&self, progress: Arc<dyn Progress>) {
+        *self.shared.progress.lock().unwrap() = Some(progress);
     }
 
     fn files_prefix(&self) -> String {
@@ -165,6 +176,14 @@ impl Shared {
         let dir = self.staging.join(id);
         std::fs::create_dir_all(&dir)?;
         let dest = dir.join(&file.filename);
+        let progress = self.progress.lock().unwrap().clone();
+        ensure_download_step(progress.as_deref(), &self.download_step_started);
+        if let Some(p) = &progress {
+            p.advance(
+                self.completed_downloads.load(Ordering::SeqCst),
+                &format!("Downloading {} ({})", project, file.filename),
+            );
+        }
         let fail = |e: Error| {
             let _ = std::fs::remove_file(&dest);
             if matches!(
@@ -216,6 +235,11 @@ impl Shared {
         if let Some(e) = self.files.lock().unwrap().get_mut(id) {
             e.verified = Some(v.clone());
         }
+        note_verified_download(
+            progress.as_deref(),
+            &self.completed_downloads,
+            &Ok(v.clone()),
+        );
         Ok(v)
     }
 
@@ -265,6 +289,25 @@ impl Shared {
         html.push_str("</body></html>\n");
         self.projects.lock().unwrap().insert(name, stats);
         Ok(html)
+    }
+}
+
+fn ensure_download_step(progress: Option<&dyn Progress>, started: &AtomicBool) {
+    if let Some(p) = progress {
+        if !started.swap(true, Ordering::SeqCst) {
+            p.step(Step::DownloadVerify, 0);
+        }
+    }
+}
+
+fn note_verified_download(
+    progress: Option<&dyn Progress>,
+    completed: &AtomicU64,
+    result: &crate::Result<Verified>,
+) {
+    if let (Some(p), Ok(v)) = (progress, result) {
+        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+        p.advance(done, &format!("{} ({})", v.project, v.filename));
     }
 }
 
@@ -396,4 +439,53 @@ fn handle(s: &Shared, mut stream: TcpStream) -> std::io::Result<()> {
         b"not found",
         send_body,
     )
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use crate::progress::{End, Step};
+
+    #[derive(Default)]
+    struct Recorder {
+        steps: Mutex<Vec<(Step, u64)>>,
+        advances: Mutex<Vec<(u64, String)>>,
+    }
+    impl Progress for Recorder {
+        fn step(&self, step: Step, total: u64) {
+            self.steps.lock().unwrap().push((step, total));
+        }
+        fn advance(&self, done: u64, current: &str) {
+            self.advances.lock().unwrap().push((done, current.into()));
+        }
+        fn finish(&self, _end: End, _summary: &str) {}
+    }
+
+    #[test]
+    fn proxy_starts_unknown_download_phase_once_and_counts_only_verified_results() {
+        let p = Recorder::default();
+        let started = AtomicBool::new(false);
+        ensure_download_step(Some(&p), &started);
+        ensure_download_step(Some(&p), &started);
+        assert_eq!(&*p.steps.lock().unwrap(), &[(Step::DownloadVerify, 0)]);
+
+        let count = AtomicU64::new(0);
+        let failed: crate::Result<Verified> = Err(Error::integrity("invalid hash"));
+        note_verified_download(Some(&p), &count, &failed);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let verified = Verified {
+            project: "pkg".into(),
+            filename: "pkg-1.whl".into(),
+            sha256: "ab".into(),
+            size: 2,
+            upstream_url: "https://registry.invalid/pkg.whl".into(),
+            path: PathBuf::from("pkg.whl"),
+        };
+        note_verified_download(Some(&p), &count, &Ok(verified));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            &*p.advances.lock().unwrap(),
+            &[(1, "pkg (pkg-1.whl)".into())]
+        );
+    }
 }

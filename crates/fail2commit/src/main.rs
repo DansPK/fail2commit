@@ -111,7 +111,18 @@ fn shim_argv(mut argv: Vec<OsString>) -> Vec<OsString> {
 }
 
 fn main() -> ExitCode {
-    let argv = shim_argv(std::env::args_os().collect());
+    let raw: Vec<OsString> = std::env::args_os().collect();
+    if raw
+        .get(1)
+        .is_some_and(|a| a == "--f2c-progress-result-window")
+    {
+        return exit(if raw.len() == 3 {
+            cmd::progress_ui::run_handover_argument(&raw[2])
+        } else {
+            2
+        });
+    }
+    let argv = shim_argv(raw);
     let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(e) => {
