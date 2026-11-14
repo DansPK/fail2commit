@@ -1508,6 +1508,97 @@ fn loopback_exempt_entries() -> crate::Result<Vec<(String, u32)>> {
 
 static LOOPBACK_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
+struct LoopbackConfigMutex(OwnedHandle);
+
+impl LoopbackConfigMutex {
+    #[allow(unsafe_code)]
+    fn acquire() -> crate::Result<Self> {
+        use windows_sys::Win32::Foundation::{
+            GetLastError, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        let owner = crate::ipc::winsec::current_user_sid()?;
+        let owner_text = crate::ipc::winsec::sid_string(&owner);
+        let security = crate::ipc::winsec::PipeSecurity::new(&owner)?;
+        let name = wide(OsStr::new(r"Global\Fail2CommitLoopbackConfig-v1"));
+        // SAFETY: the explicit, protected DACL remains alive through creation;
+        // the named mutex serializes cooperating service instances machinewide.
+        let raw = unsafe { CreateMutexW(security.attributes(), 0, name.as_ptr()) };
+        if raw.is_null() {
+            return Err(unavailable("CreateMutexW(loopback configuration)"));
+        }
+        let handle = owned(raw);
+        let owner_ok = crate::ipc::winsec::owner_sid(&handle)? == owner_text;
+        let dacl_ok = crate::ipc::winsec::dacl_is_protected(&handle)?
+            && crate::ipc::winsec::dacl_entries(&handle)?
+                == vec![
+                    (
+                        false,
+                        crate::ipc::winsec::ALL_APP_PACKAGES.to_owned(),
+                        0x001F_01FF,
+                    ),
+                    (
+                        false,
+                        crate::ipc::winsec::ALL_RESTRICTED_APP_PACKAGES.to_owned(),
+                        0x001F_01FF,
+                    ),
+                    (true, owner_text, 0x001F_01FF),
+                ];
+        if !owner_ok || !dacl_ok {
+            return Err(crate::Error::integrity(
+                "loopback configuration mutex owner or protected DACL is unexpected",
+            ));
+        }
+        // WAIT_ABANDONED also transfers ownership. Callers always re-read the
+        // complete OS list after acquiring, so interrupted prior updates are
+        // never continued from cached state.
+        let wait = unsafe { WaitForSingleObject(raw, 5_000) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            return Ok(Self(handle));
+        }
+        if wait == WAIT_TIMEOUT {
+            return Err(crate::Error::isolation_unavailable(
+                "timed out waiting for loopback configuration mutex",
+            ));
+        }
+        if wait == WAIT_FAILED {
+            let code = unsafe { GetLastError() };
+            return Err(crate::Error::isolation_unavailable(format!(
+                "WaitForSingleObject(loopback configuration) failed with Win32 error {code}"
+            )));
+        }
+        Err(crate::Error::isolation_unavailable(
+            "unexpected loopback configuration mutex wait result",
+        ))
+    }
+}
+
+impl Drop for LoopbackConfigMutex {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: this guard owns the mutex after WAIT_OBJECT_0/WAIT_ABANDONED;
+        // it is dropped on the same thread that acquired it.
+        unsafe { ReleaseMutex(raw(&self.0)) };
+    }
+}
+
+struct LoopbackConfigGuard {
+    _local: std::sync::MutexGuard<'static, ()>,
+    _machine: LoopbackConfigMutex,
+}
+
+fn lock_loopback_config() -> crate::Result<LoopbackConfigGuard> {
+    let local = LOOPBACK_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let machine = LoopbackConfigMutex::acquire()?;
+    Ok(LoopbackConfigGuard {
+        _local: local,
+        _machine: machine,
+    })
+}
+
 /// Add or remove one exact AppContainer SID from FirewallAPI's loopback
 /// exemption list while preserving every preexisting SID and its attributes.
 /// The OS API manages a machine-wide SID list; it has no per-entry handle, so
@@ -1569,11 +1660,40 @@ fn write_loopback_exempt_entries(entries: &[(String, u32)]) -> crate::Result<()>
     Ok(())
 }
 
+#[cfg(test)]
+mod loopback_config_tests {
+    use super::same_loopback_entries;
+
+    #[test]
+    fn loopback_list_verification_requires_all_sids_and_attributes() {
+        let baseline = vec![("S-1-15-2-10".to_owned(), 0), ("S-1-15-2-20".to_owned(), 3)];
+        let reordered = vec![baseline[1].clone(), baseline[0].clone()];
+        assert!(same_loopback_entries(&baseline, &reordered));
+        assert!(!same_loopback_entries(
+            &baseline,
+            &[("S-1-15-2-10".to_owned(), 0)]
+        ));
+        assert!(!same_loopback_entries(
+            &baseline,
+            &[("S-1-15-2-10".to_owned(), 0), ("S-1-15-2-20".to_owned(), 0),]
+        ));
+    }
+}
+
+fn same_loopback_entries(left: &[(String, u32)], right: &[(String, u32)]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    right.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    left == right
+}
+
 pub(crate) fn add_loopback_exemption(sid: &str) -> crate::Result<()> {
-    let _guard = LOOPBACK_CONFIG_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let mut entries = loopback_exempt_entries()?;
+    let _guard = lock_loopback_config()?;
+    let entries = loopback_exempt_entries()?;
     if entries
         .iter()
         .any(|(entry, _)| entry.eq_ignore_ascii_case(sid))
@@ -1582,48 +1702,57 @@ pub(crate) fn add_loopback_exemption(sid: &str) -> crate::Result<()> {
             "new AppContainer already has a loopback exemption",
         ));
     }
-    entries.push((sid.to_owned(), 0));
-    write_loopback_exempt_entries(&entries)?;
-    let actual = loopback_exempt_entries()?;
-    if !actual
-        .iter()
-        .any(|(entry, _)| entry.eq_ignore_ascii_case(sid))
-        || entries.iter().any(|expected| {
-            !actual
-                .iter()
-                .any(|found| found.0.eq_ignore_ascii_case(&expected.0) && found.1 == expected.1)
-        })
-    {
+    let mut expected = entries.clone();
+    expected.push((sid.to_owned(), 0));
+    if let Err(error) = write_loopback_exempt_entries(&expected) {
+        let observed = loopback_exempt_entries();
+        if observed
+            .as_ref()
+            .is_ok_and(|observed| same_loopback_entries(observed, &entries))
+        {
+            return Err(error);
+        }
         return Err(crate::Error::integrity(
-            "loopback exemption update did not read back exactly",
+            "loopback exemption update failed with an ambiguous machine-wide list change; state was not restored",
+        ));
+    }
+    let actual = loopback_exempt_entries()?;
+    if !same_loopback_entries(&actual, &expected) {
+        return Err(crate::Error::integrity(
+            "loopback exemption update observed an ambiguous machine-wide list change; state was not restored",
         ));
     }
     Ok(())
 }
 
 pub(crate) fn remove_loopback_exemption(sid: &str) -> crate::Result<()> {
-    let _guard = LOOPBACK_CONFIG_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let mut entries = loopback_exempt_entries()?;
+    let _guard = lock_loopback_config()?;
+    let entries = loopback_exempt_entries()?;
     let original_len = entries.len();
-    entries.retain(|(entry, _)| !entry.eq_ignore_ascii_case(sid));
-    if entries.len() == original_len {
+    let expected: Vec<_> = entries
+        .iter()
+        .filter(|(entry, _)| !entry.eq_ignore_ascii_case(sid))
+        .cloned()
+        .collect();
+    if expected.len() == original_len {
         return Ok(());
     }
-    write_loopback_exempt_entries(&entries)?;
-    let actual = loopback_exempt_entries()?;
-    if actual
-        .iter()
-        .any(|(entry, _)| entry.eq_ignore_ascii_case(sid))
-        || entries.iter().any(|expected| {
-            !actual
-                .iter()
-                .any(|found| found.0.eq_ignore_ascii_case(&expected.0) && found.1 == expected.1)
-        })
-    {
+    if let Err(error) = write_loopback_exempt_entries(&expected) {
+        let observed = loopback_exempt_entries();
+        if observed
+            .as_ref()
+            .is_ok_and(|observed| same_loopback_entries(observed, &entries))
+        {
+            return Err(error);
+        }
         return Err(crate::Error::integrity(
-            "loopback exemption removal did not read back exactly",
+            "loopback exemption removal failed with an ambiguous machine-wide list change; state was not restored",
+        ));
+    }
+    let actual = loopback_exempt_entries()?;
+    if !same_loopback_entries(&actual, &expected) {
+        return Err(crate::Error::integrity(
+            "loopback exemption removal observed an ambiguous machine-wide list change; state was not restored",
         ));
     }
     Ok(())

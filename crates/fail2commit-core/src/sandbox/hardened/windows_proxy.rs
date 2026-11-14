@@ -30,6 +30,7 @@ const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 const IO_POLL: Duration = Duration::from_millis(50);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+const WRITE_RETRY: Duration = Duration::from_millis(1);
 const IO_CHUNK: usize = 16 * 1024;
 
 type Resolver = dyn Fn(&str, u16, Instant, &AtomicBool) -> Option<Vec<SocketAddr>> + Send + Sync;
@@ -195,14 +196,23 @@ impl Drop for Egress {
 
 #[derive(Default)]
 struct SocketState {
-    closed: bool,
     sockets: HashMap<u64, TcpStream>,
 }
 
-#[derive(Default)]
 struct SocketRegistry {
     next_id: AtomicU64,
+    closed: AtomicBool,
     state: Mutex<SocketState>,
+}
+
+impl Default for SocketRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            state: Mutex::new(SocketState::default()),
+        }
+    }
 }
 
 struct SocketRegistration {
@@ -212,11 +222,12 @@ struct SocketRegistration {
 
 impl SocketRegistry {
     fn register(self: &Arc<Self>, stream: &TcpStream) -> io::Result<SocketRegistration> {
+        stream.set_nonblocking(true)?;
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.closed {
+        if self.closed.load(Ordering::SeqCst) {
             let _ = stream.shutdown(Shutdown::Both);
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -245,13 +256,14 @@ impl SocketRegistry {
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.closed {
+        if self.closed.load(Ordering::SeqCst) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "proxy is stopping",
             ));
         }
         let stream = connector(address, timeout)?;
+        stream.set_nonblocking(true)?;
         let clone = stream.try_clone()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.sockets.insert(id, clone);
@@ -265,38 +277,73 @@ impl SocketRegistry {
     }
 
     fn write_if_open(&self, stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+        // try_write is nonblocking, so cancellation never waits for a peer to
+        // drain its receive buffer and the registry mutex is never held over
+        // socket I/O. The atomic close flag orders each bounded write attempt
+        // against trip/shutdown; after observing close no further bytes enter
+        // the stream.
+        self.write_if_open_with(bytes, |slice| stream.write(slice))
+    }
+
+    fn write_if_open_with<F>(&self, bytes: &[u8], mut write: F) -> io::Result<()>
+    where
+        F: FnMut(&[u8]) -> io::Result<usize>,
+    {
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "proxy is stopping",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "proxy write deadline elapsed",
+                ));
+            }
+            match write(&bytes[offset..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "socket closed")),
+                Ok(written) => {
+                    offset += written;
+                    if self.closed.load(Ordering::SeqCst) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "proxy stopped during a write",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(WRITE_RETRY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown_all(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         let state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "proxy is stopping",
-            ));
-        }
-        stream.write_all(bytes)
-    }
-
-    fn shutdown_all(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.closed = true;
         for stream in state.sockets.values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
 
     fn shutdown_except(&self, keep: &TcpStream) {
+        self.closed.store(true, Ordering::SeqCst);
         let keep_local = keep.local_addr().ok();
         let keep_peer = keep.peer_addr().ok();
-        let mut state = self
+        let state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        state.closed = true;
         for stream in state.sockets.values() {
             if stream.local_addr().ok() == keep_local && stream.peer_addr().ok() == keep_peer {
                 continue;
@@ -706,7 +753,8 @@ fn read_cancellable(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                continue
+                thread::sleep(WRITE_RETRY);
+                continue;
             }
             result => return result,
         }
@@ -890,7 +938,8 @@ fn copy_limited(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                continue
+                thread::sleep(WRITE_RETRY);
+                continue;
             }
             Err(error) => return Err(error),
         };
@@ -1255,6 +1304,36 @@ mod tests {
         drop(proxy);
         assert!(started.elapsed() < Duration::from_secs(1));
         let _ = client.shutdown(Shutdown::Both);
+    }
+
+    #[test]
+    fn bait_shutdown_does_not_wait_for_a_blocked_proxy_write() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+
+        let registry = Arc::new(SocketRegistry::default());
+        let thread_registry = Arc::clone(&registry);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let thread_attempts = Arc::clone(&attempts);
+        let writer_thread = thread::spawn(move || {
+            thread_registry.write_if_open_with(b"firstsecond", |remaining| {
+                thread_attempts.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                Ok(remaining.len().min(5))
+            })
+        });
+
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let tripped_at = Instant::now();
+        registry.shutdown_all();
+        assert!(tripped_at.elapsed() < Duration::from_millis(100));
+        resume_tx.send(()).unwrap();
+        let error = writer_thread.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]

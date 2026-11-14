@@ -11,6 +11,7 @@ pub(crate) struct PackageGuard {
     package_sid: crate::sandbox::windows::ffi::OwnedSid,
     package_sid_text: String,
     exemption_added: bool,
+    keep_pending_journal: bool,
     journal_path: Option<std::path::PathBuf>,
     installed: usize,
 }
@@ -48,16 +49,32 @@ impl PackageGuard {
             package_sid,
             package_sid_text,
             exemption_added: false,
+            keep_pending_journal: false,
             journal_path: None,
             installed: 0,
         };
         let setup = (|| {
             if proxy_port.is_some() {
+                if crate::sandbox::windows::ffi::loopback_exempt_sids()?
+                    .iter()
+                    .any(|sid| sid.eq_ignore_ascii_case(&guard.package_sid_text))
+                {
+                    return Err(crate::Error::integrity(
+                        "new AppContainer already has a loopback exemption",
+                    ));
+                }
                 guard.journal_path = Some(write_exemption_journal(&guard.package_sid_text)?);
-                // Set before calling the API: if the API changes OS state but then
-                // reports a failed readback, rollback still attempts exact removal.
+                if let Err(error) =
+                    crate::sandbox::windows::ffi::add_loopback_exemption(&guard.package_sid_text)
+                {
+                    guard.keep_pending_journal =
+                        error.message.contains("ambiguous machine-wide list change");
+                    return Err(error);
+                }
                 guard.exemption_added = true;
-                crate::sandbox::windows::ffi::add_loopback_exemption(&guard.package_sid_text)?;
+                if let Some(path) = guard.journal_path.as_deref() {
+                    mark_exemption_journal_owned(path, &guard.package_sid_text)?;
+                }
             }
             let layers = required_block_layers();
             for layer in layers {
@@ -148,10 +165,14 @@ impl PackageGuard {
         }
         let key = fresh_filter_key()?;
         let mut address_v4 = wfp::FWP_V4_ADDR_AND_MASK {
-            addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            // WFP's FWP_V4_ADDR_AND_MASK uses host-order integers. Keep the
+            // wire-order conversion explicit so little-endian hosts still
+            // encode 127.0.0.1 as 0x7F000001.
+            addr: proxy_loopback_address_host_order(),
             mask: u32::MAX,
         };
-        let port_value = port.to_be();
+        // FWP_UINT16 port conditions are host order as well.
+        let port_value = proxy_loopback_port_host_order(port);
         let protocol = 6u8;
         let package = wfp::FWPM_FILTER_CONDITION0 {
             fieldKey: wfp::FWPM_CONDITION_ALE_PACKAGE_ID,
@@ -328,14 +349,14 @@ impl PackageGuard {
                     condition.conditionValue.r#type == wfp::FWP_V4_ADDR_MASK
                         && !condition.conditionValue.Anonymous.v4AddrMask.is_null()
                         && (*condition.conditionValue.Anonymous.v4AddrMask).addr
-                            == u32::from_ne_bytes([127, 0, 0, 1])
+                            == u32::from_be_bytes([127, 0, 0, 1])
                         && (*condition.conditionValue.Anonymous.v4AddrMask).mask == u32::MAX
                 });
                 let port_valid = remote_port.is_some_and(|condition| {
                     guid_equal(&condition.fieldKey, &wfp::FWPM_CONDITION_IP_REMOTE_PORT)
                         && condition.matchType == wfp::FWP_MATCH_EQUAL
                         && condition.conditionValue.r#type == wfp::FWP_UINT16
-                        && condition.conditionValue.Anonymous.uint16 == port.to_be()
+                        && condition.conditionValue.Anonymous.uint16 == port
                 });
                 let protocol_valid = protocol.is_some_and(|condition| {
                     condition.matchType == wfp::FWP_MATCH_EQUAL
@@ -357,11 +378,20 @@ impl PackageGuard {
     /// retain the active-launch refusal marker until filter cleanup is known.
     pub(crate) fn close(&mut self) -> crate::Result<()> {
         if self.exemption_added {
-            crate::sandbox::windows::ffi::remove_loopback_exemption(&self.package_sid_text)?;
+            if let Err(error) =
+                crate::sandbox::windows::ffi::remove_loopback_exemption(&self.package_sid_text)
+            {
+                // Do not retry a whole-list rewrite after an ambiguous result;
+                // retain ownership evidence for restart recovery and lock the
+                // service rather than risk overwriting a concurrent writer.
+                self.exemption_added = false;
+                self.keep_pending_journal = true;
+                return Err(error);
+            }
             self.exemption_added = false;
         }
         if self.engine.is_null() {
-            self.clear_exemption_journal()?;
+            self.finish_journal_cleanup()?;
             return Ok(());
         }
         let status = unsafe {
@@ -373,6 +403,25 @@ impl PackageGuard {
             return Err(wfp_error("FwpmEngineClose0", status));
         }
         self.engine = std::ptr::null_mut();
+        self.finish_journal_cleanup()
+    }
+
+    fn finish_journal_cleanup(&mut self) -> crate::Result<()> {
+        if self.keep_pending_journal {
+            return Err(crate::Error::isolation_unavailable(
+                "loopback exemption update was ambiguous; recovery journal retained and service must remain locked",
+            ));
+        }
+        if !self.exemption_added && self.journal_path.is_some() {
+            let present = crate::sandbox::windows::ffi::loopback_exempt_sids()?
+                .iter()
+                .any(|sid| sid.eq_ignore_ascii_case(&self.package_sid_text));
+            if present {
+                return Err(crate::Error::isolation_unavailable(
+                    "pending loopback exemption ownership is ambiguous; recovery journal retained",
+                ));
+            }
+        }
         self.clear_exemption_journal()?;
         Ok(())
     }
@@ -414,11 +463,22 @@ fn required_connect_layers() -> [windows_sys::core::GUID; 1] {
 }
 
 #[cfg(windows)]
+fn proxy_loopback_address_host_order() -> u32 {
+    u32::from_be_bytes([127, 0, 0, 1])
+}
+
+#[cfg(windows)]
+fn proxy_loopback_port_host_order(port: u16) -> u16 {
+    port
+}
+
+#[cfg(windows)]
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExemptionJournal {
     version: u32,
     package_sid: String,
+    owned: bool,
 }
 
 #[cfg(windows)]
@@ -448,6 +508,7 @@ fn validate_package_sid(sid: &str) -> bool {
 
 #[cfg(windows)]
 fn write_exemption_journal(package_sid: &str) -> crate::Result<std::path::PathBuf> {
+    use std::os::windows::fs::OpenOptionsExt;
     if !validate_package_sid(package_sid) {
         return Err(crate::Error::integrity(
             "refusing to journal a non-AppContainer package SID",
@@ -455,26 +516,31 @@ fn write_exemption_journal(package_sid: &str) -> crate::Result<std::path::PathBu
     }
     let path = exemption_journal_path()?;
     let record = ExemptionJournal {
-        version: 1,
+        version: 2,
         package_sid: package_sid.to_owned(),
+        owned: false,
     };
     let bytes = serde_json::to_vec(&record)
         .map_err(|_| crate::Error::internal("cannot encode loopback exemption journal"))?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
+        .read(true)
         .create_new(true)
+        .access_mode(
+            windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
+                | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER,
+        )
         .open(&path)
         .map_err(|error| {
             crate::Error::isolation_unavailable(format!(
                 "cannot create loopback exemption recovery journal: {error}"
             ))
         })?;
-    if crate::ipc::winsec::owner_sid(&file)? != "S-1-5-18" {
-        let _ = std::fs::remove_file(&path);
-        return Err(crate::Error::integrity(
-            "loopback exemption journal is not SYSTEM-owned",
-        ));
-    }
+    let system = crate::ipc::winsec::sid_from_string("S-1-5-18")
+        .ok_or_else(|| crate::Error::internal("SYSTEM SID constant is invalid"))?;
+    crate::ipc::winsec::set_owner_sid(&file, &system)?;
+    verify_journal_owner(&file)?;
     use std::io::Write;
     if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
         let _ = std::fs::remove_file(&path);
@@ -483,6 +549,55 @@ fn write_exemption_journal(package_sid: &str) -> crate::Result<std::path::PathBu
         )));
     }
     Ok(path)
+}
+
+#[cfg(windows)]
+fn verify_journal_owner(file: &std::fs::File) -> crate::Result<()> {
+    if crate::ipc::winsec::owner_sid(file)? != "S-1-5-18" {
+        return Err(crate::Error::integrity(
+            "loopback exemption journal is not SYSTEM-owned",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn mark_exemption_journal_owned(path: &std::path::Path, package_sid: &str) -> crate::Result<()> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        || metadata.len() > 1024
+    {
+        return Err(crate::Error::integrity(
+            "loopback exemption journal is unsafe before ownership update",
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .access_mode(
+            windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                | windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
+                | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER,
+        )
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    verify_journal_owner(&file)?;
+    let record = ExemptionJournal {
+        version: 2,
+        package_sid: package_sid.to_owned(),
+        owned: true,
+    };
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|_| crate::Error::internal("cannot encode loopback exemption journal"))?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Revoke only the package SID recorded by our protected intent journal. This
@@ -514,12 +629,21 @@ pub(crate) fn sweep_loopback_exemption() -> crate::Result<()> {
     }
     let record: ExemptionJournal = serde_json::from_reader(file)
         .map_err(|_| crate::Error::integrity("loopback exemption journal is malformed"))?;
-    if record.version != 1 || !validate_package_sid(&record.package_sid) {
+    if record.version != 2 || !validate_package_sid(&record.package_sid) {
         return Err(crate::Error::integrity(
             "loopback exemption journal identity is invalid",
         ));
     }
-    crate::sandbox::windows::ffi::remove_loopback_exemption(&record.package_sid)?;
+    if record.owned {
+        crate::sandbox::windows::ffi::remove_loopback_exemption(&record.package_sid)?;
+    } else if crate::sandbox::windows::ffi::loopback_exempt_sids()?
+        .iter()
+        .any(|sid| sid.eq_ignore_ascii_case(&record.package_sid))
+    {
+        return Err(crate::Error::isolation_unavailable(
+            "pending loopback exemption ownership is ambiguous; service remains locked",
+        ));
+    }
     std::fs::remove_file(&path).map_err(|error| {
         crate::Error::isolation_unavailable(format!(
             "cannot clear loopback exemption recovery journal: {error}"
@@ -582,6 +706,10 @@ fn policy_covers_both_ip_families_for_connect_listen_and_accept() {
         &permit_layers[0],
         &wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V4
     ));
+    assert_eq!(proxy_loopback_address_host_order(), 0x7f00_0001);
+    assert_ne!(proxy_loopback_address_host_order(), 0x0100_007f);
+    assert_eq!(proxy_loopback_port_host_order(0x1234), 0x1234);
+    assert_ne!(proxy_loopback_port_host_order(0x1234), 0x3412);
 }
 
 /// Run only in the disposable elevated Windows guest: this exercises the real
