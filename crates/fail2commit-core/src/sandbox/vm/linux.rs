@@ -1102,12 +1102,14 @@ fn add_slot_inheritance(cmd: &mut Command, pairs: Vec<(RawFd, RawFd)>) {
     // only calls async-signal-safe functions (dup2, fcntl) and reads a slice
     // allocated before the fork; no allocation, lock, or other libc state is
     // touched. Failures abort the spawn, which is fail closed.
+    // The pre_exec closure is evaluated in the child only; its body is in
+    // this unsafe context (the spawn APIs require it), and every call inside
+    // is async-signal-safe as documented above.
     unsafe {
         cmd.pre_exec(move || {
             for (src, slot) in pairs.iter() {
                 loop {
-                    // SAFETY: dup2/fcntl as above on descriptor numbers we own.
-                    let dup = unsafe { libc::dup2(*src, *slot) };
+                    let dup = libc::dup2(*src, *slot);
                     if dup >= 0 {
                         break;
                     }
@@ -1117,7 +1119,7 @@ fn add_slot_inheritance(cmd: &mut Command, pairs: Vec<(RawFd, RawFd)>) {
                     }
                     return Err(err);
                 }
-                if unsafe { libc::fcntl(*slot, libc::F_SETFD, 0) } < 0 {
+                if libc::fcntl(*slot, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }

@@ -643,12 +643,12 @@ pub(super) fn group_members(pgid: i32, bound_ticks: u64) -> Vec<i32> {
 /// when the caller already reaped the leader; then a group kill by pgid is
 /// never attempted because the id may be reused.
 pub(super) fn contain_group(
-    mut child: Option<&mut Child>,
+    child: Option<&mut Child>,
     pgid: i32,
     deadline: Instant,
 ) -> Containment {
     let bound_ticks = group_bound_ticks_now();
-    if let Some(child) = child.as_deref_mut() {
+    if let Some(child) = child {
         // The leader is unreaped, so its pid (the group id) cannot be reused:
         // one exact group kill reaches every current member.
         // SAFETY: kill targets this child's own process group with a signal.
