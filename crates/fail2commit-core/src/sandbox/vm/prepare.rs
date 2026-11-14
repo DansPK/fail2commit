@@ -921,8 +921,15 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
             );
             return Err(Error::isolation_unavailable(match containment {
                 Containment::Confirmed => "qemu query timed out".to_owned(),
-                Containment::Unconfirmed { live } => {
-                    format!("qemu query timed out; cleanup unconfirmed (live pids {live:?})")
+                Containment::Unconfirmed { live, uncertain } => {
+                    format!(
+                        "qemu query timed out; cleanup unconfirmed (live pids {live:?}{})",
+                        if uncertain {
+                            ", membership scan incomplete"
+                        } else {
+                            ""
+                        }
+                    )
                 }
             }));
         }
@@ -945,9 +952,14 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
         }
     }
     match containment {
-        Containment::Unconfirmed { live } => {
+        Containment::Unconfirmed { live, uncertain } => {
             return Err(Error::isolation_unavailable(format!(
-                "qemu query cleanup unconfirmed (live pids {live:?})"
+                "qemu query cleanup unconfirmed (live pids {live:?}{})",
+                if uncertain {
+                    ", membership scan incomplete"
+                } else {
+                    ""
+                }
             )));
         }
         Containment::Confirmed => {}
