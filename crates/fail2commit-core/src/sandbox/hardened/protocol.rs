@@ -165,6 +165,46 @@ pub fn decode_job(bytes: &[u8]) -> crate::Result<JobSpec> {
     JobSpec::try_from(wire)
 }
 
+/// Validate that every filesystem path in a decoded VM guest request refers
+/// only to the guest's assigned mounts. The outer VM may share read-only input
+/// mounts and one writable work mount; arbitrary host paths are forbidden.
+pub(crate) fn validate_vm_guest_job(
+    job: &JobSpec,
+    guest_work: &Path,
+    guest_mounts: &[PathBuf],
+) -> crate::Result<()> {
+    if !guest_work.is_absolute() || job.export_to.is_some() || guest_mounts.is_empty() {
+        return Err(crate::Error::integrity("invalid VM guest path envelope"));
+    }
+    let clean_absolute = |path: &Path| {
+        path.is_absolute()
+            && !path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+    };
+    let inside = |path: &Path| {
+        clean_absolute(path)
+            && guest_mounts
+                .iter()
+                .any(|mount| clean_absolute(mount) && (path == mount || path.starts_with(mount)))
+    };
+    if !clean_absolute(guest_work)
+        || job.work_dir != guest_work
+        || !inside(&job.program)
+        || !inside(&job.cwd)
+        || !inside(&job.work_dir)
+        || job.read_only.iter().any(|p| !inside(p))
+    {
+        return Err(crate::Error::integrity(
+            "VM guest job contains a path outside its assigned mounts",
+        ));
+    }
+    Ok(())
+}
+
 /// Private launcher envelope; the public JobSpec and backend APIs are unchanged.
 pub fn encode_hardened_job(job: &JobSpec, stage_root: &Path) -> crate::Result<Vec<u8>> {
     if !stage_root.is_absolute() {
@@ -377,6 +417,29 @@ mod tests {
         assert!(decode_outcome(raw.as_bytes()).is_err());
         encoded.resize(MAX_OUTCOME_BYTES + 1, b' ');
         assert!(decode_outcome(&encoded).is_err());
+    }
+
+    #[test]
+    fn vm_guest_paths_are_limited_to_clean_assigned_mounts() {
+        let mut guest = job();
+        guest.program = PathBuf::from(r"C:\f2c\bin\tool.exe");
+        guest.cwd = PathBuf::from(r"C:\f2c\work\job");
+        guest.work_dir = PathBuf::from(r"C:\f2c\work");
+        guest.read_only = vec![PathBuf::from(r"C:\f2c\in\0")];
+        let mounts = vec![
+            PathBuf::from(r"C:\f2c\bin"),
+            PathBuf::from(r"C:\f2c\in"),
+            PathBuf::from(r"C:\f2c\work"),
+        ];
+        assert!(validate_vm_guest_job(&guest, &guest.work_dir, &mounts).is_ok());
+
+        guest.program = PathBuf::from(r"C:\Users\host\tool.exe");
+        assert!(validate_vm_guest_job(&guest, &guest.work_dir, &mounts).is_err());
+        guest.program = PathBuf::from(r"C:\f2c\bin\..\host\tool.exe");
+        assert!(validate_vm_guest_job(&guest, &guest.work_dir, &mounts).is_err());
+        guest.program = PathBuf::from(r"C:\f2c\bin\tool.exe");
+        guest.export_to = Some(PathBuf::from(r"C:\Users\host\out"));
+        assert!(validate_vm_guest_job(&guest, &guest.work_dir, &mounts).is_err());
     }
 
     #[cfg(windows)]

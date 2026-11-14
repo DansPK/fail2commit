@@ -170,13 +170,16 @@ fn main() -> ExitCode {
             #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
             cmd::sandbox::Action::Launch {
                 jobfile,
+                vm_guest,
                 watchdog,
                 prepare_request,
                 prepare_ack,
                 launch_id,
                 test_diagnostic,
             } => {
-                let result = if *test_diagnostic {
+                let result = if *vm_guest {
+                    cmd::sandbox::launch(jobfile, true, None, None, None, None)
+                } else if *test_diagnostic {
                     cmd::sandbox::launch_test_diagnostic(
                         jobfile,
                         *watchdog,
@@ -187,6 +190,7 @@ fn main() -> ExitCode {
                 } else {
                     cmd::sandbox::launch(
                         jobfile,
+                        false,
                         *watchdog,
                         *prepare_request,
                         *prepare_ack,
@@ -198,6 +202,7 @@ fn main() -> ExitCode {
             #[cfg(not(all(feature = "hardened-test-diagnostics", debug_assertions)))]
             cmd::sandbox::Action::Launch {
                 jobfile,
+                vm_guest,
                 watchdog,
                 prepare_request,
                 prepare_ack,
@@ -206,6 +211,7 @@ fn main() -> ExitCode {
                 return exit(
                     cmd::sandbox::launch(
                         jobfile,
+                        *vm_guest,
                         *watchdog,
                         *prepare_request,
                         *prepare_ack,

@@ -14,6 +14,7 @@ pub(crate) mod egress;
 pub mod hardened;
 pub mod netpolicy;
 pub mod report;
+pub(crate) mod vm_guest;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -57,6 +58,12 @@ pub fn run_job(backend: &dyn SandboxBackend, job: &JobSpec) -> crate::Result<Job
         .state_dir
         .join("sandbox-job");
     crate::fsutil::with_lock(&lock, || run_job_locked(backend, job))
+}
+
+/// Private VM-side launcher. It accepts only the guest mount layout and uses
+/// the unchanged platform backend; exports remain owned by the host run_job.
+pub fn vm_guest_launch(jobfile: &Path) -> crate::Result<()> {
+    vm_guest::launch(jobfile)
 }
 
 fn run_job_locked(backend: &dyn SandboxBackend, job: &JobSpec) -> crate::Result<JobOutcome> {
