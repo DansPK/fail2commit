@@ -63,14 +63,14 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    GetProcessMitigationPolicy, InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
+    GetProcessMitigationPolicy, InitializeProcThreadAttributeList, OpenProcessToken,
     ProcessExtensionPointDisablePolicy, ProcessFontDisablePolicy, ProcessImageLoadPolicy,
     ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, EXTENDED_STARTUPINFO_PRESENT,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 use windows_sys::Win32::System::IO::{
@@ -683,7 +683,7 @@ pub(crate) struct VmControlTree {
 
 impl VmControlTree {
     #[allow(unsafe_code)]
-    pub(crate) fn assign(pid: u32) -> crate::Result<Self> {
+    pub(crate) fn new() -> crate::Result<Self> {
         // SAFETY: creates a fresh unnamed job object; the returned handle is
         // validated and immediately transferred to OwnedHandle.
         let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -697,29 +697,30 @@ impl VmControlTree {
         if !set_info(raw(&handle), JobObjectExtendedLimitInformation, &limits) {
             return Err(unavailable("configure VM control job object"));
         }
-        // SAFETY: OpenProcess requests only the rights needed for assignment
-        // and identity verification on the just-spawned child PID.
-        let process = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE,
-                0,
-                pid,
-            )
-        };
-        if process.is_null() {
-            return Err(unavailable("open VM control process"));
-        }
-        let process = owned(process);
-        // SAFETY: the job and process handles are live and owned here.
-        if unsafe { AssignProcessToJobObject(raw(&handle), raw(&process)) } == 0 {
-            return Err(unavailable("assign VM control process to owned job"));
-        }
-        let mut inside = 0;
-        // SAFETY: both handles are live, and `inside` is a valid out pointer.
-        if unsafe { IsProcessInJob(raw(&process), raw(&handle), &mut inside) } == 0 || inside == 0 {
-            return Err(unavailable("verify VM control process ownership"));
+        let installed: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+            query_info(raw(&handle), JobObjectExtendedLimitInformation)
+                .ok_or_else(|| unavailable("verify VM control job limits"))?;
+        if installed.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0
+            || installed.BasicLimitInformation.LimitFlags
+                & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+                != 0
+        {
+            return Err(unavailable("VM control job does not enforce kill-on-close containment"));
         }
         Ok(Self { handle })
+    }
+
+    #[allow(unsafe_code)]
+    fn verify_process(&self, process: &impl AsRawHandle) -> crate::Result<()> {
+        let mut inside = 0;
+        // SAFETY: both handles are live, and `inside` is a valid out pointer.
+        if unsafe { IsProcessInJob(raw(process), raw(&self.handle), &mut inside) } == 0 || inside == 0 {
+            return Err(unavailable("verify VM control process job membership"));
+        }
+        if self.active_processes()? != 1 {
+            return Err(unavailable("VM control job membership did not contain exactly the suspended root"));
+        }
+        Ok(())
     }
 
     pub(crate) fn active_processes(&self) -> crate::Result<u32> {
@@ -752,6 +753,179 @@ impl VmControlTree {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+pub(crate) struct VmControlProcess {
+    process: OwnedHandle,
+    thread: OwnedHandle,
+}
+
+impl VmControlProcess {
+    #[allow(unsafe_code)]
+    pub(crate) fn resume(&self) -> crate::Result<()> {
+        // SAFETY: the primary thread handle is live and was created suspended.
+        if unsafe { ResumeThread(raw(&self.thread)) } == u32::MAX {
+            return Err(unavailable("resume owned VM control process"));
+        }
+        Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn exit_code(&self) -> crate::Result<Option<u32>> {
+        // SAFETY: the process handle is live and the timeout poll is zero.
+        match unsafe { WaitForSingleObject(raw(&self.process), 0) } {
+            0 => {
+                let mut code = 0;
+                // SAFETY: live process handle and valid output pointer.
+                if unsafe { GetExitCodeProcess(raw(&self.process), &mut code) } == 0 {
+                    Err(unavailable("read VM control process exit code"))
+                } else {
+                    Ok(Some(code))
+                }
+            }
+            258 => Ok(None),
+            _ => Err(unavailable("poll VM control process")),
+        }
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn terminate_and_wait(&self, timeout: Duration) -> crate::Result<()> {
+        // SAFETY: live root process handle; it is a member of the owned job.
+        let terminated = unsafe { TerminateProcess(raw(&self.process), 1) } != 0;
+        // SAFETY: read immediately after TerminateProcess.
+        let error = unsafe { GetLastError() };
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: live process handle; this is a finite wait.
+        let waited = unsafe { WaitForSingleObject(raw(&self.process), millis) };
+        if waited == 0 && (terminated || error == ERROR_ACCESS_DENIED) {
+            Ok(())
+        } else {
+            Err(crate::Error::isolation_unavailable(format!(
+                "VM control root termination is unconfirmed (wait={waited}, win32={error})"
+            )))
+        }
+    }
+}
+
+/// Create the host control query suspended, atomically place it in the owned
+/// kill-on-close job through PROC_THREAD_ATTRIBUTE_JOB_LIST, restrict inherited
+/// handles to stdin/stdout/stderr, verify membership, then resume it.
+#[allow(unsafe_code)]
+pub(crate) fn spawn_vm_control(
+    program: &Path,
+    args: &[OsString],
+    cwd: Option<&Path>,
+    tree: &VmControlTree,
+    before_resume: impl FnOnce(),
+) -> crate::Result<(VmControlProcess, File, File)> {
+    use std::os::windows::io::AsRawHandle;
+    let command_line = crate::sandbox::windows::command_line(program, args)?;
+    let program_w = wide(program.as_os_str());
+    let cwd_w = cwd.map(|path| wide(path.as_os_str()));
+    let input = File::open("NUL").map_err(|error| unavailable(&format!("open query stdin: {error}")))?;
+    let (stdout, stdout_write) = pipe()?;
+    let (stderr, stderr_write) = pipe()?;
+    let handles = [input.as_raw_handle() as HANDLE, raw(&stdout_write), raw(&stderr_write)];
+    let _serial = SPAWN_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    if !handles.iter().all(|handle| set_inherit(*handle, true)) {
+        handles.iter().for_each(|handle| { set_inherit(*handle, false); });
+        return Err(unavailable("mark VM query stdio inheritable"));
+    }
+    let mut attribute_size = 0usize;
+    // SAFETY: documented sizing call sets the required storage size.
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut attribute_size); }
+    let mut storage = vec![0usize; attribute_size.div_ceil(std::mem::size_of::<usize>())];
+    let list = storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+    // SAFETY: aligned storage is large enough and outlives the process creation.
+    if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut attribute_size) } == 0 {
+        handles.iter().for_each(|handle| { set_inherit(*handle, false); });
+        return Err(unavailable("initialize VM query process attributes"));
+    }
+    struct AttributeList(LPPROC_THREAD_ATTRIBUTE_LIST);
+    impl Drop for AttributeList {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            // SAFETY: initialized above and dropped exactly once.
+            unsafe { DeleteProcThreadAttributeList(self.0); }
+        }
+    }
+    let _attribute_list = AttributeList(list);
+    let job_handles = [raw(&tree.handle)];
+    // SAFETY: both attribute values remain live until process creation returns.
+    let updated = unsafe {
+        UpdateProcThreadAttribute(
+            list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_ptr().cast(), std::mem::size_of_val(&handles),
+            std::ptr::null_mut(), std::ptr::null(),
+        ) != 0 && UpdateProcThreadAttribute(
+            list, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            job_handles.as_ptr().cast(), std::mem::size_of_val(&job_handles),
+            std::ptr::null_mut(), std::ptr::null(),
+        ) != 0
+    };
+    if !updated {
+        handles.iter().for_each(|handle| { set_inherit(*handle, false); });
+        return Err(unavailable("configure VM query handle/job allowlists"));
+    }
+    // SAFETY: zero is a valid initial value for STARTUPINFOEXW.
+    let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = handles[0];
+    startup.StartupInfo.hStdOutput = handles[1];
+    startup.StartupInfo.hStdError = handles[2];
+    startup.lpAttributeList = list;
+    // SAFETY: zero is a valid output initialization for PROCESS_INFORMATION.
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut command_line = command_line;
+    // SAFETY: all buffers/attributes/handles outlive the call; job membership
+    // and stdio inheritance are applied atomically before this suspended root
+    // can execute any instruction.
+    let created = unsafe {
+        CreateProcessW(
+            program_w.as_ptr(), command_line.as_mut_ptr(), std::ptr::null(),
+            std::ptr::null(), 1,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            std::ptr::null(), cwd_w.as_ref().map_or(std::ptr::null(), |path| path.as_ptr()),
+            &startup.StartupInfo, &mut info,
+        )
+    };
+    // SAFETY: GetLastError is read immediately after CreateProcessW.
+    let win32 = unsafe { GetLastError() };
+    let inheritance_cleared = handles.iter().all(|handle| set_inherit(*handle, false));
+    if created == 0 {
+        if !inheritance_cleared {
+            return Err(unavailable("failed to clear inherited VM query handles after spawn failure"));
+        }
+        return Err(crate::Error::isolation_unavailable(format!(
+            "CreateProcessW for VM control query failed with Win32 error {win32}"
+        )));
+    }
+    let process = VmControlProcess { process: owned(info.hProcess), thread: owned(info.hThread) };
+    if !inheritance_cleared {
+        let root_cleanup = process.terminate_and_wait(Duration::from_secs(2));
+        let tree_cleanup = tree.terminate().and_then(|_| tree.wait_empty(Instant::now() + Duration::from_secs(2)));
+        return Err(crate::Error::isolation_unavailable(format!(
+            "clearing inherited query handles failed; root cleanup: {root_cleanup:?}; tree cleanup: {tree_cleanup:?}"
+        )));
+    }
+    if let Err(error) = tree.verify_process(&process.process) {
+        let root_cleanup = process.terminate_and_wait(Duration::from_secs(2));
+        return Err(crate::Error::isolation_unavailable(format!(
+            "query job membership verification failed: {}; root cleanup: {root_cleanup:?}", error.message
+        )));
+    }
+    before_resume();
+    if let Err(error) = process.resume() {
+        let root_cleanup = process.terminate_and_wait(Duration::from_secs(2));
+        let tree_cleanup = tree.terminate().and_then(|_| tree.wait_empty(Instant::now() + Duration::from_secs(2)));
+        return Err(crate::Error::isolation_unavailable(format!(
+            "query root resume failed: {}; root cleanup: {root_cleanup:?}; tree cleanup: {tree_cleanup:?}", error.message
+        )));
+    }
+    drop(stdout_write);
+    drop(stderr_write);
+    Ok((process, stdout, stderr))
 }
 
 #[allow(unsafe_code)]

@@ -2288,7 +2288,7 @@ fn validate_env(key: &OsStr, value: &OsStr) -> crate::Result<()> {
     Ok(())
 }
 
-fn command_line(program: &Path, args: &[OsString]) -> crate::Result<Vec<u16>> {
+pub(crate) fn command_line(program: &Path, args: &[OsString]) -> crate::Result<Vec<u16>> {
     let mut all = Vec::with_capacity(args.len() + 1);
     all.push(program.as_os_str().to_os_string());
     all.extend_from_slice(args);
