@@ -27,7 +27,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BOOT_GRACE: Duration = Duration::from_secs(45);
-const CONTROL_GRACE: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MICROVM_MAX_DEVICES: usize = 8;
 const GUEST_ROOT: &str = "/mnt/fail2commit-vm";
@@ -285,6 +284,10 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     }
     let _pins = revalidated.pin_mounts()?;
 
+    // LV-03: compute the checked absolute deadline before any spawn, so a
+    // representability failure can never leave a live VM with dropped guards.
+    let deadline = boot_deadline(job.limits.timeout)?;
+
     let mut child = Command::new(&host.state.qemu)
         .args(&args)
         .stdin(Stdio::null())
@@ -293,13 +296,12 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
         .process_group(0)
         .spawn()
         .map_err(|e| crate::Error::isolation_unavailable(format!("start QEMU: {e}")))?;
-    let deadline = job.limits.timeout.checked_add(BOOT_GRACE).ok_or_else(|| {
-        crate::Error::isolation_unavailable("job timeout plus boot grace cannot be represented")
-    })?;
+    // Every post-spawn path confirms the whole process group is dead before
+    // the control/result guards and mount pins are released.
     let exit = match wait_child(&mut child, deadline) {
         Ok(status) => status,
         Err(WaitError::TimedOut) => {
-            terminate_process_tree(&mut child)?;
+            prepare::stop_process_group(&mut child)?;
             let outcome_path = result_dir.path().join("outcome.json");
             return match read_expected_outcome(&outcome_path, &job_id) {
                 Ok(_) => Err(crate::Error::isolation_unavailable(
@@ -309,18 +311,33 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
             };
         }
         Err(WaitError::Failed(error)) => {
-            terminate_process_tree(&mut child)?;
+            prepare::stop_process_group(&mut child)?;
             return Err(crate::Error::isolation_unavailable(format!(
                 "wait for QEMU: {error}"
             )));
         }
     };
     if !exit.success() {
+        prepare::stop_process_group(&mut child)?;
         return Err(crate::Error::isolation_unavailable(format!(
             "QEMU exited unsuccessfully: {exit}"
         )));
     }
+    // Clean exit: still confirm no descendant survives before releasing state.
+    prepare::stop_process_group(&mut child)?;
     read_expected_outcome(&result_dir.path().join("outcome.json"), &job_id)
+}
+
+/// LV-03: the checked absolute deadline is computed before any spawn. A
+/// representability failure returns before QEMU exists, so no live VM is ever
+/// left with dropped stage/control/result guards (the Windows VW-02 class).
+fn boot_deadline(timeout: Duration) -> crate::Result<Instant> {
+    let total = timeout.checked_add(BOOT_GRACE).ok_or_else(|| {
+        crate::Error::isolation_unavailable("job timeout plus boot grace cannot be represented")
+    })?;
+    Instant::now()
+        .checked_add(total)
+        .ok_or_else(|| crate::Error::isolation_unavailable("job deadline cannot be represented"))
 }
 
 /// Render the QEMU command line with explicit MMIO devices (CR-025). Paths are
@@ -553,10 +570,7 @@ enum WaitError {
     Failed(String),
 }
 
-fn wait_child(child: &mut Child, timeout: Duration) -> Result<std::process::ExitStatus, WaitError> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| WaitError::Failed("timeout cannot be represented".into()))?;
+fn wait_child(child: &mut Child, deadline: Instant) -> Result<std::process::ExitStatus, WaitError> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -565,34 +579,6 @@ fn wait_child(child: &mut Child, timeout: Duration) -> Result<std::process::Exit
             Err(e) => return Err(WaitError::Failed(e.to_string())),
         }
     }
-}
-
-/// Kill the whole QEMU process group and confirm it is gone. QEMU was spawned
-/// as a process-group leader, so a group kill reaches every descendant.
-fn terminate_process_tree(child: &mut Child) -> crate::Result<()> {
-    let pid = child.id() as i32;
-    // SAFETY: kill targets this child's own process group with a constant signal.
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    match wait_child(child, CONTROL_GRACE) {
-        Ok(_) => {}
-        Err(_) => {
-            child
-                .kill()
-                .map_err(|e| crate::Error::isolation_unavailable(format!("kill QEMU: {e}")))?;
-            child
-                .wait()
-                .map_err(|e| crate::Error::isolation_unavailable(format!("wait for QEMU: {e}")))?;
-        }
-    }
-    // SAFETY: a zero signal probes existence of the process group only.
-    let gone = unsafe { libc::kill(-pid, 0) } == -1
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-    if !gone {
-        return Err(crate::Error::isolation_unavailable(
-            "the QEMU process group did not stop cleanly",
-        ));
-    }
-    Ok(())
 }
 
 fn timeout_outcome() -> JobOutcome {
@@ -832,6 +818,7 @@ fn first_child_under(parent: &Path, path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::isolation::JobLimits;
+    use std::os::unix::fs::PermissionsExt;
 
     fn job() -> JobSpec {
         JobSpec {
@@ -1054,5 +1041,123 @@ mod tests {
         assert!(!valid_job_id("ABC"));
         assert!(path_under(Path::new("/usr/bin/bash"), Path::new("/usr")));
         assert!(!path_under(Path::new("/usrlocal/bin"), Path::new("/usr")));
+    }
+
+    #[test]
+    fn boot_deadline_is_checked_before_any_spawn() {
+        // LV-03: the representability check that used to run after spawn now
+        // runs before it; an overflowing timeout yields an error, not a VM.
+        assert!(boot_deadline(Duration::MAX).is_err());
+        assert!(boot_deadline(Duration::from_secs(u64::MAX)).is_err());
+        assert!(boot_deadline(Duration::from_secs(10)).is_ok());
+    }
+
+    #[test]
+    fn stop_process_group_confirms_descendant_death() {
+        // A group leader that backgrounds a long-lived descendant: the cleanup
+        // must kill and confirm the whole group, not just reap the leader.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("desc.pid");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pidfile.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pidfile.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let desc_pid: i32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: a zero signal only probes existence of the descendant.
+        assert_eq!(
+            unsafe { libc::kill(desc_pid, 0) },
+            0,
+            "descendant must be alive"
+        );
+        prepare::stop_process_group(&mut child).unwrap();
+        // SAFETY: zero-signal probes of the group and the descendant.
+        assert_eq!(
+            unsafe { libc::kill(-(child.id() as i32), 0) },
+            -1,
+            "group gone"
+        );
+        assert_eq!(unsafe { libc::kill(desc_pid, 0) }, -1, "descendant gone");
+    }
+
+    /// Restores FAIL2COMMIT_HOME even if a sentinel assertion panics.
+    struct HomeEnvGuard {
+        prev: Option<OsString>,
+    }
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("FAIL2COMMIT_HOME", v),
+                None => std::env::remove_var("FAIL2COMMIT_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_timeout_never_spawns_qemu() {
+        // LV-03 spawn sentinel: a fake QEMU records a marker when launched. An
+        // unrepresentable timeout must refuse before any spawn (marker absent);
+        // a representable timeout spawns and then reports the missing outcome.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("FAIL2COMMIT_HOME");
+        std::env::set_var("FAIL2COMMIT_HOME", home.path());
+        let _restore = HomeEnvGuard { prev };
+
+        let stage_root = home.path().join("cache").join("sandbox-stage");
+        let stage = stage_root.join("job-sentinel");
+        let work = stage.join("work");
+        let input = stage.join("input-0");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("tool"), b"#!/bin/sh\n").unwrap();
+        let sentinel = home.path().join("sentinel");
+        let qemu = home.path().join("fake-qemu");
+        fs::write(
+            &qemu,
+            format!(
+                "#!/bin/sh\necho spawned > '{}'\nexit 0\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&qemu, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut st = state();
+        st.qemu = qemu.to_string_lossy().into_owned();
+        st.system_shares = vec![];
+        let host = ReadyHost { state: st };
+        let mut j = job();
+        j.program = input.join("tool");
+        j.cwd = work.clone();
+        j.work_dir = work.clone();
+        j.read_only = vec![input.clone()];
+
+        // Overflow: refused before spawn, so the sentinel never appears.
+        j.limits.timeout = Duration::MAX;
+        let err = run_job(&host, &j).expect_err("overflow timeout must be refused");
+        assert!(err.message.contains("represented"), "{}", err.message);
+        assert!(!sentinel.exists(), "QEMU must not spawn on overflow");
+
+        // Control: a representable timeout spawns (sentinel appears), the fake
+        // QEMU exits cleanly, and the missing outcome is reported after the
+        // process group is confirmed dead.
+        j.limits.timeout = Duration::from_secs(2);
+        let err2 = run_job(&host, &j).expect_err("no outcome was written");
+        assert!(sentinel.exists(), "control case must spawn QEMU");
+        assert!(err2.message.contains("outcome"), "{}", err2.message);
     }
 }

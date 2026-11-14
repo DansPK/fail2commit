@@ -71,6 +71,7 @@ const GUEST_BIN_DIR: &str = "/mnt/fail2commit-vm/bin";
 /// Fixed outer-guest namespace (shared with the host backend and vm_guest).
 const GUEST_ROOT: &str = "/mnt/fail2commit-vm";
 const CONTROL_GRACE: Duration = Duration::from_secs(20);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_QUERY_OUTPUT: usize = 1024 * 1024;
 const MAX_ETC_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -535,6 +536,53 @@ fn verify_qemu_support(qemu: &Path) -> crate::Result<String> {
         }
     }
     Ok(version)
+}
+
+/// Kill the child's whole process group and confirm the group is gone before
+/// the caller releases mapped state (LV-03). Idempotent: safe after the leader
+/// already exited and was reaped. Bounded by CONTROL_GRACE; kill/wait failures
+/// are surfaced, not ignored. The child must have been spawned as a group
+/// leader (`process_group(0)`) so the group kill reaches every descendant.
+pub(super) fn stop_process_group(child: &mut Child) -> crate::Result<()> {
+    let pid = child.id() as i32;
+    // SAFETY: kill targets this child's own process group with a constant signal.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    // Reap the leader if it has not been reaped yet (bounded).
+    let deadline = Instant::now().checked_add(CONTROL_GRACE);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            // ECHILD: already reaped; the group probe below decides.
+            Err(_) => break,
+            Ok(None) => {
+                if deadline.is_none_or(|d| Instant::now() >= d) {
+                    child.wait().map_err(|e| {
+                        Error::isolation_unavailable(format!("wait for process group leader: {e}"))
+                    })?;
+                    break;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+    // Confirm the whole group is gone. A killed descendant can linger as a
+    // zombie until it is reaped, so retry the probe within the grace instead
+    // of failing on the first look.
+    let probe_deadline = Instant::now().checked_add(CONTROL_GRACE);
+    loop {
+        // SAFETY: a zero signal probes existence of the process group only.
+        let gone = unsafe { libc::kill(-pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            return Ok(());
+        }
+        if probe_deadline.is_none_or(|d| Instant::now() >= d) {
+            return Err(Error::isolation_unavailable(
+                "the process group did not stop cleanly",
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 fn run_bounded(exe: &Path, args: &[&str]) -> crate::Result<String> {
