@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1262,7 +1263,7 @@ case "$cmd" in
         if [ "$a" = "$t" ]; then exit 1; fi
       done
     done ;;
-  poweroff) echo "POWEROFF" >> "$F2C_INIT_LOG"; exit 0 ;;
+  poweroff) echo "POWEROFF" >> "$F2C_INIT_LOG"; kill -KILL 0 2>/dev/null; exit 0 ;;
   chmod) ;;
   test) [ "$@" ]; exit $? ;;
   *) ;;
@@ -1307,13 +1308,15 @@ exit 0
             .env("F2C_INIT_ROOT", &f.root)
             .env("F2C_INIT_CMDLINE", cmdline)
             .env("F2C_INIT_FAIL_TAGS", fail_tags)
+            // Own process group: the fake `poweroff -f` kills this group to
+            // emulate a halt that never returns, without touching the test.
+            .process_group(0)
             .output()
             .unwrap();
-        assert!(
-            out.status.success(),
-            "init shell crashed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        // A poweroff-terminated run is expected, not a crash. Only a shell
+        // parse error is a fixture bug.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("syntax error"), "init shell bug: {stderr}");
     }
 
     fn init_log(f: &InitFixture) -> String {
