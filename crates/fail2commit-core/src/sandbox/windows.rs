@@ -1363,6 +1363,7 @@ impl RecordedProfile {
         self.profile.as_ref().expect("profile present until drop")
     }
 
+    #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
     fn remove(mut self) -> crate::Result<()> {
         let profile = self.profile.take().ok_or_else(|| {
             crate::Error::internal("recorded AppContainer profile was already removed")

@@ -62,6 +62,7 @@ impl ReadinessFacts {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn linux_readiness(
     service_running: bool,
     peer_authenticated: bool,

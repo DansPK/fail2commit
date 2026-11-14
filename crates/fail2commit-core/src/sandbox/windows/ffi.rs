@@ -255,6 +255,7 @@ impl Profile {
     }
 
     #[allow(unsafe_code)]
+    #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
     pub(super) fn remove(mut self) -> crate::Result<()> {
         // SAFETY: name is NUL-terminated and this owns the profile SID.
         let hr = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };

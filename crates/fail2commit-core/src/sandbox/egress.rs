@@ -155,6 +155,7 @@ pub(crate) fn find_head_end(head: &[u8]) -> Option<usize> {
         .map(|pos| pos + 4)
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn content_length(head: &[u8]) -> Option<usize> {
     for line in String::from_utf8_lossy(head).lines() {
         if let Some((name, value)) = line.split_once(':') {
