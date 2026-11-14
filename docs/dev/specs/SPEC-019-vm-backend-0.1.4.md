@@ -56,20 +56,31 @@ host: wait outcome.json + VM process exit → revoke nothing (VM is disposable)
 ### 3.1 Launch
 
 - Generate a `.wsb` configuration:
-  - `MappedFolder` per `read_only` tree → `C:\f2c\in\<n>`, `ReadOnly=true`;
-  - `MappedFolder` work_dir → `C:\f2c\work`, read-write (this **is** the host
+  - `MappedFolder` per `read_only` tree → `C:\f2c\cache\sandbox-stage\<job-id>\input-<n>`, `ReadOnly=true`;
+  - `MappedFolder` work_dir → `C:\f2c\cache\sandbox-stage\<job-id>\work`, read-write (this **is** the host
     stage dir, so exports need no copy-back);
   - `MappedFolder` the fail2commit install dir → `C:\f2c\bin`, read-only;
   - `Networking`: `Enable` for `internet`, `Disable` for `none` (the inner
     AppContainer enforces the policy either way; `Disable` is defence in depth);
   - `MemoryInMB` from `limits.memory_bytes` + guest headroom;
-  - `LogonCommand`: `C:\f2c\bin\fail2commit.exe sandbox launch C:\f2c\work\job.json --vm-guest`.
+  - `LogonCommand`: `C:\f2c\bin\fail2commit.exe sandbox launch C:\f2c\control\job.json --vm-guest`.
 - Start `WindowsSandbox.exe <config.wsb>`; wait for `outcome.json`, then for the
   Windows Sandbox process to exit (`--vm-guest` runs `shutdown /s /t 0` after
   writing the outcome). Kill the process tree on timeout or outcome failure.
 - The inner backend runs exactly as on the host: fresh AppContainer profile,
   bait in the guest job home, monitor, report. Its stage root lives in the
   disposable guest — nothing to clean on the host.
+
+CR-026 (2026-11-14): Windows guest launch fixes its trusted home internally to
+`C:\f2c`, derives the actual cache root through `TrustedPaths`, and maps every
+job work/input tree under one fresh child of that sandbox-stage root. This
+preserves the unchanged AppContainer common-stage validator. The request is in
+a separate per-run read-only control mapping; results are in a separate per-run
+exchange mapping outside the AppContainer grant tree. The package gets no
+control/result grant. The outer bootstrap binary mapping is read-only. Guest
+export is disabled; only the original host work directory is exported after an
+identity-bound valid outcome and confirmed VM exit. Resolved mount/file
+identities must be validated, not just path spelling.
 
 ### 3.2 Probe (cached, cheap after first call)
 
