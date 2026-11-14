@@ -1338,6 +1338,8 @@ kernel/net/9p/9pnet_virtio.ko.xz: kernel/net/9p/9pnet.ko.zst kernel/drivers/virt
     const FIX_ID: &str = "0123456789abcdef0123456789abcdef";
 
     struct InitFixture {
+        /// Owns the fixture directory; kept alive for the test (RAII), not read.
+        #[allow(dead_code)]
         dir: tempfile::TempDir,
         root: PathBuf,
         log: PathBuf,

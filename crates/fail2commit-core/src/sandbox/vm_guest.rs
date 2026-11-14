@@ -293,11 +293,10 @@ fn kvm_signature_is_kvm(ebx: u32, ecx: u32, edx: u32) -> bool {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[allow(unsafe_code)]
 fn kvm_hypervisor_present() -> bool {
-    // SAFETY: __cpuid_count is a read-only, serializing CPU instruction that is
-    // always available on x86_64; it has no memory or privilege side effects.
-    let leaf = unsafe { std::arch::x86_64::__cpuid_count(0x4000_0000, 0) };
+    // __cpuid_count is a read-only, serializing CPU instruction always available
+    // on x86_64; it has no memory or privilege side effects.
+    let leaf = std::arch::x86_64::__cpuid_count(0x4000_0000, 0);
     kvm_signature_is_kvm(leaf.ebx, leaf.ecx, leaf.edx)
 }
 
