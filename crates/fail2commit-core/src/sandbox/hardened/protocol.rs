@@ -11,6 +11,8 @@ use std::time::Duration;
 
 pub const MAX_JOB_BYTES: usize = 1024 * 1024;
 pub const MAX_OUTCOME_BYTES: usize = 2 * 1024 * 1024;
+/// The VM envelope base64-expands the frozen outcome payload and adds identity.
+pub const MAX_VM_OUTCOME_BYTES: usize = MAX_OUTCOME_BYTES * 4 / 3 + 1024;
 const MAX_STREAM_BYTES: usize = 768 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +54,17 @@ struct OutcomeFile {
     truncated: bool,
     exported: Vec<String>,
     report: ActivityReport,
+}
+
+/// Additive VM transport: binds the frozen outcome payload to the fresh job
+/// identity assigned by the host. The inner `JobOutcome` wire contract is
+/// unchanged; the envelope only authenticates which run produced it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VmOutcomeFile {
+    version: u32,
+    job_id: String,
+    payload_b64: String,
 }
 
 impl TryFrom<&JobSpec> for JobFile {
@@ -203,6 +216,60 @@ pub(crate) fn validate_vm_guest_job(
         ));
     }
     Ok(())
+}
+
+/// Bind the frozen outcome transport to a fresh VM job identity without
+/// changing the `JobOutcome` wire contract used by the hardened launcher.
+pub fn encode_vm_outcome(job_id: &str, outcome: &JobOutcome) -> crate::Result<Vec<u8>> {
+    if !valid_vm_job_id(job_id) {
+        return Err(crate::Error::integrity("invalid VM outcome identity"));
+    }
+    use base64::Engine;
+    let payload = encode_outcome(outcome)?;
+    let wire = VmOutcomeFile {
+        version: 1,
+        job_id: job_id.to_owned(),
+        payload_b64: base64::engine::general_purpose::STANDARD.encode(payload),
+    };
+    let bytes = serde_json::to_vec(&wire).map_err(|error| {
+        crate::Error::internal(format!("VM outcome serialization failed: {error}"))
+    })?;
+    if bytes.len() > MAX_VM_OUTCOME_BYTES {
+        return Err(crate::Error::isolation_unavailable(
+            "VM outcome envelope exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Decode only an outcome carrying the identity assigned to this VM run. A
+/// stale, forged or missing identity is rejected before the payload is parsed.
+pub fn decode_vm_outcome(job_id: &str, bytes: &[u8]) -> crate::Result<JobOutcome> {
+    if !valid_vm_job_id(job_id) || bytes.len() > MAX_VM_OUTCOME_BYTES {
+        return Err(crate::Error::integrity(
+            "VM outcome envelope is invalid or oversized",
+        ));
+    }
+    use base64::Engine;
+    let wire: VmOutcomeFile = serde_json::from_slice(bytes).map_err(|error| {
+        crate::Error::integrity(format!("invalid VM outcome envelope: {error}"))
+    })?;
+    if wire.version != 1 || wire.job_id != job_id {
+        return Err(crate::Error::integrity(
+            "VM outcome does not match the active job identity",
+        ));
+    }
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(wire.payload_b64)
+        .map_err(|_| crate::Error::integrity("invalid VM outcome payload encoding"))?;
+    decode_outcome(&payload)
+}
+
+fn valid_vm_job_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 /// Private launcher envelope; the public JobSpec and backend APIs are unchanged.
@@ -366,6 +433,7 @@ mod tests {
     use super::*;
     use crate::isolation::{ActivityReport, JobLimits, JobOutcome};
 
+    #[cfg(windows)]
     fn job() -> JobSpec {
         JobSpec {
             program: PathBuf::from("C:\\work\\tool.exe"),
@@ -419,6 +487,7 @@ mod tests {
         assert!(decode_outcome(&encoded).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn vm_guest_paths_are_limited_to_clean_assigned_mounts() {
         let mut guest = job();
@@ -440,6 +509,37 @@ mod tests {
         guest.program = PathBuf::from(r"C:\f2c\bin\tool.exe");
         guest.export_to = Some(PathBuf::from(r"C:\Users\host\out"));
         assert!(validate_vm_guest_job(&guest, &guest.work_dir, &mounts).is_err());
+    }
+
+    #[test]
+    fn vm_outcome_transport_binds_fresh_identity_and_bounds_payload() {
+        let outcome = JobOutcome {
+            status: JobStatus::Exited(0),
+            stdout: b"done".to_vec(),
+            stderr: vec![],
+            truncated: false,
+            exported: vec![],
+            report: ActivityReport::default(),
+        };
+        let id = "0123456789abcdef0123456789abcdef";
+        let bytes = encode_vm_outcome(id, &outcome).unwrap();
+        assert_eq!(decode_vm_outcome(id, &bytes).unwrap(), outcome);
+        assert!(decode_vm_outcome("1123456789abcdef0123456789abcdef", &bytes).is_err());
+        assert!(encode_vm_outcome("ABC", &outcome).is_err());
+        assert!(decode_vm_outcome(id, &vec![0; MAX_VM_OUTCOME_BYTES + 1]).is_err());
+        // A forged export claim inside the payload is still refused.
+        let payload = encode_outcome(&outcome).unwrap();
+        let raw = String::from_utf8(payload)
+            .unwrap()
+            .replace("\"exported\":[]", "\"exported\":[\"x\"]");
+        use base64::Engine;
+        let forged = serde_json::to_vec(&VmOutcomeFile {
+            version: 1,
+            job_id: id.to_owned(),
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(raw),
+        })
+        .unwrap();
+        assert!(decode_vm_outcome(id, &forged).is_err());
     }
 
     #[cfg(windows)]
