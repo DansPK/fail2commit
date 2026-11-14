@@ -67,6 +67,8 @@ const STANDARD_LIB_DIRS: [&str; 6] = [
 ];
 /// Fixed guest location of the launcher and its relay sibling.
 const GUEST_BIN_DIR: &str = "/mnt/fail2commit-vm/bin";
+/// Fixed outer-guest namespace (shared with the host backend and vm_guest).
+const GUEST_ROOT: &str = "/mnt/fail2commit-vm";
 const CONTROL_GRACE: Duration = Duration::from_secs(20);
 const MAX_QUERY_OUTPUT: usize = 1024 * 1024;
 const MAX_ETC_BYTES: u64 = 64 * 1024 * 1024;
@@ -183,10 +185,15 @@ fn prepare_inner(state_path: &Path, lib_dir: &Path) -> crate::Result<String> {
     let bwrap = first_trusted(&BWRAP_PATHS, "bwrap")?;
     let setpriv = first_trusted(&SETPRIV_PATHS, "setpriv")?;
     let busybox = first_trusted(&BUSYBOX_PATHS, "busybox")?;
+    let kmod = if modules.is_empty() {
+        None
+    } else {
+        Some(first_trusted(&KMOD_PATHS, "kmod")?)
+    };
 
-    let mut roots = vec![bash, bwrap, setpriv, busybox.clone()];
-    if !modules.is_empty() {
-        roots.push(first_trusted(&KMOD_PATHS, "kmod")?);
+    let mut roots = vec![bash, bwrap, setpriv.clone(), busybox.clone()];
+    if let Some(kmod) = &kmod {
+        roots.push(kmod.clone());
     }
     let mut closure = library_closure(&roots)?;
     closure.extend(library_closure(&[install_exe.clone(), relay.clone()])?);
@@ -251,7 +258,18 @@ fn prepare_inner(state_path: &Path, lib_dir: &Path) -> crate::Result<String> {
             }
         }
     }
-    let init = render_init(&system_shares, &modules, max_inputs);
+    let tools = GuestTools {
+        busybox,
+        setpriv,
+        kmod,
+    };
+    let init = render_init(
+        &system_shares,
+        &modules,
+        max_inputs,
+        &tools,
+        Path::new(GUEST_ROOT),
+    );
     cpio.file("/init", 0o100000 | 0o755, init.as_bytes());
     let image = cpio.finish();
 
@@ -585,12 +603,27 @@ impl GuestModule {
 /// Resolve the guest module closure from the trusted modules.dep. Built-in
 /// modules need no file; a missing required module fails preparation closed.
 fn resolve_modules(release: &str) -> crate::Result<Vec<GuestModule>> {
-    let mod_dir = PathBuf::from(format!("/lib/modules/{release}"));
+    resolve_modules_in(&PathBuf::from(format!("/lib/modules/{release}")))
+}
+
+/// modules.dep names may carry a compression suffix (.ko.xz, .ko.zst);
+/// normalize to the bare module name so required modules and the dependency
+/// closure match (LV-07). The copied file keeps its real compressed name.
+fn module_base_name(rel: &str) -> String {
+    let file = rel.rsplit('/').next().unwrap_or("");
+    let file = file
+        .strip_suffix(".xz")
+        .or_else(|| file.strip_suffix(".zst"))
+        .unwrap_or(file);
+    file.strip_suffix(".ko").unwrap_or(file).to_owned()
+}
+
+fn resolve_modules_in(mod_dir: &Path) -> crate::Result<Vec<GuestModule>> {
     let builtin = fs::read_to_string(mod_dir.join("modules.builtin")).unwrap_or_default();
     let builtin: BTreeSet<String> = builtin
         .lines()
-        .filter_map(|l| l.rsplit('/').next())
-        .map(|n| n.trim_end_matches(".ko").to_owned())
+        .filter(|l| !l.trim().is_empty())
+        .map(module_base_name)
         .collect();
     let dep = fs::read_to_string(mod_dir.join("modules.dep")).map_err(|_| {
         Error::isolation_unavailable("kernel modules.dep is missing; cannot prepare guest modules")
@@ -602,28 +635,14 @@ fn resolve_modules(release: &str) -> crate::Result<Vec<GuestModule>> {
             continue;
         };
         let rel = target.trim().to_owned();
-        let name = rel
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(".ko")
-            .to_owned();
-        let needs: Vec<String> = rest
-            .split_whitespace()
-            .map(|p| {
-                p.rsplit('/')
-                    .next()
-                    .unwrap_or("")
-                    .trim_end_matches(".ko")
-                    .to_owned()
-            })
-            .collect();
+        let name = module_base_name(&rel);
+        let needs: Vec<String> = rest.split_whitespace().map(module_base_name).collect();
         deps.insert(name, (rel, needs));
     }
     let mut ordered: Vec<GuestModule> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for name in GUEST_MODULES {
-        visit_module(name, &deps, &builtin, &mod_dir, &mut ordered, &mut seen)?;
+        visit_module(name, &deps, &builtin, mod_dir, &mut ordered, &mut seen)?;
     }
     Ok(ordered)
 }
@@ -862,24 +881,44 @@ fn copy_etc_path(cpio: &mut Cpio, path: &Path, budget: &mut u64) -> crate::Resul
     Ok(())
 }
 
+/// Trusted guest tool paths selected at prepare time. Non-merged hosts keep
+/// these in /bin, so init must render the actual selected paths (LV-07).
+struct GuestTools {
+    busybox: PathBuf,
+    setpriv: PathBuf,
+    kmod: Option<PathBuf>,
+}
+
 /// Generate the guest init. System shares and module loading are fixed at
 /// prepare time; the fresh job id and uid/gid arrive on the kernel command
 /// line. Every mandatory mount fails closed (poweroff without an outcome).
-fn render_init(system_shares: &[String], modules: &[GuestModule], max_inputs: usize) -> String {
-    let mut s = String::from("#!/usr/bin/busybox sh\n");
+fn render_init(
+    system_shares: &[String],
+    modules: &[GuestModule],
+    max_inputs: usize,
+    tools: &GuestTools,
+    root: &Path,
+) -> String {
+    let busybox = tools.busybox.display();
+    let setpriv = tools.setpriv.display();
+    let root = root.display();
+    let mut s = format!("#!{busybox} sh\n");
     s.push_str("# fail2commit guest init (FR-029). Generated by vm prepare.\n");
     s.push_str("export PATH=/usr/bin:/usr/sbin:/bin:/sbin\n");
-    s.push_str("BB=/usr/bin/busybox\n");
+    s.push_str(&format!("BB={busybox}\n"));
     s.push_str("$BB mkdir -p /proc /sys /dev /tmp\n");
     s.push_str("$BB chmod 1777 /tmp\n");
     s.push_str("$BB mount -t proc proc /proc || $BB poweroff -f\n");
     s.push_str("$BB mount -t sysfs sysfs /sys || $BB poweroff -f\n");
     s.push_str("$BB mount -t devtmpfs devtmpfs /dev || $BB poweroff -f\n");
     for module in modules {
-        s.push_str(&format!(
-            "/usr/bin/kmod modprobe {} || $BB poweroff -f\n",
-            module.name
-        ));
+        if let Some(kmod) = &tools.kmod {
+            s.push_str(&format!(
+                "{} modprobe {} || $BB poweroff -f\n",
+                kmod.display(),
+                module.name
+            ));
+        }
     }
     for dir in system_shares {
         let tag = system_share_tag(dir);
@@ -893,7 +932,7 @@ fn render_init(system_shares: &[String], modules: &[GuestModule], max_inputs: us
     s.push_str("case \"$id\" in *[!0-9a-f]*|\"\") $BB poweroff -f;; esac\n");
     s.push_str("[ ${#id} -eq 32 ] || $BB poweroff -f\n");
     s.push_str("case \"$uid$gid\" in *[!0-9]*|\"\") $BB poweroff -f;; esac\n");
-    s.push_str("R=/mnt/fail2commit-vm\n");
+    s.push_str(&format!("R={root}\n"));
     s.push_str("$BB mkdir -p $R/jobs/$id/work $R/control/$id $R/results/$id\n");
     s.push_str("$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=524288 f2cwork $R/jobs/$id/work || $BB poweroff -f\n");
     for index in 0..max_inputs {
@@ -904,7 +943,9 @@ fn render_init(system_shares: &[String], modules: &[GuestModule], max_inputs: us
     s.push_str("$BB mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 f2cctl $R/control/$id || $BB poweroff -f\n");
     s.push_str("$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=524288 f2cres $R/results/$id || $BB poweroff -f\n");
     s.push_str("export HOME=/tmp\n");
-    s.push_str("/usr/bin/setpriv --reuid=$uid --regid=$gid --clear-groups $R/bin/fail2commit sandbox launch $R/control/$id/job.json --vm-guest\n");
+    s.push_str(&format!(
+        "{setpriv} --reuid=$uid --regid=$gid --clear-groups $R/bin/fail2commit sandbox launch $R/control/$id/job.json --vm-guest\n"
+    ));
     s.push_str("$BB poweroff -f\n");
     s
 }
@@ -1002,13 +1043,27 @@ mod tests {
         assert_eq!(system_share_tag("/lib64"), "f2clib64");
     }
 
+    fn usr_tools() -> GuestTools {
+        GuestTools {
+            busybox: PathBuf::from("/usr/bin/busybox"),
+            setpriv: PathBuf::from("/usr/bin/setpriv"),
+            kmod: Some(PathBuf::from("/usr/bin/kmod")),
+        }
+    }
+
     #[test]
     fn init_mounts_mmio_shares_and_fails_closed() {
         let modules = vec![GuestModule {
             name: "9p".into(),
             host: PathBuf::from("/lib/modules/x/9p.ko"),
         }];
-        let init = render_init(&["/usr".to_owned()], &modules, 2);
+        let init = render_init(
+            &["/usr".to_owned()],
+            &modules,
+            2,
+            &usr_tools(),
+            Path::new(GUEST_ROOT),
+        );
         assert!(init
             .contains("mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 f2cusr /usr"));
         assert!(init.contains("kmod modprobe 9p"));
@@ -1024,6 +1079,133 @@ mod tests {
         // Mandatory mounts poweroff on failure; optional inputs do not.
         assert!(init.contains("f2cwork $R/jobs/$id/work || $BB poweroff -f"));
         assert!(!init.contains("f2cin0 $R/jobs/$id/input-0 || $BB poweroff -f"));
+    }
+
+    #[test]
+    fn init_renders_the_selected_tool_paths() {
+        let modules = vec![GuestModule {
+            name: "9p".into(),
+            host: PathBuf::from("/lib/modules/x/9p.ko.zst"),
+        }];
+        // Non-merged layout: the selected /bin tools must appear, not /usr/bin.
+        let tools = GuestTools {
+            busybox: PathBuf::from("/bin/busybox"),
+            setpriv: PathBuf::from("/bin/setpriv"),
+            kmod: Some(PathBuf::from("/bin/kmod")),
+        };
+        let init = render_init(
+            &["/usr".to_owned()],
+            &modules,
+            2,
+            &tools,
+            Path::new(GUEST_ROOT),
+        );
+        assert!(init.starts_with("#!/bin/busybox sh\n"));
+        assert!(init.contains("BB=/bin/busybox\n"));
+        assert!(init.contains("/bin/kmod modprobe 9p || $BB poweroff -f"));
+        assert!(init.contains("/bin/setpriv --reuid=$uid --regid=$gid --clear-groups"));
+        assert!(!init.contains("/usr/bin/busybox"));
+        assert!(!init.contains("/usr/bin/setpriv"));
+        assert!(!init.contains("/usr/bin/kmod"));
+        // Merged-/usr selection renders the /usr paths instead.
+        let init = render_init(
+            &["/usr".to_owned()],
+            &modules,
+            2,
+            &usr_tools(),
+            Path::new(GUEST_ROOT),
+        );
+        assert!(init.starts_with("#!/usr/bin/busybox sh\n"));
+        assert!(init.contains("BB=/usr/bin/busybox\n"));
+        assert!(init.contains("/usr/bin/kmod modprobe 9p"));
+        assert!(init.contains("/usr/bin/setpriv --reuid"));
+    }
+
+    #[test]
+    fn init_mounts_non_merged_system_shares() {
+        let shares: Vec<String> = ["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let tools = GuestTools {
+            busybox: PathBuf::from("/bin/busybox"),
+            setpriv: PathBuf::from("/bin/setpriv"),
+            kmod: None,
+        };
+        let init = render_init(&shares, &[], 1, &tools, Path::new(GUEST_ROOT));
+        for dir in &shares {
+            let tag = system_share_tag(dir);
+            assert!(init.contains(&format!(
+                "mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 {tag} {dir}"
+            )));
+        }
+        assert!(!init.contains("modprobe"));
+    }
+
+    /// Write a fake /lib/modules/<release> tree; every dep target gets a file.
+    fn write_module_tree(dir: &Path, dep: &str, builtin: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("modules.dep"), dep).unwrap();
+        fs::write(dir.join("modules.builtin"), builtin).unwrap();
+        for line in dep.lines() {
+            if let Some((target, _)) = line.split_once(':') {
+                let p = dir.join(target.trim());
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(&p, b"module").unwrap();
+            }
+        }
+    }
+
+    const COMPRESSED_DEP: &str = "\
+kernel/drivers/virtio/virtio.ko.xz:
+kernel/drivers/virtio/virtio_ring.ko.xz: kernel/drivers/virtio/virtio.ko.xz
+kernel/drivers/virtio/virtio_mmio.ko.xz: kernel/drivers/virtio/virtio_ring.ko.xz
+kernel/drivers/net/virtio_net.ko.zst: kernel/drivers/virtio/virtio_ring.ko.xz
+kernel/net/9p/9pnet.ko.zst:
+kernel/net/9p/9p.ko.zst: kernel/net/9p/9pnet.ko.zst
+kernel/net/9p/9pnet_virtio.ko.xz: kernel/net/9p/9pnet.ko.zst kernel/drivers/virtio/virtio_ring.ko.xz
+";
+
+    #[test]
+    fn module_closure_normalizes_compressed_names_and_orders_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        write_module_tree(dir.path(), COMPRESSED_DEP, "");
+        let mods = resolve_modules_in(dir.path()).unwrap();
+        let names: Vec<&str> = mods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "virtio",
+                "virtio_ring",
+                "virtio_mmio",
+                "virtio_net",
+                "9pnet",
+                "9p",
+                "9pnet_virtio"
+            ]
+        );
+        for m in &mods {
+            assert!(m.host.is_file(), "{}", m.host.display());
+            let path = m.host.to_string_lossy();
+            assert!(path.ends_with(".ko.xz") || path.ends_with(".ko.zst"));
+        }
+    }
+
+    #[test]
+    fn builtin_modules_need_no_files_and_missing_modules_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let builtin = "kernel/drivers/virtio/virtio_mmio.ko\nkernel/drivers/net/virtio_net.ko\nkernel/net/9p/9p.ko\nkernel/net/9p/9pnet_virtio.ko\n";
+        write_module_tree(dir.path(), "", builtin);
+        assert!(resolve_modules_in(dir.path()).unwrap().is_empty());
+        // A required module neither built in nor in modules.dep fails closed.
+        let dir2 = tempfile::tempdir().unwrap();
+        write_module_tree(
+            dir2.path(),
+            "kernel/drivers/virtio/virtio_mmio.ko.xz:\n",
+            "",
+        );
+        let err = resolve_modules_in(dir2.path()).expect_err("virtio_net is missing");
+        assert!(err.message.contains("virtio_net"), "{}", err.message);
     }
 
     #[test]
