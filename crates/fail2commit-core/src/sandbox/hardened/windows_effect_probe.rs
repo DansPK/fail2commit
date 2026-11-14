@@ -322,7 +322,8 @@ mod tests {
             udp_listen_v6_refused: true,
         };
         assert!(complete.complete());
-        let failures: [(&str, fn(&mut EffectResults)); 26] = [
+        type EffectMutation = (&'static str, fn(&mut EffectResults));
+        let failures: [EffectMutation; 26] = [
             ("proxy_loopback_permitted", |r| {
                 r.proxy_loopback_permitted = false
             }),

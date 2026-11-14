@@ -135,7 +135,7 @@ pub fn status() -> serde_json::Value {
             fields.insert("controls".into(), controls);
             fields.insert("detail".into(), serde_json::json!(detail));
         }
-        return status;
+        status
     }
 
     #[cfg(windows)]
@@ -159,7 +159,7 @@ pub fn status() -> serde_json::Value {
                 serde_json::json!(windows_readiness_detail(&detail)),
             );
         }
-        return status;
+        status
     }
 
     #[cfg(not(any(target_os = "linux", windows)))]
@@ -400,14 +400,14 @@ fn launch_with_control_mode(
 pub fn installed() -> bool {
     #[cfg(windows)]
     {
-        return match machine_state_path() {
+        match machine_state_path() {
             Ok(p) => match std::fs::symlink_metadata(p) {
                 Ok(_) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(_) => true,
             },
             Err(_) => true,
-        };
+        }
     }
     #[cfg(target_os = "linux")]
     {

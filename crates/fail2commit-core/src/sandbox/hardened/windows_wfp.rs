@@ -140,7 +140,7 @@ impl PackageGuard {
         let name: Vec<u16> = "Fail2Commit per-job package deny\0"
             .encode_utf16()
             .collect();
-        let mut filter = wfp::FWPM_FILTER0 {
+        let filter = wfp::FWPM_FILTER0 {
             filterKey: key,
             displayData: wfp::FWPM_DISPLAY_DATA0 {
                 name: name.as_ptr() as *mut u16,
@@ -165,7 +165,7 @@ impl PackageGuard {
         };
         let mut id = 0u64;
         let status =
-            unsafe { wfp::FwpmFilterAdd0(self.engine, &mut filter, std::ptr::null_mut(), &mut id) };
+            unsafe { wfp::FwpmFilterAdd0(self.engine, &filter, std::ptr::null_mut(), &mut id) };
         if status != 0 || id == 0 {
             return Err(wfp_error("FwpmFilterAdd0", status));
         }
@@ -233,7 +233,7 @@ impl PackageGuard {
         let name: Vec<u16> = "Fail2Commit exact proxy loopback permit\0"
             .encode_utf16()
             .collect();
-        let mut filter = wfp::FWPM_FILTER0 {
+        let filter = wfp::FWPM_FILTER0 {
             filterKey: key,
             displayData: wfp::FWPM_DISPLAY_DATA0 {
                 name: name.as_ptr() as *mut u16,
@@ -258,7 +258,7 @@ impl PackageGuard {
         };
         let mut id = 0u64;
         let status =
-            unsafe { wfp::FwpmFilterAdd0(self.engine, &mut filter, std::ptr::null_mut(), &mut id) };
+            unsafe { wfp::FwpmFilterAdd0(self.engine, &filter, std::ptr::null_mut(), &mut id) };
         if status != 0 || id == 0 {
             return Err(wfp_error("FwpmFilterAdd0(proxy permit)", status));
         }
@@ -454,7 +454,7 @@ impl PackageGuard {
             let path = self.journal_path.as_deref().ok_or_else(|| {
                 crate::Error::integrity("created loopback journal path was not tracked")
             })?;
-            match std::fs::remove_file(&path) {
+            match std::fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -610,6 +610,9 @@ fn initialize_exemption_journal(
 }
 
 #[cfg(windows)]
+// Intentional dependency-injection seam for exercising journal setup and
+// cleanup failures at each filesystem boundary without touching machine state.
+#[allow(clippy::too_many_arguments)]
 fn initialize_created_journal_with(
     path: &std::path::Path,
     mut file: std::fs::File,
@@ -764,14 +767,14 @@ fn wfp_error(operation: &str, status: u32) -> crate::Error {
 fn verify_filters_removed(keys: &[windows_sys::core::GUID]) -> crate::Result<()> {
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
     use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
-    let mut session: wfp::FWPM_SESSION0 = unsafe { std::mem::zeroed() };
+    let session: wfp::FWPM_SESSION0 = unsafe { std::mem::zeroed() };
     let mut engine = std::ptr::null_mut();
     let status = unsafe {
         wfp::FwpmEngineOpen0(
             std::ptr::null(),
             RPC_C_AUTHN_WINNT,
             std::ptr::null(),
-            &mut session,
+            &session,
             &mut engine,
         )
     };

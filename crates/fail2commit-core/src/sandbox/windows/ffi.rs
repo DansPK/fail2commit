@@ -978,6 +978,10 @@ pub(super) fn spawn_lpac_suspended(
 }
 
 #[allow(unsafe_code)]
+// This private adapter deliberately mirrors the Win32 launch inputs used by
+// both AppContainer and LPAC callers; retaining the parameter list keeps the
+// security-sensitive process construction explicit at each call site.
+#[allow(clippy::too_many_arguments)]
 fn spawn_suspended_with_lpac(
     program: &Path,
     cmdline: &mut [u16],
@@ -1666,26 +1670,6 @@ fn write_loopback_exempt_entries(entries: &[(String, u32)]) -> crate::Result<()>
     Ok(())
 }
 
-#[cfg(test)]
-mod loopback_config_tests {
-    use super::same_loopback_entries;
-
-    #[test]
-    fn loopback_list_verification_requires_all_sids_and_attributes() {
-        let baseline = vec![("S-1-15-2-10".to_owned(), 0), ("S-1-15-2-20".to_owned(), 3)];
-        let reordered = vec![baseline[1].clone(), baseline[0].clone()];
-        assert!(same_loopback_entries(&baseline, &reordered));
-        assert!(!same_loopback_entries(
-            &baseline,
-            &[("S-1-15-2-10".to_owned(), 0)]
-        ));
-        assert!(!same_loopback_entries(
-            &baseline,
-            &[("S-1-15-2-10".to_owned(), 0), ("S-1-15-2-20".to_owned(), 0),]
-        ));
-    }
-}
-
 fn same_loopback_entries(left: &[(String, u32)], right: &[(String, u32)]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -1894,4 +1878,24 @@ pub(super) fn set_null_dacl_for_tests(path: &Path) -> crate::Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod loopback_config_tests {
+    use super::same_loopback_entries;
+
+    #[test]
+    fn loopback_list_verification_requires_all_sids_and_attributes() {
+        let baseline = vec![("S-1-15-2-10".to_owned(), 0), ("S-1-15-2-20".to_owned(), 3)];
+        let reordered = vec![baseline[1].clone(), baseline[0].clone()];
+        assert!(same_loopback_entries(&baseline, &reordered));
+        assert!(!same_loopback_entries(
+            &baseline,
+            &[("S-1-15-2-10".to_owned(), 0)]
+        ));
+        assert!(!same_loopback_entries(
+            &baseline,
+            &[("S-1-15-2-10".to_owned(), 0), ("S-1-15-2-20".to_owned(), 0),]
+        ));
+    }
 }

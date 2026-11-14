@@ -36,6 +36,16 @@ const IO_CHUNK: usize = 16 * 1024;
 type Resolver = dyn Fn(&str, u16, Instant, &AtomicBool) -> Option<Vec<SocketAddr>> + Send + Sync;
 type Connector = dyn Fn(SocketAddr, Duration) -> io::Result<TcpStream> + Send + Sync;
 
+struct AcceptContext {
+    stop: Arc<AtomicBool>,
+    sockets: Arc<SocketRegistry>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    watch: Arc<Watch>,
+    bait: Option<Arc<BaitSet>>,
+    resolver: Arc<Resolver>,
+    connector: Arc<Connector>,
+}
+
 struct DnsRequest {
     host: String,
     port: u16,
@@ -420,7 +430,16 @@ fn start_with(
             .name("f2c-hardened-egress".into())
             .spawn(move || {
                 accept_loop(
-                    listener, stop, sockets, workers, watch, bait, resolver, connector,
+                    listener,
+                    AcceptContext {
+                        stop,
+                        sockets,
+                        workers,
+                        watch,
+                        bait,
+                        resolver,
+                        connector,
+                    },
                 )
             })?
     };
@@ -434,16 +453,16 @@ fn start_with(
     })
 }
 
-fn accept_loop(
-    listener: TcpListener,
-    stop: Arc<AtomicBool>,
-    sockets: Arc<SocketRegistry>,
-    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    watch: Arc<Watch>,
-    bait: Option<Arc<BaitSet>>,
-    resolver: Arc<Resolver>,
-    connector: Arc<Connector>,
-) {
+fn accept_loop(listener: TcpListener, context: AcceptContext) {
+    let AcceptContext {
+        stop,
+        sockets,
+        workers,
+        watch,
+        bait,
+        resolver,
+        connector,
+    } = context;
     let live = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::SeqCst) && !watch.tripped() {
         reap_finished_workers(&workers);
@@ -915,12 +934,9 @@ fn tunnel(
     });
     let download = copy_limited(upstream, client, &total, &watch, &stop, &sockets, deadline);
     let _ = client.shutdown(Shutdown::Write);
-    let upload = upload.join().unwrap_or_else(|_| {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "proxy upload worker panicked",
-        ))
-    });
+    let upload = upload
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("proxy upload worker panicked")));
     download.and(upload)
 }
 
@@ -982,10 +998,7 @@ fn account_transfer(
         sockets.shutdown_all();
         watch.trip(ActivityKind::Limit, "egress proxy transfer limit exceeded");
         stop.store(true, Ordering::SeqCst);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "proxy transfer limit exceeded",
-        ));
+        return Err(io::Error::other("proxy transfer limit exceeded"));
     }
     Ok(())
 }

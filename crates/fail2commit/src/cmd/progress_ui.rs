@@ -218,11 +218,11 @@ fn queue_result_handover(
 }
 
 fn decode_handover(hex: &str) -> Option<String> {
-    if hex.is_empty() || hex.len() % 2 != 0 || hex.len() > MAX_HANDOVER_BYTES * 2 {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) || hex.len() > MAX_HANDOVER_BYTES * 2 {
         return None;
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
         let digit = |b: u8| match b {
             b'0'..=b'9' => Some(b - b'0'),
             b'a'..=b'f' => Some(b - b'a' + 10),

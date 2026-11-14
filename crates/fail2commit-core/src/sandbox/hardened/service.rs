@@ -3609,10 +3609,10 @@ fn service_loop_windows() -> crate::Result<()> {
                 continue;
             }};
         }
-        let mut mode = PIPE_READMODE_BYTE | 0x00000001;
+        let mode = PIPE_READMODE_BYTE | 0x00000001;
         // SAFETY: valid connected server pipe and writable mode value.
         if unsafe {
-            SetNamedPipeHandleState(raw, &mut mode, std::ptr::null_mut(), std::ptr::null_mut())
+            SetNamedPipeHandleState(raw, &mode, std::ptr::null_mut(), std::ptr::null_mut())
         } == 0
         {
             disconnect_and_continue!();
@@ -4255,7 +4255,7 @@ fn run_snapshot_as_sandbox(
             .collect(),
     );
 
-    let mut sa = SECURITY_ATTRIBUTES {
+    let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
         bInheritHandle: 1,
@@ -4263,7 +4263,7 @@ fn run_snapshot_as_sandbox(
     let (mut read_raw, mut write_raw): (HANDLE, HANDLE) =
         (std::ptr::null_mut(), std::ptr::null_mut());
     // SAFETY: output handles and security descriptor are valid; both handles are fresh.
-    if unsafe { CreatePipe(&mut read_raw, &mut write_raw, &mut sa, 0) } == 0 {
+    if unsafe { CreatePipe(&mut read_raw, &mut write_raw, &sa, 0) } == 0 {
         return Err(crate::Error::internal(format!(
             "CreatePipe(watchdog) failed: {}",
             std::io::Error::last_os_error()
@@ -4284,7 +4284,7 @@ fn run_snapshot_as_sandbox(
     let mut request_write_raw: HANDLE = std::ptr::null_mut();
     // SAFETY: fresh anonymous pipes; child endpoints are restricted by the
     // explicit handle list below and server endpoints are made non-inheritable.
-    if unsafe { CreatePipe(&mut request_read_raw, &mut request_write_raw, &mut sa, 4096) } == 0 {
+    if unsafe { CreatePipe(&mut request_read_raw, &mut request_write_raw, &sa, 4096) } == 0 {
         return Err(crate::Error::isolation_unavailable(format!(
             "CreatePipe(WFP preparation) failed: {}",
             std::io::Error::last_os_error()
@@ -4294,7 +4294,7 @@ fn run_snapshot_as_sandbox(
     let request_write = unsafe { OwnedHandle::from_raw_handle(request_write_raw as RawHandle) };
     let mut ack_read_raw: HANDLE = std::ptr::null_mut();
     let mut ack_write_raw: HANDLE = std::ptr::null_mut();
-    if unsafe { CreatePipe(&mut ack_read_raw, &mut ack_write_raw, &mut sa, 4096) } == 0 {
+    if unsafe { CreatePipe(&mut ack_read_raw, &mut ack_write_raw, &sa, 4096) } == 0 {
         return Err(crate::Error::isolation_unavailable(format!(
             "CreatePipe(WFP acknowledgement) failed: {}",
             std::io::Error::last_os_error()
@@ -6438,7 +6438,8 @@ mod tests {
 
     #[test]
     fn failed_policy_ack_with_each_cleanup_failure_keeps_marker_and_launch_latched() {
-        let stages: [(&str, fn(&mut PreparationCleanupProof)); 4] = [
+        type CleanupStage = (&'static str, fn(&mut PreparationCleanupProof));
+        let stages: [CleanupStage; 4] = [
             ("launcher tree", |proof| proof.launcher_tree_empty = false),
             ("package grants", |proof| {
                 proof.package_grants_revoked = false

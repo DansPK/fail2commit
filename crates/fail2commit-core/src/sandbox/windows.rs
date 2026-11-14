@@ -479,7 +479,7 @@ enum WindowsLaunchResult {
 fn run_with_launch_mode(
     job: &JobSpec,
     hardened_stage_root: Option<&Path>,
-    mut preparation: Option<&mut crate::sandbox::hardened::service::PreparationClient>,
+    preparation: Option<&mut crate::sandbox::hardened::service::PreparationClient>,
     diagnostic: bool,
 ) -> crate::Result<WindowsLaunchResult> {
     if diagnostic && !cfg!(all(feature = "hardened-test-diagnostics", debug_assertions)) {
@@ -698,7 +698,7 @@ fn run_with_launch_mode(
     monitor
         .settle_before_resume(&job_object)
         .map_err(|error| abort_with(&spawned, error))?;
-    let _policy_receipt = if let Some(preparation) = preparation.as_deref_mut() {
+    let _policy_receipt = if let Some(preparation) = preparation {
         let package_sid = ffi::sid_to_string(profile.profile().sid())?;
         let receipt = preparation
             .prepare(
