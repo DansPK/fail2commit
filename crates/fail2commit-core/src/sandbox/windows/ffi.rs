@@ -60,6 +60,7 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, CreatePipe, PIPE_NOWAIT, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE,
 };
+use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
     GetProcessMitigationPolicy, InitializeProcThreadAttributeList, OpenProcessToken,
@@ -70,6 +71,7 @@ use windows_sys::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
+use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
 };
@@ -165,7 +167,7 @@ fn local_free<T>(p: *mut T) {
 }
 
 #[allow(unsafe_code)]
-fn sid_to_string(sid: PSID) -> crate::Result<String> {
+pub(crate) fn sid_to_string(sid: PSID) -> crate::Result<String> {
     let mut out: *mut u16 = std::ptr::null_mut();
     // SAFETY: `sid` is a valid SID owned by the caller; `out` receives a
     // LocalAlloc'd NUL-terminated string freed below.
@@ -192,6 +194,7 @@ pub(super) fn sid_text(sid: PSID) -> crate::Result<String> {
 /// A freshly created, uniquely named AppContainer profile. Deleted on drop.
 pub(super) struct Profile {
     name: Vec<u16>,
+    name_text: String,
     sid: PSID,
     pub(super) sid_string: String,
 }
@@ -235,6 +238,7 @@ impl Profile {
         }
         let mut profile = Profile {
             name,
+            name_text: name_s.to_owned(),
             sid,
             sid_string: String::new(),
         };
@@ -245,6 +249,27 @@ impl Profile {
     pub(super) fn sid(&self) -> PSID {
         self.sid
     }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name_text
+    }
+
+    #[allow(unsafe_code)]
+    pub(super) fn remove(mut self) -> crate::Result<()> {
+        // SAFETY: name is NUL-terminated and this owns the profile SID.
+        let hr = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
+        if hr != 0 && hr as u32 != 0x8007_0002 {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "DeleteAppContainerProfile({}) failed: HRESULT 0x{:08X}",
+                self.name_text, hr as u32
+            )));
+        }
+        if !self.sid.is_null() {
+            unsafe { FreeSid(self.sid) };
+            self.sid = std::ptr::null_mut();
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Profile {
@@ -254,13 +279,16 @@ impl Drop for Profile {
         // CreateAppContainerProfile (FreeSid ownership) and is freed once.
         unsafe {
             DeleteAppContainerProfile(self.name.as_ptr());
-            FreeSid(self.sid);
+            if !self.sid.is_null() {
+                FreeSid(self.sid);
+                self.sid = std::ptr::null_mut();
+            }
         }
     }
 }
 
 /// Every profile this backend creates starts with this (SPEC-014 section 6).
-pub(super) const PROFILE_PREFIX: &str = "fail2commit.sbx.";
+pub(crate) const PROFILE_PREFIX: &str = "fail2commit.sbx.";
 
 /// Delete a leftover profile by name. A profile that no longer exists is
 /// success (HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) and S_OK alike).
@@ -911,6 +939,54 @@ pub(super) fn spawn_suspended(
     capabilities: &[PSID],
     stdio: [HANDLE; 3],
 ) -> crate::Result<Spawned> {
+    spawn_suspended_with_lpac(
+        program,
+        cmdline,
+        env_block,
+        cwd,
+        sid,
+        capabilities,
+        stdio,
+        false,
+    )
+}
+
+/// Create the same restricted child with the LPAC all-application-packages
+/// policy applied. Callers must still verify `TokenIsLessPrivilegedAppContainer`
+/// before resuming it and must configure network filtering before package code.
+#[allow(dead_code)]
+pub(super) fn spawn_lpac_suspended(
+    program: &Path,
+    cmdline: &mut [u16],
+    env_block: &[u16],
+    cwd: &Path,
+    sid: PSID,
+    capabilities: &[PSID],
+    stdio: [HANDLE; 3],
+) -> crate::Result<Spawned> {
+    spawn_suspended_with_lpac(
+        program,
+        cmdline,
+        env_block,
+        cwd,
+        sid,
+        capabilities,
+        stdio,
+        true,
+    )
+}
+
+#[allow(unsafe_code)]
+fn spawn_suspended_with_lpac(
+    program: &Path,
+    cmdline: &mut [u16],
+    env_block: &[u16],
+    cwd: &Path,
+    sid: PSID,
+    capabilities: &[PSID],
+    stdio: [HANDLE; 3],
+    lpac: bool,
+) -> crate::Result<Spawned> {
     let program_w = wide(program.as_os_str());
     let cwd_w = wide(cwd.as_os_str());
     let mut cap_list: Vec<SID_AND_ATTRIBUTES> = capabilities
@@ -935,12 +1011,16 @@ pub(super) fn spawn_suspended(
     let mut size = 0usize;
     // SAFETY: sizing call with a null list is documented to fail and set
     // `size`.
-    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 3, 0, &mut size) };
+    let attribute_count = if lpac { 4 } else { 3 };
+    // SAFETY: sizing call with a null list is documented to fail and set `size`.
+    unsafe {
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), attribute_count, 0, &mut size)
+    };
     // usize-aligned backing storage for the opaque attribute list.
     let mut buf = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
     let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
     // SAFETY: `buf` is at least `size` bytes and outlives the list.
-    if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &mut size) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(list, attribute_count, 0, &mut size) } == 0 {
         return Err(unavailable("InitializeProcThreadAttributeList"));
     }
     struct ListGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
@@ -982,6 +1062,16 @@ pub(super) fn spawn_suspended(
                 std::ptr::null_mut(),
                 std::ptr::null(),
             ) != 0
+            && (!lpac
+                || UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
+                    (&PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT as *const u32).cast(),
+                    std::mem::size_of::<u32>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                ) != 0)
     };
     if !ok {
         return Err(unavailable("UpdateProcThreadAttribute"));
@@ -1346,7 +1436,12 @@ pub(super) fn known_user_profile() -> crate::Result<PathBuf> {
 /// edits). No process is launched and no environment value is consulted; a
 /// missing export or a failing call is an error, so the caller fails closed.
 #[allow(unsafe_code)]
-pub(super) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
+pub(crate) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
+    loopback_exempt_entries().map(|entries| entries.into_iter().map(|(sid, _)| sid).collect())
+}
+
+#[allow(unsafe_code)]
+fn loopback_exempt_entries() -> crate::Result<Vec<(String, u32)>> {
     type GetConfig = unsafe extern "system" fn(*mut u32, *mut *mut SID_AND_ATTRIBUTES) -> u32;
     let library = wide(OsStr::new("FirewallAPI.dll"));
     // SAFETY: NUL-terminated module name; the loaded module is freed below.
@@ -1385,7 +1480,7 @@ pub(super) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
                 continue;
             }
             if let Ok(sid) = sid_to_string(entry.Sid) {
-                out.push(sid);
+                out.push((sid, entry.Attributes));
             }
         }
         // SAFETY: the documented sample frees each SID and then the array with
@@ -1411,11 +1506,268 @@ pub(super) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
     Ok(out)
 }
 
+static LOOPBACK_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+struct LoopbackConfigMutex(OwnedHandle);
+
+impl LoopbackConfigMutex {
+    #[allow(unsafe_code)]
+    fn acquire() -> crate::Result<Self> {
+        use windows_sys::Win32::Foundation::{
+            GetLastError, ERROR_ALREADY_EXISTS, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        let owner = crate::ipc::winsec::current_user_sid()?;
+        let owner_text = crate::ipc::winsec::sid_string(&owner);
+        let security = crate::ipc::winsec::PipeSecurity::new(&owner)?;
+        let name = wide(OsStr::new(r"Global\Fail2CommitLoopbackConfig-v1"));
+        // SAFETY: the explicit, protected DACL remains alive through creation;
+        // the named mutex serializes cooperating service instances machinewide.
+        let raw = unsafe { CreateMutexW(security.attributes(), 0, name.as_ptr()) };
+        let create_error = unsafe { GetLastError() };
+        if raw.is_null() {
+            return Err(unavailable("CreateMutexW(loopback configuration)"));
+        }
+        let handle = owned(raw);
+        if create_error != ERROR_ALREADY_EXISTS {
+            crate::ipc::winsec::set_kernel_object_owner_sid(&handle, &owner)?;
+        }
+        let owner_ok = crate::ipc::winsec::owner_sid(&handle)? == owner_text;
+        let dacl_ok = crate::ipc::winsec::dacl_is_protected(&handle)?
+            && crate::ipc::winsec::dacl_entries(&handle)?
+                == vec![
+                    (
+                        false,
+                        crate::ipc::winsec::ALL_APP_PACKAGES.to_owned(),
+                        0x001F_01FF,
+                    ),
+                    (
+                        false,
+                        crate::ipc::winsec::ALL_RESTRICTED_APP_PACKAGES.to_owned(),
+                        0x001F_01FF,
+                    ),
+                    (true, owner_text, 0x001F_01FF),
+                ];
+        if !owner_ok || !dacl_ok {
+            return Err(crate::Error::integrity(
+                "loopback configuration mutex owner or protected DACL is unexpected",
+            ));
+        }
+        // WAIT_ABANDONED also transfers ownership. Callers always re-read the
+        // complete OS list after acquiring, so interrupted prior updates are
+        // never continued from cached state.
+        let wait = unsafe { WaitForSingleObject(raw, 5_000) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            return Ok(Self(handle));
+        }
+        if wait == WAIT_TIMEOUT {
+            return Err(crate::Error::isolation_unavailable(
+                "timed out waiting for loopback configuration mutex",
+            ));
+        }
+        if wait == WAIT_FAILED {
+            let code = unsafe { GetLastError() };
+            return Err(crate::Error::isolation_unavailable(format!(
+                "WaitForSingleObject(loopback configuration) failed with Win32 error {code}"
+            )));
+        }
+        Err(crate::Error::isolation_unavailable(
+            "unexpected loopback configuration mutex wait result",
+        ))
+    }
+}
+
+impl Drop for LoopbackConfigMutex {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: this guard owns the mutex after WAIT_OBJECT_0/WAIT_ABANDONED;
+        // it is dropped on the same thread that acquired it.
+        unsafe { ReleaseMutex(raw(&self.0)) };
+    }
+}
+
+struct LoopbackConfigGuard {
+    _local: std::sync::MutexGuard<'static, ()>,
+    _machine: LoopbackConfigMutex,
+}
+
+fn lock_loopback_config() -> crate::Result<LoopbackConfigGuard> {
+    let local = LOOPBACK_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let machine = LoopbackConfigMutex::acquire()?;
+    Ok(LoopbackConfigGuard {
+        _local: local,
+        _machine: machine,
+    })
+}
+
+/// Add or remove one exact AppContainer SID from FirewallAPI's loopback
+/// exemption list while preserving every preexisting SID and its attributes.
+/// The OS API manages a machine-wide SID list; it has no per-entry handle, so
+/// updates are serialized within this process and always verified by readback.
+#[allow(unsafe_code)]
+fn write_loopback_exempt_entries(entries: &[(String, u32)]) -> crate::Result<()> {
+    type SetConfig = unsafe extern "system" fn(u32, *const SID_AND_ATTRIBUTES) -> u32;
+    let owned: Vec<_> = entries
+        .iter()
+        .map(|(sid, _)| sid_from_string(sid))
+        .collect::<crate::Result<_>>()?;
+    let attributes: Vec<_> = entries.iter().map(|(_, attr)| *attr).collect();
+    let config: Vec<_> = owned
+        .iter()
+        .zip(attributes)
+        .map(|(sid, attributes)| SID_AND_ATTRIBUTES {
+            Sid: sid.as_psid(),
+            Attributes: attributes,
+        })
+        .collect();
+    let count = match u32::try_from(config.len()) {
+        Ok(count) if count <= 16_384 => count,
+        _ => {
+            return Err(crate::Error::isolation_unavailable(
+                "FirewallAPI loopback exemption list exceeds its safety bound",
+            ));
+        }
+    };
+    let library = wide(OsStr::new("FirewallAPI.dll"));
+    let module = unsafe { LoadLibraryW(library.as_ptr()) };
+    if module.is_null() {
+        return Err(unavailable("LoadLibraryW(FirewallAPI.dll)"));
+    }
+    let proc = unsafe {
+        GetProcAddress(
+            module,
+            c"NetworkIsolationSetAppContainerConfig".as_ptr().cast(),
+        )
+    };
+    if proc.is_null() {
+        unsafe { FreeLibrary(module) };
+        return Err(crate::Error::isolation_unavailable(
+            "FirewallAPI.dll does not export NetworkIsolationSetAppContainerConfig",
+        ));
+    }
+    let set_config: SetConfig = unsafe { std::mem::transmute(proc) };
+    let pointer = if config.is_empty() {
+        std::ptr::null()
+    } else {
+        config.as_ptr()
+    };
+    let status = unsafe { set_config(count, pointer) };
+    unsafe { FreeLibrary(module) };
+    if status != 0 {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "NetworkIsolationSetAppContainerConfig failed: Win32 error {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod loopback_config_tests {
+    use super::same_loopback_entries;
+
+    #[test]
+    fn loopback_list_verification_requires_all_sids_and_attributes() {
+        let baseline = vec![("S-1-15-2-10".to_owned(), 0), ("S-1-15-2-20".to_owned(), 3)];
+        let reordered = vec![baseline[1].clone(), baseline[0].clone()];
+        assert!(same_loopback_entries(&baseline, &reordered));
+        assert!(!same_loopback_entries(
+            &baseline,
+            &[("S-1-15-2-10".to_owned(), 0)]
+        ));
+        assert!(!same_loopback_entries(
+            &baseline,
+            &[("S-1-15-2-10".to_owned(), 0), ("S-1-15-2-20".to_owned(), 0),]
+        ));
+    }
+}
+
+fn same_loopback_entries(left: &[(String, u32)], right: &[(String, u32)]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    right.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    left == right
+}
+
+pub(crate) fn add_loopback_exemption(sid: &str) -> crate::Result<()> {
+    let _guard = lock_loopback_config()?;
+    let entries = loopback_exempt_entries()?;
+    if entries
+        .iter()
+        .any(|(entry, _)| entry.eq_ignore_ascii_case(sid))
+    {
+        return Err(crate::Error::integrity(
+            "new AppContainer already has a loopback exemption",
+        ));
+    }
+    let mut expected = entries.clone();
+    expected.push((sid.to_owned(), 0));
+    if let Err(error) = write_loopback_exempt_entries(&expected) {
+        let observed = loopback_exempt_entries();
+        if observed
+            .as_ref()
+            .is_ok_and(|observed| same_loopback_entries(observed, &entries))
+        {
+            return Err(error);
+        }
+        return Err(crate::Error::integrity(
+            "loopback exemption update failed with an ambiguous machine-wide list change; state was not restored",
+        ));
+    }
+    let actual = loopback_exempt_entries()?;
+    if !same_loopback_entries(&actual, &expected) {
+        return Err(crate::Error::integrity(
+            "loopback exemption update observed an ambiguous machine-wide list change; state was not restored",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_loopback_exemption(sid: &str) -> crate::Result<()> {
+    let _guard = lock_loopback_config()?;
+    let entries = loopback_exempt_entries()?;
+    let original_len = entries.len();
+    let expected: Vec<_> = entries
+        .iter()
+        .filter(|(entry, _)| !entry.eq_ignore_ascii_case(sid))
+        .cloned()
+        .collect();
+    if expected.len() == original_len {
+        return Ok(());
+    }
+    if let Err(error) = write_loopback_exempt_entries(&expected) {
+        let observed = loopback_exempt_entries();
+        if observed
+            .as_ref()
+            .is_ok_and(|observed| same_loopback_entries(observed, &entries))
+        {
+            return Err(error);
+        }
+        return Err(crate::Error::integrity(
+            "loopback exemption removal failed with an ambiguous machine-wide list change; state was not restored",
+        ));
+    }
+    let actual = loopback_exempt_entries()?;
+    if !same_loopback_entries(&actual, &expected) {
+        return Err(crate::Error::integrity(
+            "loopback exemption removal observed an ambiguous machine-wide list change; state was not restored",
+        ));
+    }
+    Ok(())
+}
+
 /// A SID owned through `LocalFree`, for SIDs parsed back from a state file.
-pub(super) struct OwnedSid(PSID);
+pub(crate) struct OwnedSid(PSID);
 
 impl OwnedSid {
-    pub(super) fn as_psid(&self) -> PSID {
+    pub(crate) fn as_psid(&self) -> PSID {
         self.0
     }
 }
@@ -1431,7 +1783,7 @@ impl Drop for OwnedSid {
 
 /// Parse a string SID (`S-1-15-2-...`).
 #[allow(unsafe_code)]
-pub(super) fn sid_from_string(text: &str) -> crate::Result<OwnedSid> {
+pub(crate) fn sid_from_string(text: &str) -> crate::Result<OwnedSid> {
     let text_w = wide(OsStr::new(text));
     let mut sid: PSID = std::ptr::null_mut();
     // SAFETY: NUL-terminated input; `sid` is a LocalAlloc'd SID owned by the

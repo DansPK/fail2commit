@@ -23,7 +23,7 @@
 //!   are checked, so a run never reports success while package code lives and a
 //!   failed ACL cleanup is recorded, logged and refused by the next operation.
 
-mod ffi;
+pub(crate) mod ffi;
 mod watch;
 
 use crate::isolation::{
@@ -433,10 +433,81 @@ fn probe_command(approval_pipe: &str, default_pipe: &str) -> String {
 /// root, grant read-back, loopback list, token, job limits, handle list) so a
 /// cached probe verdict is never the only evidence for a launch (S7B-005).
 fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
-    let stage_root = stage_root()?;
-    clear_pending_revokes(&stage_root)?;
-    clear_stale_profiles(&stage_root)?;
-    let paths = ValidatedPaths::new(job, &stage_root)?;
+    match run_with_launch_mode(job, None, None, false)? {
+        WindowsLaunchResult::Completed(outcome) => Ok(outcome),
+        #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+        WindowsLaunchResult::Diagnostic(_) => Err(crate::Error::internal(
+            "ordinary sandbox runner returned a test diagnostic",
+        )),
+    }
+}
+
+pub(crate) fn run_hardened_lpac(
+    job: &JobSpec,
+    stage_root: &Path,
+    preparation: &mut crate::sandbox::hardened::service::PreparationClient,
+) -> crate::Result<JobOutcome> {
+    match run_with_launch_mode(job, Some(stage_root), Some(preparation), false)? {
+        WindowsLaunchResult::Completed(outcome) => Ok(outcome),
+        #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+        WindowsLaunchResult::Diagnostic(_) => Err(crate::Error::internal(
+            "ordinary hardened runner returned a test diagnostic",
+        )),
+    }
+}
+
+#[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+pub(crate) fn run_hardened_lpac_diagnostic(
+    job: &JobSpec,
+    stage_root: &Path,
+    preparation: &mut crate::sandbox::hardened::service::PreparationClient,
+) -> crate::Result<crate::sandbox::hardened::service::HardenedLauncherDiagnostic> {
+    match run_with_launch_mode(job, Some(stage_root), Some(preparation), true)? {
+        WindowsLaunchResult::Diagnostic(diagnostic) => Ok(diagnostic),
+        WindowsLaunchResult::Completed(_) => Err(crate::Error::internal(
+            "test diagnostic unexpectedly completed a package job",
+        )),
+    }
+}
+
+enum WindowsLaunchResult {
+    Completed(JobOutcome),
+    #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+    Diagnostic(crate::sandbox::hardened::service::HardenedLauncherDiagnostic),
+}
+
+fn run_with_launch_mode(
+    job: &JobSpec,
+    hardened_stage_root: Option<&Path>,
+    mut preparation: Option<&mut crate::sandbox::hardened::service::PreparationClient>,
+    diagnostic: bool,
+) -> crate::Result<WindowsLaunchResult> {
+    if diagnostic && !cfg!(all(feature = "hardened-test-diagnostics", debug_assertions)) {
+        return Err(crate::Error::rejected(
+            "hardened test diagnostic controls are unavailable in this build",
+        ));
+    }
+    if diagnostic && preparation.is_none() {
+        return Err(crate::Error::rejected(
+            "hardened test diagnostic requires the authenticated SYSTEM preparation channel",
+        ));
+    }
+    let validation_root = match hardened_stage_root {
+        Some(root) => root.canonicalize().map_err(|error| {
+            crate::Error::isolation_unavailable(format!(
+                "cannot open authenticated hardened stage root: {error}"
+            ))
+        })?,
+        None => stage_root()?,
+    };
+    // Profile records belong to the sandbox account's private profile. The
+    // authenticated envelope points at the caller's staged job tree and is
+    // used only to validate package inputs; mixing these roots would make the
+    // service account attempt to write into caller-owned state.
+    let profile_root = stage_root()?;
+    clear_pending_revokes(&profile_root)?;
+    clear_stale_profiles(&profile_root)?;
+    let paths = ValidatedPaths::new(job, &validation_root)?;
     let max_processes = job.limits.max_processes.filter(|n| *n > 0).ok_or_else(|| {
         crate::Error::isolation_unavailable("a positive process limit is required")
     })?;
@@ -454,15 +525,35 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     // FR-024: bait goes into the job's own home before grants, so it is staged
     // and granted like any other work_dir file and never leaves the stage.
     let mut env = job.env.clone();
-    let bait = if job.bait {
+    let bait = if job.bait && !diagnostic {
         Some(place_bait(&paths.work_dir, &mut env)?)
     } else {
         None
     };
+    let proxy = if preparation.is_some() && job.network == crate::isolation::NetworkMode::Internet {
+        let policy_bait = bait.as_ref().map(|bait| Arc::clone(&bait.policy));
+        Some(crate::sandbox::hardened::windows_proxy::start(
+            Arc::new(crate::sandbox::egress::Watch::default()),
+            policy_bait,
+        )?)
+    } else {
+        None
+    };
+    if let Some(proxy) = proxy.as_ref() {
+        let proxy_environment = proxy.environment();
+        env.retain(|(key, _)| {
+            !proxy_environment
+                .iter()
+                .any(|(proxy_key, _)| key.eq_ignore_ascii_case(proxy_key))
+        });
+        env.extend(proxy_environment);
+    }
     // FR-023: `Internet` is exactly the internetClient capability.
-    let internet = match job.network {
-        crate::isolation::NetworkMode::Internet => Some(ffi::sid_from_string(INTERNET_CLIENT)?),
-        crate::isolation::NetworkMode::None => None,
+    let internet = match (preparation.is_some(), job.network) {
+        (true, _) | (false, crate::isolation::NetworkMode::None) => None,
+        (false, crate::isolation::NetworkMode::Internet) => {
+            Some(ffi::sid_from_string(INTERNET_CLIENT)?)
+        }
     };
     let capabilities: Vec<PSID> = internet.iter().map(|s| s.as_psid()).collect();
     let expected_caps: Vec<String> = internet
@@ -480,13 +571,21 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
         None => None,
     };
 
-    let profile = RecordedProfile::create(&stage_root)?;
+    let profile = RecordedProfile::create(&profile_root)?;
     verify_no_loopback_exemption(&profile.profile().sid_string)?;
-    let mut grants = StagingGrants::new(profile.profile().sid(), &stage_root);
-    for root in &paths.read_only {
-        grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
-    }
-    grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
+    // The SYSTEM service adds the LPAC package SID ACEs after reading this
+    // freshly-created profile SID over the authenticated preparation channel.
+    // A sandbox account cannot safely grant it access to caller-owned files.
+    let mut grants = if preparation.is_none() {
+        let mut grants = StagingGrants::new(profile.profile().sid(), &validation_root);
+        for root in &paths.read_only {
+            grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
+        }
+        grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
+        Some(grants)
+    } else {
+        None
+    };
 
     let job_object = ffi::Job::new(max_processes, memory_bytes)?;
     job_object.verify(max_processes, memory_bytes)?;
@@ -494,11 +593,26 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     // `\\?\` form that canonicalization returns, so execution inputs use the
     // plain DOS form. Canonical verbatim paths are still what every containment
     // comparison and every ACL call uses.
-    let program = plain_path(&paths.program);
-    let cwd = plain_path(&paths.cwd);
+    let (program, cwd, args, environment) = if diagnostic {
+        let system32 = required_windows_directory()?.join("System32");
+        let program = system32.join("whoami.exe");
+        (
+            program.clone(),
+            system32,
+            Vec::new(),
+            Vec::<(OsString, OsString)>::new(),
+        )
+    } else {
+        (
+            plain_path(&paths.program),
+            plain_path(&paths.cwd),
+            job.args.clone(),
+            env.clone(),
+        )
+    };
     let work_dir = plain_path(&paths.work_dir);
-    let env = environment_block(&env, &cwd, &work_dir)?;
-    let mut command_line = command_line(&program, &job.args)?;
+    let env = environment_block(&environment, &cwd, &work_dir)?;
+    let mut command_line = command_line(&program, &args)?;
 
     // Declared after `grants`, so it drops first: the oplock handles must be
     // closed before the ACL revoke reopens the bait files.
@@ -515,16 +629,28 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
         stdout_write.as_raw_handle() as HANDLE,
         stderr_write.as_raw_handle() as HANDLE,
     ];
-    let mut canary = HandleCanary::create(&paths.stage)?;
-    let spawned = ffi::spawn_suspended(
-        &program,
-        &mut command_line,
-        &env,
-        &cwd,
-        profile.profile().sid(),
-        &capabilities,
-        stdio,
-    )?;
+    let mut canary = HandleCanary::create(&paths.work_dir)?;
+    let spawned = if preparation.is_some() {
+        ffi::spawn_lpac_suspended(
+            &program,
+            &mut command_line,
+            &env,
+            &cwd,
+            profile.profile().sid(),
+            &capabilities,
+            stdio,
+        )?
+    } else {
+        ffi::spawn_suspended(
+            &program,
+            &mut command_line,
+            &env,
+            &cwd,
+            profile.profile().sid(),
+            &capabilities,
+            stdio,
+        )?
+    };
     let facts = ffi::token_facts(&spawned.process, profile.profile().sid())
         .map_err(|error| abort_with(&spawned, error))?;
     if !facts.is_appcontainer
@@ -541,13 +667,13 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
             )),
         ));
     }
-    // LPAC is not the default (SPEC-014 section 4). Observing it would mean the
-    // launch policy changed unexpectedly.
-    if facts.is_lpac {
+    // Hardened jobs require the LPAC token read-back; the default runner keeps
+    // the frozen standard AppContainer policy.
+    if facts.is_lpac != preparation.is_some() {
         return Err(abort_with(
             &spawned,
             crate::Error::isolation_unavailable(
-                "unexpected LPAC token; launch configuration changed",
+                "child token LPAC state did not match the selected launch mode",
             ),
         ));
     }
@@ -572,6 +698,75 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     monitor
         .settle_before_resume(&job_object)
         .map_err(|error| abort_with(&spawned, error))?;
+    let _policy_receipt = if let Some(preparation) = preparation.as_deref_mut() {
+        let package_sid = ffi::sid_to_string(profile.profile().sid())?;
+        let receipt = preparation
+            .prepare(
+                &package_sid,
+                profile.profile().name(),
+                job.network,
+                proxy.as_ref().map(|proxy| proxy.port()),
+            )
+            .map_err(|error| abort_with(&spawned, error))?;
+        if receipt.package_sid != package_sid
+            || receipt.launch_id != preparation.launch_id()
+            || receipt.proxy_port != proxy.as_ref().map(|proxy| proxy.port())
+        {
+            return Err(abort_with(
+                &spawned,
+                crate::Error::integrity("WFP preparation receipt did not bind this package"),
+            ));
+        }
+        Some(receipt)
+    } else {
+        None
+    };
+    #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+    if diagnostic {
+        // The authenticated service has already installed the package SID
+        // grants and acknowledged the per-launch policy. Keep the process
+        // suspended so no diagnostic or package image runs in the sandbox.
+        let package_policy_acknowledged = _policy_receipt.is_some();
+        spawned.kill()?;
+        let child_termination_confirmed = true;
+        job_object.wait_empty(Instant::now() + CLEANUP_GRACE)?;
+        let child_tree_empty = job_object.active_processes()? == 0;
+        if !child_tree_empty {
+            return Err(crate::Error::isolation_unavailable(
+                "diagnostic child tree remained active after termination",
+            ));
+        }
+        monitor.release_bait(&job_object);
+        let _ = monitor.finish(&job_object);
+        if let Some(grants) = grants.as_mut() {
+            grants.release()?;
+        }
+        profile.remove()?;
+        return Ok(WindowsLaunchResult::Diagnostic(
+            crate::sandbox::hardened::service::HardenedLauncherDiagnostic {
+                service_received_diagnostic_request: false,
+                service_profile_loaded: false,
+                service_environment_created: false,
+                service_launcher_created: false,
+                service_launcher_exit_confirmed: false,
+                service_profile_unloaded: false,
+                service_marker_cleared: false,
+                service_package_grants_revoked: false,
+                service_wfp_session_closed: false,
+                launcher_created: true,
+                profile_created: true,
+                child_process_created_suspended: true,
+                token_is_appcontainer: facts.is_appcontainer,
+                token_is_lpac: facts.is_lpac,
+                token_sid_matches_profile: facts.sid_matches,
+                child_assigned_to_job: true,
+                system_acknowledged_package_policy: package_policy_acknowledged,
+                child_termination_confirmed,
+                child_tree_empty,
+                profile_removed: true,
+            },
+        ));
+    }
     spawned
         .resume()
         .map_err(|error| abort_with(&spawned, error))?;
@@ -586,7 +781,7 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     let (stdout_thread, stdout_rx) = drain(stdout_read, Arc::clone(&budget));
     let (stderr_thread, stderr_rx) = drain(stderr_read, Arc::clone(&budget));
     let deadline = Instant::now() + job.limits.timeout;
-    let status = wait_for_tree(&job_object, deadline, &mut monitor)?;
+    let status = wait_for_tree(&job_object, deadline, &mut monitor, proxy.as_ref())?;
     let status = match status {
         Some(status) => status,
         None => JobStatus::Exited(spawned.exit_code()? as i32),
@@ -598,21 +793,161 @@ fn run_unprobed(job: &JobSpec) -> crate::Result<JobOutcome> {
     let _ = stderr_thread.join();
     let truncated = budget.lock().unwrap_or_else(|e| e.into_inner()).truncated;
     let mut report = monitor.finish(&job_object);
+    if let Some(proxy) = proxy.as_ref() {
+        let proxy_report = proxy.report();
+        for event in proxy_report.events {
+            report.push(event.kind, event.detail);
+        }
+        report.truncated |= proxy_report.truncated;
+    }
     if truncated {
         report.push(ActivityKind::Limit, "output");
     }
+    // Stop forwarding job traffic before revoking temporary filesystem grants.
+    drop(proxy);
     // Cleanup is part of the operation: a failed revoke is recorded, logged and
     // returned, so the next probe()/run() refuses while it is outstanding.
-    grants.release()?;
+    if let Some(grants) = grants.as_mut() {
+        grants.release()?;
+    }
     drop(profile);
-    Ok(JobOutcome {
+    Ok(WindowsLaunchResult::Completed(JobOutcome {
         status,
         stdout,
         stderr,
         truncated,
         exported: Vec::new(),
         report,
-    })
+    }))
+}
+
+/// Apply and verify the sandbox-account grants around a single authenticated
+/// hardened-service transaction. Paths are checked by the same handle-based
+/// stage validator used by the ordinary AppContainer backend.
+pub(crate) fn with_hardened_job_grants<T>(
+    job: &JobSpec,
+    account_sid: &str,
+    action: impl FnOnce() -> HardenedGrantAction<T>,
+) -> crate::Result<T> {
+    let stage_root = stage_root()?;
+    if crate::sandbox::hardened::service::launch_recovery_pending().unwrap_or(true) {
+        return Err(crate::Error::isolation_unavailable(
+            "an unresolved hardened launch marker blocks staging ACL cleanup and launch",
+        ));
+    }
+    clear_pending_revokes(&stage_root)?;
+    clear_stale_profiles(&stage_root)?;
+    let paths = ValidatedPaths::new(job, &stage_root)?;
+    let account_sid = ffi::sid_from_string(account_sid)?;
+    let mut grants = StagingGrants::new_crash_safe(account_sid.as_psid(), &stage_root);
+    for root in &paths.read_only {
+        grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
+    }
+    grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
+    let result = match action() {
+        HardenedGrantAction::Complete(result) => result,
+        HardenedGrantAction::ContainmentUnconfirmed(error) => {
+            // The launcher may still have a live descendant. Persisted revocation
+            // state and the grants themselves must remain intact until recovery can
+            // prove the process tree is gone.
+            std::mem::forget(grants);
+            return Err(error);
+        }
+    };
+    let cleanup = grants.release();
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(crate::Error::isolation_unavailable(format!(
+            "hardened job failed: {}; account grants could not be revoked: {}",
+            error.message, cleanup.message
+        ))),
+    }
+}
+
+pub(crate) enum HardenedGrantAction<T> {
+    Complete(crate::Result<T>),
+    ContainmentUnconfirmed(crate::Error),
+}
+
+/// SYSTEM-owned per-package access to the caller's already validated staged
+/// inputs. The service holds this object through launcher and child teardown,
+/// then revokes every package SID ACE before returning an outcome.
+pub(crate) struct HardenedPackageGrants<'a> {
+    grants: StagingGrants<'a>,
+    // Keep the pointer stored in StagingGrants valid until grants have been
+    // dropped/released; fields drop in declaration order, so SID follows it.
+    _sid: ffi::OwnedSid,
+}
+
+impl HardenedPackageGrants<'_> {
+    pub(crate) fn release(&mut self) -> crate::Result<()> {
+        self.grants.release()
+    }
+}
+
+pub(crate) fn grant_hardened_package<'a>(
+    job: &JobSpec,
+    stage_root: &'a Path,
+    package_sid: &str,
+) -> crate::Result<HardenedPackageGrants<'a>> {
+    let paths = ValidatedPaths::new(job, stage_root)?;
+    let sid = ffi::sid_from_string(package_sid)?;
+    let mut grants = StagingGrants::new_crash_safe(sid.as_psid(), stage_root);
+    for root in &paths.read_only {
+        grants.grant_tree(root, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, false)?;
+    }
+    grants.grant_tree(&paths.work_dir, FILE_MODIFY, true)?;
+    Ok(HardenedPackageGrants { grants, _sid: sid })
+}
+
+pub(crate) fn sweep_hardened_job_state(cache_root: &Path) -> crate::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const REPARSE: u32 = 0x400;
+    let stage_root = stage_root()?;
+    clear_pending_revokes(&stage_root)?;
+    let root = fs::symlink_metadata(cache_root)?;
+    if !root.is_dir() || root.file_attributes() & REPARSE != 0 {
+        return Err(crate::Error::integrity(
+            "hardened job cache is not a plain directory",
+        ));
+    }
+    for entry in fs::read_dir(cache_root)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("hardened-job-")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() || metadata.file_attributes() & REPARSE != 0 {
+            return Err(crate::Error::integrity(
+                "stale hardened job path is not a plain directory",
+            ));
+        }
+        for child in fs::read_dir(&path)? {
+            let child = child?;
+            let name = child.file_name();
+            if name != "job.json" && name != "outcome.json" {
+                return Err(crate::Error::integrity(
+                    "stale hardened job directory contains an unexpected entry",
+                ));
+            }
+            let child_meta = fs::symlink_metadata(child.path())?;
+            if !child_meta.is_file() || child_meta.file_attributes() & REPARSE != 0 {
+                return Err(crate::Error::integrity(
+                    "stale hardened job file is not a plain file",
+                ));
+            }
+            fs::remove_file(child.path())?;
+        }
+        fs::remove_dir(path)?;
+    }
+    Ok(())
 }
 
 /// Kill a suspended or failed root process, keeping the original error and
@@ -635,9 +970,20 @@ fn wait_for_tree(
     job_object: &ffi::Job,
     deadline: Instant,
     monitor: &mut Monitor,
+    proxy: Option<&crate::sandbox::hardened::windows_proxy::Egress>,
 ) -> crate::Result<Option<JobStatus>> {
     let mut decided = None;
     while Instant::now() < deadline {
+        if proxy.is_some_and(|proxy| proxy.tripped()) {
+            job_object.terminate().map_err(|error| {
+                crate::Error::isolation_unavailable(format!(
+                    "the proxy stopped the sandbox job but TerminateJobObject failed: {}",
+                    error.message
+                ))
+            })?;
+            decided = Some(JobStatus::Killed);
+            break;
+        }
         let stop = match job_object.next_event(POLL_MS) {
             Some(event) => match monitor.on_event(&event) {
                 Flow::Empty => break,
@@ -892,6 +1238,7 @@ impl Monitor {
 /// Bait files placed for one job: absolute path and path relative to home.
 struct PlacedBait {
     files: Vec<(PathBuf, String)>,
+    policy: Arc<BaitSet>,
 }
 
 /// SPEC-014 section 2: the bait home is the job's `USERPROFILE` when it is
@@ -943,7 +1290,7 @@ fn place_bait(work_dir: &Path, env: &mut Vec<(OsString, OsString)>) -> crate::Re
     if lookup(env, "HOME").is_none() {
         env.push(("HOME".into(), plain_path(&home).into_os_string()));
     }
-    let set = BaitSet::generate()?;
+    let set = Arc::new(BaitSet::generate()?);
     // Never overwrite a file the job brought (or a link planted in its place).
     if let Some(f) = set
         .files
@@ -962,7 +1309,7 @@ fn place_bait(work_dir: &Path, env: &mut Vec<(OsString, OsString)>) -> crate::Re
         .map(|(path, f)| (path, f.rel.to_string_lossy().into_owned()))
         .collect();
     env.extend(set.env.iter().map(|(k, v)| (k.into(), v.into())));
-    Ok(PlacedBait { files })
+    Ok(PlacedBait { files, policy: set })
 }
 
 /// `internetClient`, the only capability an `Internet` job gets (FR-023).
@@ -1015,13 +1362,28 @@ impl RecordedProfile {
     fn profile(&self) -> &ffi::Profile {
         self.profile.as_ref().expect("profile present until drop")
     }
+
+    fn remove(mut self) -> crate::Result<()> {
+        let profile = self.profile.take().ok_or_else(|| {
+            crate::Error::internal("recorded AppContainer profile was already removed")
+        })?;
+        profile.remove()?;
+        fs::remove_file(&self.record).map_err(|error| {
+            crate::Error::isolation_unavailable(format!(
+                "AppContainer profile was deleted but its recovery record could not be removed: {error}"
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 impl Drop for RecordedProfile {
     fn drop(&mut self) {
         // Profile first (its Drop deletes it), then the record.
-        drop(self.profile.take());
-        let _ = fs::remove_file(&self.record);
+        if let Some(profile) = self.profile.take() {
+            drop(profile);
+            let _ = fs::remove_file(&self.record);
+        }
     }
 }
 
@@ -1067,8 +1429,6 @@ struct ValidatedPaths {
     cwd: PathBuf,
     read_only: Vec<PathBuf>,
     work_dir: PathBuf,
-    /// The one job stage directory below the fail2commit stage root.
-    stage: PathBuf,
 }
 
 impl ValidatedPaths {
@@ -1141,7 +1501,6 @@ impl ValidatedPaths {
             cwd,
             read_only,
             work_dir,
-            stage,
         })
     }
 }
@@ -1238,6 +1597,11 @@ fn stage_root() -> crate::Result<PathBuf> {
     })?;
     reject_unsafe_anchor(&root)?;
     Ok(root)
+}
+
+#[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+pub(crate) fn hardened_test_stage_root() -> crate::Result<PathBuf> {
+    stage_root()
 }
 
 /// Refuse an anchor that is a volume root, the user profile (or an ancestor of
@@ -1359,6 +1723,8 @@ struct StagingGrants<'a> {
     sid: PSID,
     stage_root: &'a Path,
     granted: Vec<PathBuf>,
+    recorded_paths: Vec<PathBuf>,
+    crash_safe: bool,
 }
 
 impl<'a> StagingGrants<'a> {
@@ -1367,6 +1733,18 @@ impl<'a> StagingGrants<'a> {
             sid,
             stage_root,
             granted: Vec::new(),
+            recorded_paths: Vec::new(),
+            crash_safe: false,
+        }
+    }
+
+    fn new_crash_safe(sid: PSID, stage_root: &'a Path) -> Self {
+        Self {
+            sid,
+            stage_root,
+            granted: Vec::new(),
+            recorded_paths: Vec::new(),
+            crash_safe: true,
         }
     }
 
@@ -1378,6 +1756,13 @@ impl<'a> StagingGrants<'a> {
             paths.push(object.path().to_path_buf());
             Ok(())
         })?;
+        if self.crash_safe {
+            let sid = ffi::sid_text(self.sid)?;
+            record_pending_revoke_roots(self.stage_root, &[root.to_path_buf()], &sid)?;
+            if !self.recorded_paths.iter().any(|path| path == root) {
+                self.recorded_paths.push(root.to_path_buf());
+            }
+        }
         for path in paths {
             let object = ffi::StagedObject::open(&path)?;
             require_plain(&object, self.stage_root)?;
@@ -1405,19 +1790,52 @@ impl<'a> StagingGrants<'a> {
     fn release(&mut self) -> crate::Result<()> {
         let granted = std::mem::take(&mut self.granted);
         let mut failures = Vec::new();
-        for path in granted.iter().rev() {
-            if fs::symlink_metadata(path).is_err() {
-                // The staged object is already gone: no ACE can remain on it.
-                continue;
+        if self.crash_safe {
+            let mut paths = Vec::new();
+            for root in &self.recorded_paths {
+                match fs::symlink_metadata(root) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        failures.push((root.clone(), e.to_string()));
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+                if let Err(error) = walk_stage(root, self.stage_root, |object| {
+                    paths.push(object.path().to_path_buf());
+                    Ok(())
+                }) {
+                    failures.push((root.clone(), error.message));
+                }
             }
-            let result = ffi::StagedObject::open(path)
-                .and_then(|object| require_plain(&object, self.stage_root).map(|()| object))
-                .and_then(|object| object.revoke(self.sid));
-            if let Err(error) = result {
-                failures.push((path.clone(), error.message));
+            for path in paths.iter().rev() {
+                let result = ffi::StagedObject::open(path)
+                    .and_then(|object| require_plain(&object, self.stage_root).map(|()| object))
+                    .and_then(|object| object.revoke(self.sid));
+                if let Err(error) = result {
+                    failures.push((path.clone(), error.message));
+                }
+            }
+        } else {
+            for path in granted.iter().rev() {
+                if fs::symlink_metadata(path).is_err() {
+                    // The staged object is already gone: no ACE can remain on it.
+                    continue;
+                }
+                let result = ffi::StagedObject::open(path)
+                    .and_then(|object| require_plain(&object, self.stage_root).map(|()| object))
+                    .and_then(|object| object.revoke(self.sid));
+                if let Err(error) = result {
+                    failures.push((path.clone(), error.message));
+                }
             }
         }
         if failures.is_empty() {
+            if self.crash_safe && !self.recorded_paths.is_empty() {
+                let sid = ffi::sid_text(self.sid)?;
+                remove_pending_revokes(self.stage_root, &self.recorded_paths, &sid)?;
+                self.recorded_paths.clear();
+            }
             return Ok(());
         }
         for (path, message) in &failures {
@@ -1428,7 +1846,9 @@ impl<'a> StagingGrants<'a> {
             );
         }
         let sid = ffi::sid_text(self.sid)?;
-        record_pending_revokes(self.stage_root, &failures, &sid)?;
+        if !self.crash_safe {
+            record_pending_revokes(self.stage_root, &failures, &sid)?;
+        }
         Err(crate::Error::isolation_unavailable(format!(
             "{} staged ACL revocation(s) failed; recorded in {} and the next sandbox operation \
              will refuse until they are cleared",
@@ -1440,7 +1860,7 @@ impl<'a> StagingGrants<'a> {
 
 impl Drop for StagingGrants<'_> {
     fn drop(&mut self) {
-        if !self.granted.is_empty() {
+        if !self.granted.is_empty() || !self.recorded_paths.is_empty() {
             let _ = self.release();
         }
     }
@@ -1493,7 +1913,11 @@ struct PendingRevoke {
     path: String,
     sid: String,
     detail: String,
+    #[serde(default)]
+    recursive: bool,
 }
+
+const MAX_PENDING_REVOKES_BYTES: usize = 256 * 1024;
 
 fn revoke_state_file(stage_root: &Path) -> PathBuf {
     stage_root.join(REVOKE_STATE_FILE)
@@ -1517,10 +1941,56 @@ fn record_pending_revokes(
                     path,
                     sid: sid.to_string(),
                     detail: detail.clone(),
+                    recursive: false,
                 });
             }
         }
         write_pending_revokes(stage_root, &entries)
+    })
+}
+
+fn record_pending_revoke_roots(
+    stage_root: &Path,
+    roots: &[PathBuf],
+    sid: &str,
+) -> crate::Result<()> {
+    let file = revoke_state_file(stage_root);
+    crate::fsutil::with_lock(&file, || {
+        let mut entries = read_pending_revokes(stage_root)?;
+        for root in roots {
+            let path = root.to_string_lossy().into_owned();
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.path == path && entry.sid == sid)
+            {
+                entry.detail = "in-progress hardened job; recursively revoke on restart".into();
+                entry.recursive = true;
+            } else {
+                entries.push(PendingRevoke {
+                    path,
+                    sid: sid.to_string(),
+                    detail: "in-progress hardened job; recursively revoke on restart".into(),
+                    recursive: true,
+                });
+            }
+        }
+        write_pending_revokes(stage_root, &entries)
+    })
+}
+
+fn remove_pending_revokes(stage_root: &Path, paths: &[PathBuf], sid: &str) -> crate::Result<()> {
+    let wanted: std::collections::HashSet<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let file = revoke_state_file(stage_root);
+    crate::fsutil::with_lock(&file, || {
+        let entries = read_pending_revokes(stage_root)?;
+        let remaining: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| !(entry.sid == sid && wanted.contains(&entry.path)))
+            .collect();
+        write_pending_revokes(stage_root, &remaining)
     })
 }
 
@@ -1555,6 +2025,11 @@ fn write_pending_revokes(stage_root: &Path, entries: &[PendingRevoke]) -> crate:
     } else {
         let json = serde_json::to_vec_pretty(entries)
             .map_err(|e| crate::Error::internal(format!("serialize pending revokes: {e}")))?;
+        if json.len() > MAX_PENDING_REVOKES_BYTES {
+            return Err(crate::Error::isolation_unavailable(
+                "pending ACL revocation state exceeds its safety limit",
+            ));
+        }
         crate::fsutil::atomic_write(&file, &json)
     }
 }
@@ -1562,6 +2037,11 @@ fn write_pending_revokes(stage_root: &Path, entries: &[PendingRevoke]) -> crate:
 /// Retry outstanding revocations and refuse while any remain. Called by every
 /// `probe()` and `run()` so a leaked ACE is never silently ignored (S7B-006).
 fn clear_pending_revokes(stage_root: &Path) -> crate::Result<()> {
+    if crate::sandbox::hardened::service::launch_recovery_pending().unwrap_or(true) {
+        return Err(crate::Error::isolation_unavailable(
+            "an unresolved hardened launch marker blocks pending ACL revocation cleanup",
+        ));
+    }
     let entries = read_pending_revokes(stage_root)?;
     if entries.is_empty() {
         return Ok(());
@@ -1576,15 +2056,30 @@ fn clear_pending_revokes(stage_root: &Path) -> crate::Result<()> {
                 continue;
             }
             let result = ffi::sid_from_string(&entry.sid).and_then(|sid| {
-                ffi::StagedObject::open(&path)
-                    .and_then(|object| require_plain(&object, stage_root).map(|()| object))
-                    .and_then(|object| object.revoke(sid.as_psid()))
+                if entry.recursive {
+                    let mut paths = Vec::new();
+                    walk_stage(&path, stage_root, |object| {
+                        paths.push(object.path().to_path_buf());
+                        Ok(())
+                    })?;
+                    for child in paths.iter().rev() {
+                        ffi::StagedObject::open(child)
+                            .and_then(|object| require_plain(&object, stage_root).map(|()| object))
+                            .and_then(|object| object.revoke(sid.as_psid()))?;
+                    }
+                    Ok(())
+                } else {
+                    ffi::StagedObject::open(&path)
+                        .and_then(|object| require_plain(&object, stage_root).map(|()| object))
+                        .and_then(|object| object.revoke(sid.as_psid()))
+                }
             });
             if let Err(error) = result {
                 failed.push(PendingRevoke {
                     path: entry.path.clone(),
                     sid: entry.sid.clone(),
                     detail: error.message,
+                    recursive: entry.recursive,
                 });
             }
         }
@@ -1865,6 +2360,38 @@ fn random_bytes_16() -> crate::Result<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardened_grant_journal_is_write_ahead_and_removed_after_cleanup() {
+        let state = tempfile::tempdir().unwrap();
+        let granted = state.path().join("input.bin");
+        fs::write(&granted, b"stage").unwrap();
+        let sid = "S-1-5-21-1-2-3-1001";
+        record_pending_revoke_roots(state.path(), std::slice::from_ref(&granted), sid).unwrap();
+        let recorded = read_pending_revokes(state.path()).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].path, granted.to_string_lossy());
+        assert_eq!(recorded[0].sid, sid);
+        assert!(recorded[0].recursive);
+        remove_pending_revokes(state.path(), &[granted], sid).unwrap();
+        assert!(read_pending_revokes(state.path()).unwrap().is_empty());
+        assert!(!revoke_state_file(state.path()).exists());
+    }
+
+    #[test]
+    fn hardened_grant_journal_refuses_unbounded_cleanup_state() {
+        let state = tempfile::tempdir().unwrap();
+        let entries: Vec<_> = (0..5000)
+            .map(|i| {
+                (
+                    state.path().join(format!("{i:04}-{}", "p".repeat(96))),
+                    "crash cleanup".into(),
+                )
+            })
+            .collect();
+        assert!(record_pending_revokes(state.path(), &entries, "S-1-5-21-1-2-3-1001").is_err());
+        assert!(read_pending_revokes(state.path()).unwrap().is_empty());
+    }
 
     /// A disposable job stage directly below the real fail2commit stage root,
     /// which is what the stager contract requires.

@@ -10,13 +10,15 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 pub mod bait;
+pub(crate) mod egress;
+pub mod hardened;
 pub mod netpolicy;
 pub mod report;
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 /// Linux backend, public so tests can simulate a missing install
 /// (`Bubblewrap::with_bwrap`) or force the rlimit-only path.
@@ -37,6 +39,14 @@ pub fn platform_backend() -> Box<dyn SandboxBackend> {
     return Box::new(windows::AppContainer);
     #[allow(unreachable_code)]
     Box::new(Unavailable)
+}
+
+/// Backend selected by trusted sandbox settings. `auto` uses hardened mode
+/// whenever its machine install marker exists; an unhealthy install is kept
+/// selected so `run_job` fails closed rather than dropping to the platform
+/// default. `vm` remains the SPEC-019 fallback until that feature lands.
+pub fn select_backend(settings: &crate::settings::Settings) -> Box<dyn SandboxBackend> {
+    hardened::selected(settings).unwrap_or_else(platform_backend)
 }
 
 /// Probe, run, then export declared paths only after a clean exit.

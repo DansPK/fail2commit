@@ -4,11 +4,16 @@
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Security::Authorization::{
+    SetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
+};
 use windows_sys::Win32::Security::{
     AddAccessAllowedAce, AddAccessDeniedAce, GetAce, GetKernelObjectSecurity, GetLengthSid,
-    GetSecurityDescriptorDacl, GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, SetSecurityDescriptorControl,
     SetSecurityDescriptorDacl, TokenIsAppContainer, TokenUser, ACL, ACL_REVISION,
-    DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
+    SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -201,6 +206,7 @@ impl PipeSecurity {
             let psd = (&mut *sd as *mut SECURITY_DESCRIPTOR).cast::<c_void>();
             if InitializeSecurityDescriptor(psd, 1) == 0
                 || SetSecurityDescriptorDacl(psd, 1, acl.as_ptr().cast(), 0) == 0
+                || SetSecurityDescriptorControl(psd, SE_DACL_PROTECTED, SE_DACL_PROTECTED) == 0
             {
                 return Err(last_err("security descriptor"));
             }
@@ -220,6 +226,48 @@ impl PipeSecurity {
     pub fn attributes(&self) -> *const SECURITY_ATTRIBUTES {
         &self.attrs
     }
+}
+
+/// True only when the kernel object has a protected DACL (no inherited ACEs).
+pub fn dacl_is_protected(object: &impl AsRawHandle) -> crate::Result<bool> {
+    let handle = object.as_raw_handle() as HANDLE;
+    let mut need = 0u32;
+    // SAFETY: size query with a null descriptor buffer.
+    unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        )
+    };
+    if need == 0 || need > 64 * 1024 {
+        return Err(last_err("GetKernelObjectSecurity(protected DACL size)"));
+    }
+    let mut buf = vec![0u64; (need as usize).div_ceil(8)];
+    // SAFETY: buffer is sized to the descriptor length reported above.
+    if unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION,
+            buf.as_mut_ptr().cast(),
+            need,
+            &mut need,
+        )
+    } == 0
+    {
+        return Err(last_err("GetKernelObjectSecurity(protected DACL)"));
+    }
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // SAFETY: `buf` contains a self-relative descriptor returned by Windows.
+    if unsafe { GetSecurityDescriptorControl(buf.as_mut_ptr().cast(), &mut control, &mut revision) }
+        == 0
+    {
+        return Err(last_err("GetSecurityDescriptorControl"));
+    }
+    Ok(control & SE_DACL_PROTECTED != 0)
 }
 
 /// `(allow, sid, mask)` entries of a kernel object's DACL, in order.
@@ -292,6 +340,97 @@ pub fn dacl_entries(object: &impl AsRawHandle) -> crate::Result<Vec<(bool, Strin
         }
     }
     Ok(out)
+}
+
+/// Read the kernel object's owner SID from its security descriptor.
+pub fn owner_sid(object: &impl AsRawHandle) -> crate::Result<String> {
+    let handle = object.as_raw_handle() as HANDLE;
+    let mut need = 0u32;
+    // SAFETY: size query with a null descriptor buffer.
+    unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            OWNER_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        )
+    };
+    if need == 0 || need > 64 * 1024 {
+        return Err(last_err("GetKernelObjectSecurity(owner size)"));
+    }
+    let mut buf = vec![0u64; (need as usize).div_ceil(8)];
+    // SAFETY: buffer is sized to the descriptor length reported above.
+    if unsafe {
+        GetKernelObjectSecurity(
+            handle,
+            OWNER_SECURITY_INFORMATION,
+            buf.as_mut_ptr().cast(),
+            need,
+            &mut need,
+        )
+    } == 0
+    {
+        return Err(last_err("GetKernelObjectSecurity(owner)"));
+    }
+    let (mut owner, mut defaulted) = (std::ptr::null_mut(), 0i32);
+    // SAFETY: buf contains a valid self-relative descriptor returned above.
+    if unsafe { GetSecurityDescriptorOwner(buf.as_mut_ptr().cast(), &mut owner, &mut defaulted) }
+        == 0
+        || owner.is_null()
+    {
+        return Err(last_err("GetSecurityDescriptorOwner"));
+    }
+    // SAFETY: owner points into buf and GetLengthSid validates its exact length.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), GetLengthSid(owner) as usize) };
+    Ok(sid_string(bytes))
+}
+
+/// Set only a file's owner SID through its already-open handle, then read it
+/// back. The caller must hold WRITE_OWNER or an applicable take-ownership
+/// privilege; this avoids a path-based owner change race.
+pub fn set_owner_sid(object: &impl AsRawHandle, owner: &[u8]) -> crate::Result<()> {
+    set_object_owner_sid(object, SE_FILE_OBJECT, owner, "file")
+}
+
+/// Set/read back the owner of a newly-created kernel object through its handle.
+pub fn set_kernel_object_owner_sid(object: &impl AsRawHandle, owner: &[u8]) -> crate::Result<()> {
+    set_object_owner_sid(object, SE_KERNEL_OBJECT, owner, "kernel object")
+}
+
+fn set_object_owner_sid(
+    object: &impl AsRawHandle,
+    object_type: SE_OBJECT_TYPE,
+    owner: &[u8],
+    label: &str,
+) -> crate::Result<()> {
+    let handle = object.as_raw_handle() as HANDLE;
+    // SAFETY: the handle is live; `owner` is a validated SID byte sequence;
+    // all unrelated security descriptor fields are null and untouched.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle,
+            object_type,
+            OWNER_SECURITY_INFORMATION,
+            owner.as_ptr().cast_mut().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(crate::Error::integrity(format!(
+            "SetSecurityInfo({label} owner) failed with Win32 error {status}"
+        )));
+    }
+    let expected = sid_string(owner);
+    if owner_sid(object)? != expected {
+        return Err(crate::Error::integrity(format!(
+            "{label} owner SID did not read back as requested"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -26,7 +26,7 @@ mod proxy;
 mod relay;
 mod seccomp;
 
-pub use proxy::Watch;
+pub(crate) use proxy::Watch;
 
 /// Entry point for the `f2c-sandbox-relay` binary (SPEC-013 §4; FR-023).
 pub fn relay_main() -> std::io::Result<()> {
@@ -140,6 +140,7 @@ const OPTIONAL_CONTROLS: [&str; 2] = ["cgroup_v2_limits", "process_limit"];
 pub struct Bubblewrap {
     bwrap_paths: Vec<PathBuf>,
     cgroup: bool,
+    parent_cgroup_limits: bool,
     probed: OnceLock<Probed>,
 }
 
@@ -168,6 +169,7 @@ impl Default for Bubblewrap {
         Bubblewrap {
             bwrap_paths: BWRAP_PATHS.iter().map(PathBuf::from).collect(),
             cgroup: true,
+            parent_cgroup_limits: false,
             probed: OnceLock::new(),
         }
     }
@@ -186,6 +188,15 @@ impl Bubblewrap {
     /// Never use cgroup limits, even when delegation works (rlimits only).
     pub fn without_cgroup(mut self) -> Self {
         self.cgroup = false;
+        self
+    }
+
+    /// The hardened service places this launcher in a system-scope cgroup
+    /// with per-job limits before invoking it. This prevents the normal
+    /// per-user systemd scope wrapper from nesting another cgroup.
+    pub(crate) fn under_hardened_cgroup(mut self) -> Self {
+        self.cgroup = false;
+        self.parent_cgroup_limits = true;
         self
     }
 
@@ -224,7 +235,7 @@ impl Bubblewrap {
             scope,
         };
         let mut unexpected = String::new();
-        match self_test(&tools, &mut unexpected) {
+        match self_test(&tools, self.parent_cgroup_limits, &mut unexpected) {
             Ok(list) => controls.extend(list),
             Err(e) => {
                 controls.push(("sandbox_self_test".into(), false));
@@ -284,6 +295,65 @@ impl SandboxBackend for Bubblewrap {
             ))),
         }
     }
+}
+
+fn in_hardened_system_scope(kind: &str) -> bool {
+    hardened_scope_cgroup_path(kind).is_some()
+}
+
+fn hardened_scope_cgroup_path(kind: &str) -> Option<String> {
+    let Ok(cgroup) = fs::read_to_string("/proc/self/cgroup") else {
+        return None;
+    };
+    cgroup.lines().find_map(|line| {
+        let Some(path) = line.strip_prefix("0::/") else {
+            return None;
+        };
+        let component = path.strip_prefix("system.slice/")?;
+        if valid_hardened_scope_name(component, kind) {
+            Some(component.to_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn hardened_cgroup_limits_fit(job: &JobSpec) -> bool {
+    let Some(unit) = hardened_scope_cgroup_path("job") else {
+        return false;
+    };
+    let root = Path::new("/sys/fs/cgroup/system.slice").join(unit);
+    let Some(memory) = read_numeric_limit(&root.join("memory.max")) else {
+        return false;
+    };
+    let Some(tasks) = read_numeric_limit(&root.join("pids.max")) else {
+        return false;
+    };
+    let Some(swap) = read_numeric_limit(&root.join("memory.swap.max")) else {
+        return false;
+    };
+    cgroup_limits_fit(memory, tasks, swap, job)
+}
+
+fn cgroup_limits_fit(memory: u64, tasks: u64, swap: u64, job: &JobSpec) -> bool {
+    let memory_limit = job
+        .limits
+        .memory_bytes
+        .unwrap_or(1024 * 1024 * 1024)
+        .max(64 * 1024 * 1024);
+    let task_limit = job.limits.max_processes.unwrap_or(256).clamp(1, 32768) as u64;
+    memory > 0 && memory <= memory_limit && tasks > 0 && tasks <= task_limit && swap == 0
+}
+
+fn read_numeric_limit(path: &Path) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn valid_hardened_scope_name(name: &str, kind: &str) -> bool {
+    let prefix = format!("f2c-hardened-{kind}-");
+    name.strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(".scope"))
+        .is_some_and(|random| random.len() == 32 && random.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn unavailable(controls: Vec<(String, bool)>, detail: String) -> Probed {
@@ -651,6 +721,15 @@ fn scope_command(scope: &Scope, limits: &JobLimits) -> Command {
 /// `host_env` is extra environment for the bwrap process itself (probe
 /// canary); `--clearenv` must keep it out of the sandbox.
 fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Result<JobOutcome> {
+    execute_controlled(tools, job, host_env, None)
+}
+
+fn execute_controlled(
+    tools: &Tools,
+    job: &JobSpec,
+    host_env: &[(&str, &str)],
+    watchdog_closed: Option<&AtomicBool>,
+) -> crate::Result<JobOutcome> {
     let ctl = JobCtl::create(job)?;
     let args = policy_args(tools, job, &ctl)?;
     ctl.watch.record(
@@ -709,7 +788,17 @@ fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Re
     let mut tripped = false;
     let waited = loop {
         match child.try_wait() {
+            // A proxy/watchdog event is authoritative even if the child exits
+            // after receiving the refusal response but before this poll.
+            Ok(Some(st)) if ctl.watch.tripped() => {
+                tripped = true;
+                break Ok(st);
+            }
             Ok(Some(st)) => break Ok(st),
+            Ok(None) if watchdog_closed.is_some_and(|closed| closed.load(Ordering::SeqCst)) => {
+                tripped = true;
+                break kill_tree(&mut child, &init_pid);
+            }
             Ok(None) if ctl.watch.tripped() => {
                 // A bait touch or a hard limit: stop the job now (FR-024, FR-020).
                 tripped = true;
@@ -762,6 +851,119 @@ fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Re
         exported: Vec::new(),
         report,
     })
+}
+
+/// Run an immutable service snapshot under the dedicated system account. The
+/// caller supplies the inherited watchdog read descriptor; this path never
+/// creates the user-scope wrapper used by the ordinary per-user backend.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_hardened(job: &JobSpec, watchdog_fd: i32) -> crate::Result<JobOutcome> {
+    run_hardened_with_ready(job, watchdog_fd, || Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_hardened_with_ready(
+    job: &JobSpec,
+    watchdog_fd: i32,
+    ready: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<JobOutcome> {
+    use std::os::fd::FromRawFd;
+
+    if watchdog_fd < 0 || unsafe { libc::fcntl(watchdog_fd, libc::F_GETFD) } < 0 {
+        return Err(crate::Error::rejected(
+            "hardened launcher watchdog descriptor is invalid",
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and returns the effective uid.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err(crate::Error::rejected(
+            "hardened launcher must run as an unprivileged system account",
+        ));
+    }
+    if !in_hardened_system_scope("job") {
+        return Err(crate::Error::rejected(
+            "hardened Linux launcher is outside its service-owned system scope",
+        ));
+    }
+    if !hardened_cgroup_limits_fit(job) {
+        return Err(crate::Error::rejected(
+            "hardened Linux system-scope cgroup limits do not match the immutable job snapshot",
+        ));
+    }
+
+    let watchdog = unsafe { std::fs::File::from_raw_fd(watchdog_fd) };
+    let watchdog_closed = Arc::new(AtomicBool::new(false));
+    let monitor_stop = Arc::new(AtomicBool::new(false));
+    let monitor_closed = Arc::clone(&watchdog_closed);
+    let monitor_stop_thread = Arc::clone(&monitor_stop);
+    let monitor = thread::Builder::new()
+        .name("f2c-hardened-watchdog".into())
+        .spawn(move || {
+            use std::os::fd::AsRawFd;
+            let fd = watchdog.as_raw_fd();
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+            while !monitor_stop_thread.load(Ordering::Acquire) {
+                // SAFETY: pollfd points to one live descriptor and has the
+                // correct count for the duration of this bounded wait.
+                let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
+                if result < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    monitor_closed.store(true, Ordering::SeqCst);
+                    return;
+                }
+                if result == 0 {
+                    continue;
+                }
+                if pollfd.revents & libc::POLLIN != 0 {
+                    let mut byte = 0u8;
+                    // SAFETY: byte is a writable one-byte destination.
+                    let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+                    if read != 1 || byte != 0 {
+                        monitor_closed.store(true, Ordering::SeqCst);
+                    }
+                    return;
+                }
+                if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    monitor_closed.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        })?;
+
+    let backend = Bubblewrap::default().under_hardened_cgroup();
+    let probed = backend.probe_now();
+    let result = match probed.tools {
+        Some(tools) if !watchdog_closed.load(Ordering::SeqCst) => {
+            ready().and_then(|()| execute_controlled(&tools, job, &[], Some(&watchdog_closed)))
+        }
+        Some(_) => Err(crate::Error::isolation_unavailable(
+            "service watchdog closed during hardened control probes",
+        )),
+        None => Err(crate::Error::isolation_unavailable(format!(
+            "hardened Linux controls are unavailable: {}",
+            probed.report.detail
+        ))),
+    };
+    monitor_stop.store(true, Ordering::Release);
+    monitor
+        .join()
+        .map_err(|_| crate::Error::internal("hardened watchdog monitor panicked"))?;
+    match result {
+        Ok(mut outcome) if watchdog_closed.load(Ordering::SeqCst) => {
+            outcome.status = JobStatus::Killed;
+            outcome
+                .report
+                .push(ActivityKind::Blocked, "service watchdog closed");
+            Ok(outcome)
+        }
+        other => other,
+    }
 }
 
 /// Place the status and marker pipes at fds 3 and 4 without CLOEXEC.
@@ -926,7 +1128,11 @@ fn probe_scope(bash: &Path) -> Option<Scope> {
 /// Run a real sandbox and verify each mandatory control from inside it.
 /// `diagnostic` receives any unexpected env keys, root entries or visible
 /// host paths, for the probe detail.
-fn self_test(tools: &Tools, diagnostic: &mut String) -> crate::Result<Vec<(String, bool)>> {
+fn self_test(
+    tools: &Tools,
+    parent_cgroup_limits: bool,
+    diagnostic: &mut String,
+) -> crate::Result<Vec<(String, bool)>> {
     let dir = tempfile::tempdir()?;
     let work = dir.path().canonicalize()?;
     let home = home_dir().unwrap_or_else(|| PathBuf::from("/nonexistent-home"));
@@ -1019,11 +1225,17 @@ fn self_test(tools: &Tools, diagnostic: &mut String) -> crate::Result<Vec<(Strin
     let nproc_ok = field("nproc") == [PROBE_NPROC.to_string()];
     controls.push((
         "process_limit".into(),
-        tools.scope.is_some() || (nproc_ok && !is_root),
+        tools.scope.is_some() || parent_cgroup_limits || (nproc_ok && !is_root),
     ));
     let as_ok = field("as") == [(PROBE_MEMORY / 1024).to_string()];
-    controls.push(("memory_limit".into(), tools.scope.is_some() || as_ok));
-    controls.push(("cgroup_v2_limits".into(), tools.scope.is_some()));
+    controls.push((
+        "memory_limit".into(),
+        tools.scope.is_some() || parent_cgroup_limits || as_ok,
+    ));
+    controls.push((
+        "cgroup_v2_limits".into(),
+        tools.scope.is_some() || parent_cgroup_limits,
+    ));
     Ok(controls)
 }
 
@@ -1069,5 +1281,65 @@ mod tests {
         let b = drain(Some(&b"xyz"[..]), budget).join().unwrap();
         assert_eq!(a, (b"0123456789".to_vec(), true));
         assert_eq!(b, (Vec::new(), true));
+    }
+
+    #[test]
+    fn hardened_scope_probe_rejects_user_scopes_and_malformed_names() {
+        assert!(valid_hardened_scope_name(
+            "f2c-hardened-job-0123456789abcdef0123456789abcdef.scope",
+            "job"
+        ));
+        assert!(valid_hardened_scope_name(
+            "f2c-hardened-probe-0123456789abcdef0123456789abcdef.scope",
+            "probe"
+        ));
+        for invalid in [
+            "f2c-hardened-job-0123456789abcdef0123456789abcdef.scope.extra",
+            "f2c-hardened-job-0123456789abcdef0123456789abcdeg.scope",
+            "f2c-hardened-probe-0123456789abcdef0123456789abcdef.scope",
+        ] {
+            assert!(!valid_hardened_scope_name(invalid, "job"), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn hardened_job_scope_limits_must_fit_the_snapshot_and_disable_swap() {
+        let td = tempfile::tempdir().unwrap();
+        let mut spec = JobSpec {
+            program: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+            cwd: td.path().to_path_buf(),
+            env: Vec::new(),
+            read_only: Vec::new(),
+            work_dir: td.path().to_path_buf(),
+            exports: Vec::new(),
+            export_to: None,
+            limits: JobLimits {
+                timeout: Duration::from_secs(1),
+                memory_bytes: Some(128 * 1024 * 1024),
+                max_processes: Some(16),
+                max_output_bytes: 1024,
+                disk_bytes: None,
+            },
+            network: NetworkMode::None,
+            bait: false,
+        };
+        assert!(cgroup_limits_fit(128 * 1024 * 1024, 16, 0, &spec));
+        assert!(cgroup_limits_fit(64 * 1024 * 1024, 8, 0, &spec));
+        assert!(!cgroup_limits_fit(129 * 1024 * 1024, 16, 0, &spec));
+        assert!(!cgroup_limits_fit(128 * 1024 * 1024, 17, 0, &spec));
+        assert!(!cgroup_limits_fit(128 * 1024 * 1024, 16, 1, &spec));
+        spec.limits.memory_bytes = None;
+        spec.limits.max_processes = None;
+        assert!(cgroup_limits_fit(1024 * 1024 * 1024, 256, 0, &spec));
+        assert!(!cgroup_limits_fit(1024 * 1024 * 1024 + 1, 256, 0, &spec));
+    }
+
+    #[test]
+    fn cgroup_limit_parser_rejects_unlimited_and_malformed_values() {
+        assert_eq!("536870912".parse::<u64>().ok(), Some(536870912));
+        assert_eq!("max".parse::<u64>().ok(), None);
+        assert_eq!("".parse::<u64>().ok(), None);
+        assert_eq!("-1".parse::<u64>().ok(), None);
     }
 }

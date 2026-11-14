@@ -21,7 +21,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
             ..Default::default()
         }),
         Action::Guarded(req) => {
-            let backend = fail2commit_core::sandbox::platform_backend();
+            let backend = fail2commit_core::sandbox::select_backend(&ctx.settings);
             let approval = ctx.approval();
             let progress =
                 super::progress_ui::ProgressUi::new(ctx.json, ctx.settings.ui.progress_window);

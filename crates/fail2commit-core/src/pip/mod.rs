@@ -555,7 +555,7 @@ fn review_and_apply(
     // when the user starts Python outside this command.
     crate::exec::authorize_scripts(
         ctx,
-        &*crate::sandbox::platform_backend(),
+        &*crate::sandbox::select_backend(ctx.settings),
         crate::policy::ScriptSituation {
             has_scripts: false,
             required: false,

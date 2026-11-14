@@ -76,6 +76,8 @@ enum Command {
     Run(cmd::run::Args),
     /// Sandbox on / off / status (T-008).
     Sandbox(cmd::sandbox::Args),
+    /// Install, inspect or remove hardened system sandbox mode (FR-027).
+    Hardened(cmd::hardened::Args),
     /// npm registry signing keys: `forget <registry-url>` re-trusts a registry (CR-018).
     Signatures(cmd::signatures::Args),
     /// Windows, administrators: guard machine-wide npm and pip (CR-013).
@@ -134,6 +136,87 @@ fn main() -> ExitCode {
         return exit(cmd::api::run());
     }
     let json = cli.json;
+    if let Command::Sandbox(args) = &cli.command {
+        match &args.action {
+            cmd::sandbox::Action::Serve => return exit(cmd::sandbox::serve().map_or(70, |_| 0)),
+            cmd::sandbox::Action::EgressProbe => {
+                return exit(
+                    fail2commit_core::sandbox::hardened::run_network_effect_probe_child()
+                        .map_or(70, |_| 0),
+                );
+            }
+            #[cfg(target_os = "linux")]
+            cmd::sandbox::Action::HardenedProbe { watchdog } => {
+                return exit(
+                    fail2commit_core::sandbox::hardened::run_linux_watchdog_probe(*watchdog)
+                        .map_or(70, |_| 0),
+                );
+            }
+            #[cfg(target_os = "linux")]
+            cmd::sandbox::Action::HardenedEgressProbe {
+                expected_uid,
+                bait_trip,
+                platform_only,
+            } => {
+                return exit(
+                    fail2commit_core::sandbox::hardened::run_linux_egress_probe_child(
+                        *expected_uid,
+                        *bait_trip,
+                        *platform_only,
+                    )
+                    .map_or(70, |_| 0),
+                );
+            }
+            #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
+            cmd::sandbox::Action::Launch {
+                jobfile,
+                watchdog,
+                prepare_request,
+                prepare_ack,
+                launch_id,
+                test_diagnostic,
+            } => {
+                let result = if *test_diagnostic {
+                    cmd::sandbox::launch_test_diagnostic(
+                        jobfile,
+                        *watchdog,
+                        *prepare_request,
+                        *prepare_ack,
+                        launch_id.as_deref(),
+                    )
+                } else {
+                    cmd::sandbox::launch(
+                        jobfile,
+                        *watchdog,
+                        *prepare_request,
+                        *prepare_ack,
+                        launch_id.as_deref(),
+                    )
+                };
+                return exit(result.map_or(70, |_| 0));
+            }
+            #[cfg(not(all(feature = "hardened-test-diagnostics", debug_assertions)))]
+            cmd::sandbox::Action::Launch {
+                jobfile,
+                watchdog,
+                prepare_request,
+                prepare_ack,
+                launch_id,
+            } => {
+                return exit(
+                    cmd::sandbox::launch(
+                        jobfile,
+                        *watchdog,
+                        *prepare_request,
+                        *prepare_ack,
+                        launch_id.as_deref(),
+                    )
+                    .map_or(70, |_| 0),
+                );
+            }
+            _ => {}
+        }
+    }
     let response = execute(cli, None);
     cmd::print_response(&response, json);
     exit(response.exit_status())
@@ -158,6 +241,7 @@ pub fn execute(cli: Cli, id: Option<String>) -> Response {
         Command::Rules(a) => cmd::rules::run(&ctx, a),
         Command::Run(a) => cmd::run::run(&ctx, a),
         Command::Sandbox(a) => cmd::sandbox::run(&ctx, a),
+        Command::Hardened(a) => cmd::hardened::run(&ctx, a),
         Command::Signatures(a) => cmd::signatures::run(&ctx, a),
         Command::MachineShims(a) => cmd::machine::run(&ctx, a),
         Command::Password(a) => cmd::password::run(&ctx, a),

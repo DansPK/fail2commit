@@ -1,0 +1,13 @@
+[Unit]
+Description=Fail2commit hardened sandbox control socket
+
+[Socket]
+ListenStream=/run/fail2commit-hardened/sock
+SocketMode=0600
+SocketUser=@INSTALLER_UID@
+DirectoryMode=0755
+Accept=no
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
