@@ -14,7 +14,7 @@ pkgdesc='Guards Git pushes and npm/pip installs with explicit, operation-bound a
 arch=('x86_64')
 url='https://github.com/DansPK/fail2commit'
 license=('Apache-2.0') # bundled crate licences: THIRD-PARTY-NOTICES.md
-depends=('gcc-libs' 'glibc' 'git' 'bubblewrap')
+depends=('gcc-libs' 'glibc' 'git' 'bubblewrap' 'acl' 'util-linux' 'systemd')
 makedepends=('cargo')
 optdepends=('nodejs: guarded npm installs'
             'npm: guarded npm installs'
@@ -46,9 +46,12 @@ check() {
 package() {
   cd "$pkgname-$pkgver-src"
   install -Dm755 target/release/fail2commit "$pkgdir/usr/bin/fail2commit"
+  install -Dm755 target/release/f2c-sandbox-relay "$pkgdir/usr/bin/f2c-sandbox-relay"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
   install -Dm644 THIRD-PARTY-NOTICES.md "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.md"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 docs/install.md "$pkgdir/usr/share/doc/$pkgname/install.md"
+  install -Dm644 packaging/linux/fail2commit-hardened.socket "$pkgdir/usr/share/fail2commit/templates/fail2commit-hardened.socket"
+  install -Dm644 packaging/linux/fail2commit-hardened.service "$pkgdir/usr/share/fail2commit/templates/fail2commit-hardened.service"
 }

@@ -483,6 +483,26 @@ mod linux {
         let src = std::env::current_exe()?.canonicalize()?;
         let bin_dir = Path::new(LINUX_BIN_DIR);
         let installed_exe = bin_dir.join("fail2commit");
+        let relay_src = src
+            .parent()
+            .ok_or_else(|| crate::Error::integrity("CLI executable has no parent directory"))?
+            .join("f2c-sandbox-relay");
+        let relay_exe = bin_dir.join("f2c-sandbox-relay");
+        let relay_meta = std::fs::symlink_metadata(&relay_src).map_err(|error| {
+            crate::Error::isolation_unavailable(format!(
+                "hardened Linux install requires the packaged f2c-sandbox-relay beside the CLI: {error}"
+            ))
+        })?;
+        if !relay_meta.is_file()
+            || relay_meta.file_type().is_symlink()
+            || relay_meta.uid() != 0
+            || relay_meta.mode() & 0o022 != 0
+            || relay_meta.mode() & 0o111 == 0
+        {
+            return Err(crate::Error::integrity(
+                "hardened Linux relay is not a trusted executable",
+            ));
+        }
         let state_path = Path::new(LINUX_STATE);
         let state_tmp = state_path.with_extension("json.new");
         let socket_unit = Path::new(LINUX_UNIT_DIR).join("fail2commit-hardened.socket");
@@ -525,6 +545,9 @@ mod linux {
             uid_range.1,
         )?;
         let result = (|| {
+            // Publish ownership before creating any install artifacts so the
+            // common idempotent uninstall path can roll them back on failure.
+            write_state_at(state_path, &state)?;
             std::fs::create_dir_all(bin_dir)?;
             let tmp = bin_dir.join("fail2commit.new");
             let mut file = std::fs::OpenOptions::new()
@@ -536,6 +559,16 @@ mod linux {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
             file.sync_all()?;
             std::fs::rename(&tmp, &installed_exe)?;
+            let relay_tmp = bin_dir.join("f2c-sandbox-relay.new");
+            let mut relay_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&relay_tmp)?;
+            std::io::copy(&mut std::fs::File::open(&relay_src)?, &mut relay_file)?;
+            std::fs::set_permissions(&relay_tmp, std::fs::Permissions::from_mode(0o755))?;
+            relay_file.sync_all()?;
+            std::fs::rename(&relay_tmp, &relay_exe)?;
             persist_uid_before_create(
                 &mut state,
                 planned_uid,

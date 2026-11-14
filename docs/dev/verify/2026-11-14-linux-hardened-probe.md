@@ -1,62 +1,33 @@
-# FR-027 / SPEC-018 Linux hardened probe implementation
+# FR-027 / SPEC-018 Linux hardened source and glue status
 
-Date: 2026-11-14  
-Branch: child worktree `f2c-014-hardened`  
-Base: `4bf0004e1712781637e4a2c6556989d897b8a6f7`
+Date: 2026-11-14. Branch: `f2c-014-hardened`; implementation base: `c80f2c51073ff6999190fe220391428373efb4a9`.
 
-## Implemented
+## Implemented in source, not runtime verified
 
-- The authenticated root service handles only a fixed `PROBE` request. It verifies the kernel
-  peer UID against the recorded installer, verifies the installed sandbox account and trusted
-  service executable/tools, and runs the installed launcher with fixed platform, network-effect,
-  bait-trip and watchdog fixtures. The caller supplies no command, path, environment or URI.
-- A passing platform probe requires the real system-scope launcher, account identity, immutable
-  fixed job snapshot, Bubblewrap, read-only fixture, writable stage, resource controls, watchdog
-  cancellation and confirmed scope cleanup. A passing network probe additionally requires public
-  HTTP proxy access, direct IPv4/IPv6 TCP, DNS/UDP and listen refusal, private/metadata/loopback
-  proxy refusal, and a bait-triggered killed outcome with no exports.
-- Normal Internet launches remain rejected unless the complete service-owned network probe has
-  passed. The platform and network results are reported separately; a service/unit file alone
-  cannot set either result.
-- Caller stage trees and every descendant must be owned by the authenticated peer. Root-owned
-  inaccessible descendants are rejected before any ACL mutation. ACL journals use staged,
-  synced, no-replace publication, retryable cleanup, exact-object recovery, and durable probe-scope
-  markers. Marker removal requires successful kill and exact inactive-state readback; failures
-  retain the refusal marker for service recovery.
+- Root service accepts a fixed authenticated `PROBE` request, validates the recorded installer UID and installed sandbox account, and runs fixed launcher/platform/network/bait/watchdog fixtures. Caller requests cannot supply a command, environment, or URI.
+- Backend activation remains fail-closed: Internet jobs require service, peer-authentication, platform, and network-effect probe success. `hardened status` now performs that service probe, reports individual controls and details, and the CLI includes the failure detail.
+- Linux status now requires the read-only fixture to reside on a kernel-reported read-only mount; its DAC mode alone cannot satisfy the control.
+- Hardened installation copies the trusted packaged `f2c-sandbox-relay` beside the installed executable. Debian and Arch packages include that sibling. Unit templates are shipped under `/usr/share/fail2commit/templates`, not systemd's live unit search path; install renders installer-specific values into the active units.
+- The Debian guest native library check passed after the mount-flag type correction. See exact commands below.
 
-## Verification evidence
+## Still missing or blocked
 
-Host build: `cargo check -p fail2commit --locked` — exit 0 (Windows host; Linux-only code is not
-compiled by this check). `git diff --check` — exit 0.
+- Sol review LP01 remains open: validate the authenticated caller's effective read/traverse access on every caller-supplied ancestor before any root ACL mutation, using kernel-backed peer UID/GID and supplementary groups. Root-owned ancestor owner checks are insufficient.
+- Sol review LP02 remains open: retain every journaled temporary target through scope death and exact ACL restoration, then delete it; production recovery/retry needs a failure-injection test.
+- Root service/account installation and the full system-scope, ACL effect, bwrap/seccomp/network, bait cancellation, and crash-recovery probes were not run. `sudo -n true` in the authorized Debian guest exited 1 with `sudo: a password is required` as UID 1000; no credentials were guessed and no privileged guest or host state was changed.
+- Windows runtime effect-probe review and Linux privileged runtime gates remain pending. This is not a full FR-027 completion report and the backend must stay unavailable when any required effect is absent.
 
-Native guest: Debian VM `debian-f2c`, user `dev` UID 1000, Rust `1.100.0`; source staged at
-`/home/dev/.cache/f2c-linux-launcher-20261114/source`. To limit guest disk usage, tests used
-`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_TEST_DEBUG=0`, and
-`CARGO_PROFILE_DEV_DEBUG=0` with target directory
-`/home/dev/.cache/f2c-linux-launcher-20261114/target`.
+## Verification
 
-| Command | Result |
-| --- | --- |
-| `cargo check -p fail2commit --locked` | exit 0 |
-| `cargo test -p fail2commit-core --lib sandbox::hardened::linux_acl::tests --locked` | exit 0; 8 passed, 1 ignored (root-only ownership fixture) |
-| `cargo test -p fail2commit-core --lib sandbox::hardened::service::tests --locked` | exit 0; 27 passed |
-| `cargo test -p fail2commit-core --lib sandbox::linux::proxy::tests --locked` | exit 0; 4 passed |
-| `cargo test -p fail2commit-core --lib sandbox::egress::tests --locked` | exit 0; 2 passed |
+Guest: Debian `debian-f2c`, source at `/home/dev/.cache/f2c-linux-launcher-20261114/source`, Rust `1.100.0`, target at `/home/dev/.cache/f2c-linux-launcher-20261114/target`.
 
-The ACL tests include partial-write/file-sync/publication/parent-sync fault injection, cleanup
-retry, preservation of a pre-existing colliding journal, peer-owner policy, and path-substitution
-rejection. Service tests require real effect events and a killed bait outcome, and inject failed
-watchdog kill/inactive-readback paths.
+| Command | Exit/result |
+|---|---|
+| `cargo check -p fail2commit-core --lib --locked` (native Debian guest, `CARGO_INCREMENTAL=0`, dev debug info disabled) | 0; four existing dead-code warnings |
+| `cargo check -p fail2commit --locked` (native Debian guest, `CARGO_INCREMENTAL=0`, dev debug info disabled) | 0; same four warnings |
+| `cargo test -p fail2commit-core --lib sandbox::hardened::service::tests --locked` | 0; 28 passed, 0 failed, 247 filtered |
+| `git diff --check` | 0 |
 
-## Pending runtime gates
+## Integration notes for manager
 
-No root-installed service or sandbox job was run. On the authorized Debian guest,
-`sudo -n true` returned exit 1 (`sudo: a password is required`) as `dev` UID 1000; credentials were
-not guessed and no guest or host privileged state was changed. The root-only root-owned-descendant
-ACL test remains ignored, and actual root service/account installation, scope/cgroup effect probes,
-Bubblewrap+seccomp filesystem/network effects, bait cancellation, cleanup-after-crash, and Internet
-activation remain unverified. Until those exact installed-service probes pass, the backend must
-continue to report unavailable and must reject Internet jobs.
-
-Remaining beyond this Linux code milestone: complete Windows runtime probe/review gates and finish
-the broader FR-027 release review; this report does not claim FR-027 is complete.
+The child and manager branches diverge from `db4e07497110f46a96ff0eb52857e8728dab669d`; manager FR-013 source through `ce550df` is not integrated here. Shared paths requiring manual preservation during integration are `crates/fail2commit-core/src/pip/mod.rs`, `crates/fail2commit/Cargo.toml`, `crates/fail2commit/src/cmd/mod.rs`, `crates/fail2commit/src/cmd/npm.rs`, and `crates/fail2commit/src/main.rs`. Preserve manager progress UI/seams and this branch's hardened features, command routing, backend selection, package assets, and relay install behavior; do not merge this child branch wholesale over the manager tree.

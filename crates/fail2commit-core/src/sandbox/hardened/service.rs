@@ -1412,6 +1412,11 @@ pub(super) fn run_linux_egress_probe_child(
         .ok_or_else(|| crate::Error::integrity("Linux probe work path has no parent"))?
         .join("readonly")
         .join("probe.txt");
+    if !linux_mount_is_read_only(&read_only_file)? {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux service probe read-only fixture is not on a read-only mount",
+        ));
+    }
     if std::fs::read(&read_only_file)? != b"f2c-hardened-readonly-probe\n" {
         return Err(crate::Error::isolation_unavailable(
             "Linux service probe cannot read its peer-owned read-only fixture",
@@ -1558,6 +1563,20 @@ pub(super) fn run_linux_egress_probe_child(
     }
     std::io::stdout().write_all(b"F2C-LINUX-EFFECT-PROBE-PASS\n")?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_mount_is_read_only(path: &Path) -> crate::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| crate::Error::rejected("probe fixture path contains NUL"))?;
+    // SAFETY: statvfs receives a valid NUL-terminated path and writable struct.
+    let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut info) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(info.f_flag & libc::ST_RDONLY as u64 != 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -6878,5 +6897,14 @@ mod tests {
         )
         .is_err());
         assert!(stop_and_confirm_linux_scope_with(unit, |_| Ok(()), |_, _| Ok(true)).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_read_only_mount_check_rejects_writable_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture");
+        std::fs::write(&path, b"probe").unwrap();
+        assert!(!linux_mount_is_read_only(&path).unwrap());
     }
 }

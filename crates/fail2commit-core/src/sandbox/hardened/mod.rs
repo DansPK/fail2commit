@@ -36,7 +36,62 @@ pub fn uninstall() -> crate::Result<serde_json::Value> {
     lifecycle::uninstall()
 }
 pub fn status() -> serde_json::Value {
-    lifecycle::status()
+    let mut status = lifecycle::status();
+    if status["installed"] != true || status.get("error").is_some() {
+        return status;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let (service, peer_auth, platform, network, detail) = service::probe_linux();
+        let available = service && peer_auth && platform && network;
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert("service_running".into(), serde_json::json!(service));
+            fields.insert("peer_authenticated".into(), serde_json::json!(peer_auth));
+            fields.insert("platform_probe_available".into(), serde_json::json!(platform));
+            fields.insert("network_probe_available".into(), serde_json::json!(network));
+            fields.insert("probe_available".into(), serde_json::json!(available));
+            fields.insert(
+                "controls".into(),
+                serde_json::json!({
+                    "service_running": service,
+                    "peer_authentication": peer_auth,
+                    "launcher_watchdog_and_platform": platform,
+                    "shared_egress_effects": network,
+                }),
+            );
+            fields.insert("detail".into(), serde_json::json!(detail));
+        }
+        return status;
+    }
+
+    #[cfg(windows)]
+    {
+        let (service, peer_auth, effect_probe, detail) = service::probe_windows();
+        let available = service && peer_auth && effect_probe;
+        if let Some(fields) = status.as_object_mut() {
+            fields.insert("service_running".into(), serde_json::json!(service));
+            fields.insert("peer_authenticated".into(), serde_json::json!(peer_auth));
+            fields.insert("probe_available".into(), serde_json::json!(available));
+            fields.insert("effect_probe_passed".into(), serde_json::json!(effect_probe));
+            fields.insert(
+                "controls".into(),
+                serde_json::json!({
+                    "service_running": service,
+                    "peer_authentication": peer_auth,
+                    "wfp_lpac_traffic_effects": effect_probe,
+                }),
+            );
+            fields.insert("detail".into(), serde_json::json!(detail));
+        }
+        return status;
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        status["probe_available"] = serde_json::json!(false);
+        status
+    }
 }
 
 pub fn serve() -> crate::Result<()> {

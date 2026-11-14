@@ -37,7 +37,7 @@ sudo dpkg --purge fail2commit
 ```
 
 The package contains no maintainer scripts and never edits a home directory.
-It installs `/usr/bin/fail2commit` and documentation under
+It installs `/usr/bin/fail2commit`, `/usr/bin/f2c-sandbox-relay`, and documentation under
 `/usr/share/doc/fail2commit`. Debian/Ubuntu architectures other than amd64 are
 not supplied as binary packages.
 
@@ -65,7 +65,7 @@ makepkg -si
 The package depends on `git` and `bubblewrap`; `nodejs`/`npm` and `python`
 are optional and only needed for the matching guards. It has no install
 scriptlet and never edits a home directory: it installs
-`/usr/bin/fail2commit`, licenses under `/usr/share/licenses/fail2commit` and
+`/usr/bin/fail2commit`, `/usr/bin/f2c-sandbox-relay`, licenses under `/usr/share/licenses/fail2commit` and
 documentation under `/usr/share/doc/fail2commit`. Run `fail2commit sandbox
 status` from a normal login session: the cgroup v2 job limits need your
 systemd user manager.
@@ -78,6 +78,21 @@ sudo pacman -R fail2commit
 ```
 
 ## Linux source archive
+
+### Optional hardened Linux service
+
+On systemd Linux with root access, install the packaged CLI and relay first,
+then run `sudo fail2commit hardened install` from the installing user's
+session. Use `fail2commit hardened status` to inspect installation and the
+mandatory platform/network self-tests. If status reports unavailable, guarded
+Internet jobs stay refused; do not select the hardened backend for jobs until
+the reported controls pass. Remove the service with
+`sudo fail2commit hardened uninstall`; this stops its socket/service and
+removes only the account, files, and units recorded by that install.
+
+This release's hardened path requires Linux systemd, Bubblewrap, `setpriv`,
+POSIX ACL tools (`getfacl`/`setfacl`), and the packaged sibling
+`f2c-sandbox-relay`. Package installation alone does not activate it.
 
 The source archive contains `Cargo.lock`, vendored crates, and Cargo source
 replacement configuration. A Rust 1.x toolchain and native C build tools are

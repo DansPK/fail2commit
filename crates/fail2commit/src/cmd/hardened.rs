@@ -45,8 +45,14 @@ pub fn run(_ctx: &Ctx, args: Args) -> CmdResult {
                 return Err(Error::rejected("hardened mode is not installed"));
             }
             if data["probe_available"] != true {
+                let detail = data["detail"]
+                    .as_str()
+                    .filter(|detail| !detail.is_empty())
+                    .unwrap_or("mandatory controls are unavailable");
                 return Err(Error::isolation_unavailable(
-                    "hardened mode is installed but its mandatory probe controls did not pass",
+                    format!(
+                        "hardened mode is installed but unavailable: {detail}"
+                    ),
                 ));
             }
             Ok(Outcome {

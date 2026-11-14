@@ -33,8 +33,9 @@ depends = "$auto"
 extended-description = "Guards Git pushes and package installs with explicit, operation-bound approval. Per-user hooks and shims are installed only by fail2commit setup."
 assets = [
     ["target/release/fail2commit", "usr/bin/", "755"],
-    ["../../packaging/linux/fail2commit-hardened.socket", "lib/systemd/system/fail2commit-hardened.socket", "644"],
-    ["../../packaging/linux/fail2commit-hardened.service", "lib/systemd/system/fail2commit-hardened.service", "644"],
+    ["target/release/f2c-sandbox-relay", "usr/bin/", "755"],
+    ["../../packaging/linux/fail2commit-hardened.socket", "usr/share/fail2commit/templates/fail2commit-hardened.socket", "644"],
+    ["../../packaging/linux/fail2commit-hardened.service", "usr/share/fail2commit/templates/fail2commit-hardened.service", "644"],
     ["../../README.md", "usr/share/doc/fail2commit/README.md", "644"],
     ["../../docs/install.md", "usr/share/doc/fail2commit/install.md", "644"],
     ["../../docs/dev/release.md", "usr/share/doc/fail2commit/release.md", "644"],
