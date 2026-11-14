@@ -14,6 +14,7 @@ pub(crate) mod egress;
 pub mod hardened;
 pub mod netpolicy;
 pub mod report;
+mod vm;
 pub(crate) mod vm_guest;
 
 #[cfg(target_os = "linux")]
@@ -45,8 +46,12 @@ pub fn platform_backend() -> Box<dyn SandboxBackend> {
 /// Backend selected by trusted sandbox settings. `auto` uses hardened mode
 /// whenever its machine install marker exists; an unhealthy install is kept
 /// selected so `run_job` fails closed rather than dropping to the platform
-/// default. `vm` remains the SPEC-019 fallback until that feature lands.
+/// default. VM selection is explicit and applies only the specified
+/// hardware/feature-absence fallback.
 pub fn select_backend(settings: &crate::settings::Settings) -> Box<dyn SandboxBackend> {
+    if settings.sandbox.backend == crate::settings::BackendChoice::Vm {
+        return vm::selected();
+    }
     hardened::selected(settings).unwrap_or_else(platform_backend)
 }
 
