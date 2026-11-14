@@ -2,6 +2,10 @@
 
 use crate::isolation::{JobOutcome, JobSpec, ProbeReport, SandboxBackend};
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+mod prepare;
 #[cfg(windows)]
 mod windows;
 
@@ -9,8 +13,45 @@ pub(crate) fn selected() -> Box<dyn SandboxBackend> {
     #[cfg(windows)]
     return windows::selected();
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    return linux::selected();
+
+    #[cfg(not(any(windows, target_os = "linux")))]
     Box::new(UnavailableVm)
+}
+
+/// Prepare the root-owned Linux VM image. Other platforms do not need this
+/// command and refuse instead of creating placeholder state.
+pub fn prepare() -> crate::Result<String> {
+    #[cfg(target_os = "linux")]
+    return prepare::prepare();
+
+    #[cfg(not(target_os = "linux"))]
+    Err(crate::Error::rejected(
+        "VM preparation is supported only on Linux",
+    ))
+}
+
+/// Report the Linux VM preparation and probe state without starting a VM.
+pub fn status() -> crate::Result<String> {
+    #[cfg(target_os = "linux")]
+    return prepare::status();
+
+    #[cfg(not(target_os = "linux"))]
+    Err(crate::Error::rejected(
+        "VM status is supported only on Linux",
+    ))
+}
+
+/// Remove only the Linux VM image and state files owned by this feature.
+pub fn remove() -> crate::Result<String> {
+    #[cfg(target_os = "linux")]
+    return prepare::remove();
+
+    #[cfg(not(target_os = "linux"))]
+    Err(crate::Error::rejected(
+        "VM image removal is supported only on Linux",
+    ))
 }
 
 /// A documented absence falls back to the platform backend. Every other probe
@@ -21,7 +62,7 @@ pub(crate) struct PlatformFallback {
 }
 
 impl PlatformFallback {
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, target_os = "linux", test))]
     fn new(backend: Box<dyn SandboxBackend>, reason: impl Into<String>) -> Self {
         Self {
             backend,
@@ -45,10 +86,10 @@ impl SandboxBackend for PlatformFallback {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 struct UnavailableVm;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 impl SandboxBackend for UnavailableVm {
     fn probe(&self) -> ProbeReport {
         ProbeReport {

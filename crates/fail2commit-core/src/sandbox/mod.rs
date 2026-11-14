@@ -17,6 +17,10 @@ pub mod report;
 mod vm;
 pub(crate) mod vm_guest;
 
+/// `fail2commit vm prepare | status | remove` (FR-029, SPEC-019). Linux owns
+/// the QEMU/KVM image lifecycle; other platforms refuse without creating state.
+pub use vm::{prepare as vm_prepare, remove as vm_remove, status as vm_status};
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]

@@ -78,6 +78,9 @@ enum Command {
     Sandbox(cmd::sandbox::Args),
     /// Install, inspect or remove hardened system sandbox mode (FR-027).
     Hardened(cmd::hardened::Args),
+    /// Prepare, inspect or remove the Linux QEMU/KVM VM sandbox image (FR-029).
+    #[cfg(target_os = "linux")]
+    Vm(cmd::vm::Args),
     /// npm registry signing keys: `forget <registry-url>` re-trusts a registry (CR-018).
     Signatures(cmd::signatures::Args),
     /// Windows, administrators: guard machine-wide npm and pip (CR-013).
@@ -248,6 +251,8 @@ pub fn execute(cli: Cli, id: Option<String>) -> Response {
         Command::Run(a) => cmd::run::run(&ctx, a),
         Command::Sandbox(a) => cmd::sandbox::run(&ctx, a),
         Command::Hardened(a) => cmd::hardened::run(&ctx, a),
+        #[cfg(target_os = "linux")]
+        Command::Vm(a) => cmd::vm::run(&ctx, a),
         Command::Signatures(a) => cmd::signatures::run(&ctx, a),
         Command::MachineShims(a) => cmd::machine::run(&ctx, a),
         Command::Password(a) => cmd::password::run(&ctx, a),

@@ -21,3 +21,13 @@ reports whether every mandatory platform and network effect probe passes, and
 `sudo fail2commit hardened uninstall` removes only recorded service resources.
 An installed service whose probe is unavailable remains fail-closed; do not
 use hardened Internet jobs until status reports availability.
+
+The optional disposable VM backend (FR-029, `sandbox.backend = "vm"`) bundles
+nothing extra: it uses the host kernel and host binaries. Its runtime
+dependencies are optional and must be installed by the operator:
+`qemu-system-x86_64` (with the `microvm` machine and `virtio-9p-device` /
+`virtio-net-device` MMIO devices), `busybox`, and `/dev/kvm` access for the
+invoking user. `sudo fail2commit vm prepare` assembles the root-owned initramfs
+once; `fail2commit vm status` reports it and `sudo fail2commit vm remove`
+deletes it. Without KVM the backend falls back to the platform default; without
+preparation it fails closed. See `docs/sandbox-linux.md` §5.

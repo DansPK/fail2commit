@@ -18,6 +18,8 @@ pub mod secrets;
 pub mod server;
 pub mod setup;
 pub mod signatures;
+#[cfg(target_os = "linux")]
+pub mod vm;
 
 use fail2commit_core::approval::ApprovalCtx;
 use fail2commit_core::approver::ApproverChoice;
