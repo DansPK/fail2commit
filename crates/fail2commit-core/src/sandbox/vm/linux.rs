@@ -1047,6 +1047,7 @@ mod tests {
                 host: format!("/x{i}").into(),
                 tag: format!("t{i}"),
                 read_only: true,
+                fd: None,
             });
         }
         // 11 shares + 1 network exceeds the 8-device microvm limit.
