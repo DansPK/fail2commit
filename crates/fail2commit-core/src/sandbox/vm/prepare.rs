@@ -16,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -692,31 +693,26 @@ pub(super) fn contain_group(
     }
 }
 
-/// Convenience used by the query path: contain the still-unreaped child and
-/// surface any uncertainty as an error.
-pub(super) fn stop_group_result(child: &mut Child) -> crate::Result<()> {
-    let pgid = child.id() as i32;
-    match contain_group(Some(child), pgid, Instant::now() + CONTROL_GRACE) {
-        Containment::Confirmed => Ok(()),
-        Containment::Unconfirmed { live } => Err(Error::isolation_unavailable(format!(
-            "the process group did not stop cleanly (live pids: {live:?})"
-        ))),
-    }
-}
-
 fn run_bounded(exe: &Path, args: &[&str]) -> crate::Result<String> {
     run_bounded_with_grace(exe, args, CONTROL_GRACE)
 }
 
-/// Bounded QEMU capability query (LV-06). The whole owned process group is
-/// deadline-bound, stdout is cap-drained concurrently (a full pipe must never
-/// block the child), and reader completion is bounded too (a descendant may
-/// hold the pipe after the leader exits). Kill/wait failures are surfaced, not
-/// ignored. The output cap alone is not a time bound; the deadlines are.
+/// Bounded QEMU capability query (LV-06, R2-02). One absolute whole-query
+/// deadline bounds the leader wait, the output drain, and group cleanup:
+/// stdout is set nonblocking and drained by the owning loop itself in bounded
+/// chunks with a deadline check every iteration, so no detached reader can
+/// be left blocked on a descendant-held pipe. The last quarter of the budget
+/// (minimum 50 ms) is reserved so cleanup still completes inside the
+/// advertised bound even when the leader exits near the deadline. Cleanup
+/// uncertainty is surfaced, and every path is bounded by that one deadline.
 fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::Result<String> {
     let deadline = Instant::now()
         .checked_add(grace)
         .ok_or_else(|| Error::isolation_unavailable("qemu query deadline cannot be represented"))?;
+    let reserve = (grace / 4).max(Duration::from_millis(50));
+    let leader_deadline = deadline.checked_sub(reserve).ok_or_else(|| {
+        Error::isolation_unavailable("qemu query cleanup reserve cannot be represented")
+    })?;
     let mut child = Command::new(exe)
         .args(args)
         .stdin(Stdio::null())
@@ -725,63 +721,125 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
         .process_group(0)
         .spawn()
         .map_err(|e| Error::isolation_unavailable(format!("start {}: {e}", exe.display())))?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    // Cap-drain on a thread so a verbose response cannot fill the pipe and
-    // block the child, and keep counting past the cap to detect oversize.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let mut total = 0usize;
-        let mut buf = [0u8; 16 * 1024];
-        let mut r = stdout;
-        loop {
-            match r.read(&mut buf) {
-                Ok(0) => break,
+    let pgid = child.id() as i32;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    // Caller-owned nonblocking drain (R2-02): the loop reads continuously so
+    // a full pipe never blocks the child, and a retained descendant cannot
+    // block the caller because reads return only what is ready.
+    // SAFETY: F_GETFL/F_SETFL on the read end of our own pipe; only
+    // O_NONBLOCK is added.
+    let fl = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+    if fl < 0
+        || unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0
+    {
+        let containment = contain_group(Some(&mut child), pgid, deadline);
+        return Err(Error::isolation_unavailable(format!(
+            "cannot set nonblocking qemu query pipe (containment: {:?})",
+            containment
+        )));
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut total = 0usize;
+    let mut eof = false;
+    let mut buf = [0u8; 16 * 1024];
+
+    fn drain(
+        stdout: &mut impl Read,
+        buf: &mut [u8],
+        out: &mut Vec<u8>,
+        total: &mut usize,
+        eof: &mut bool,
+        stop_at: Instant,
+    ) {
+        while !*eof {
+            match stdout.read(buf) {
+                Ok(0) => *eof = true,
                 Ok(n) => {
-                    total = total.saturating_add(n);
+                    *total = total.saturating_add(n);
                     if out.len() <= MAX_QUERY_OUTPUT {
                         let keep = n.min(MAX_QUERY_OUTPUT + 1 - out.len());
                         out.extend_from_slice(&buf[..keep]);
                     }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(_) => *eof = true,
+            }
+            if Instant::now() >= stop_at {
+                break;
             }
         }
-        let _ = tx.send((out, total));
-    });
-    // Wait for the leader within the deadline.
+    }
+
     let status = loop {
+        drain(
+            &mut stdout,
+            &mut buf,
+            &mut out,
+            &mut total,
+            &mut eof,
+            deadline,
+        );
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-            Ok(None) => {
-                let cleanup = stop_group_result(&mut child);
-                return Err(Error::isolation_unavailable(format!(
-                    "qemu query timed out{}",
-                    cleanup_suffix(cleanup)
-                )));
-            }
+            Ok(None) => {}
             Err(e) => {
-                let cleanup = stop_group_result(&mut child);
+                let containment = contain_group(Some(&mut child), pgid, deadline);
                 return Err(Error::isolation_unavailable(format!(
-                    "wait for qemu query: {e}{}",
-                    cleanup_suffix(cleanup)
+                    "wait for qemu query: {e} (containment: {containment:?})"
                 )));
             }
         }
+        if Instant::now() >= leader_deadline {
+            // Stop the still-running leader now so containment and the final
+            // drain complete within the single advertised deadline.
+            let containment = contain_group(Some(&mut child), pgid, deadline);
+            drain(
+                &mut stdout,
+                &mut buf,
+                &mut out,
+                &mut total,
+                &mut eof,
+                deadline,
+            );
+            return Err(Error::isolation_unavailable(match containment {
+                Containment::Confirmed => "qemu query timed out".to_owned(),
+                Containment::Unconfirmed { live } => {
+                    format!("qemu query timed out; cleanup unconfirmed (live pids {live:?})")
+                }
+            }));
+        }
+        std::thread::sleep(POLL_INTERVAL);
     };
-    // The leader exited; descendants may still hold stdout. Stop the whole
-    // group so the reader gets EOF, then bound reader completion and surface
-    // any cleanup uncertainty.
-    let cleanup = stop_group_result(&mut child);
-    let received = rx.recv_timeout(grace);
-    cleanup?;
-    let (out, total) = received.map_err(|_| {
-        Error::isolation_unavailable(
-            "qemu query output reader did not finish after the process group was stopped",
-        )
-    })?;
+    // The leader exited and was reaped by try_wait, so only exact-pid kills
+    // are safe from here. Containment and the final drain share the deadline.
+    let containment = contain_group(None, pgid, deadline);
+    while !eof && Instant::now() < deadline {
+        drain(
+            &mut stdout,
+            &mut buf,
+            &mut out,
+            &mut total,
+            &mut eof,
+            deadline,
+        );
+        if !eof && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+    match containment {
+        Containment::Unconfirmed { live } => {
+            return Err(Error::isolation_unavailable(format!(
+                "qemu query cleanup unconfirmed (live pids {live:?})"
+            )));
+        }
+        Containment::Confirmed => {}
+    }
+    if !eof {
+        return Err(Error::isolation_unavailable(
+            "qemu query output did not end before the deadline",
+        ));
+    }
     if !status.success() {
         return Err(Error::isolation_unavailable(format!(
             "{} {:?} exited unsuccessfully",
@@ -796,13 +854,6 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
     }
     String::from_utf8(out)
         .map_err(|_| Error::isolation_unavailable("qemu query output is not UTF-8"))
-}
-
-fn cleanup_suffix(cleanup: crate::Result<()>) -> String {
-    match cleanup {
-        Ok(()) => String::new(),
-        Err(e) => format!("; cleanup uncertain: {}", e.message),
-    }
 }
 
 #[derive(Debug)]
@@ -1900,6 +1951,28 @@ exit 0
         );
         let err = query_retry(&script, Duration::from_secs(10)).unwrap_err();
         assert!(err.message.contains("oversized"), "{}", err.message);
+    }
+
+    #[test]
+    fn bounded_query_leader_near_deadline_completes_inside_bound() {
+        // R2-02: the leader exits just before the reserved cleanup boundary
+        // with a descendant holding the pipe; the single whole-query deadline
+        // must still cover containment and the final drain (no fresh grace
+        // per phase), completing within roughly grace + one poll slice.
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(
+            dir.path(),
+            "q",
+            "#!/bin/sh\nsleep 0.55\necho near-deadline\n(sleep 30) &\nexit 0\n",
+        );
+        let start = Instant::now();
+        let out = query_retry(&script, Duration::from_secs(1)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(out.contains("near-deadline"), "{out}");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "whole query exceeded its bound: {elapsed:?}"
+        );
     }
 
     #[test]
