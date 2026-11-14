@@ -324,8 +324,8 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
 }
 
 /// Render the QEMU command line with explicit MMIO devices (CR-025). Paths are
-/// separate arguments (no shell); the command line carries only validated
-/// hex/numeric identity, so neither shares nor identity can inject options.
+/// separate arguments (no shell) and each share path is comma-escaped (LV-04);
+/// the command line otherwise carries only validated hex/numeric identity.
 fn render_qemu_args(
     state: &VmState,
     shares: &[Share],
@@ -363,10 +363,16 @@ fn render_qemu_args(
     push(&["-m", &mib.to_string()]);
     push(&["-smp", "2", "-no-reboot", "-nographic", "-nodefaults"]);
     for share in shares {
+        // LV-04: reject lossy non-UTF-8 paths and escape commas per QEMU's
+        // option syntax, so a stage path cannot redirect the share or inject
+        // a suboption. Separate Command arguments do not stop suboption parsing.
+        let path = share.host.to_str().ok_or_else(|| {
+            crate::Error::isolation_unavailable("VM share path is not valid UTF-8")
+        })?;
         let mut fsdev = format!(
             "local,id={},path={},security_model=passthrough",
             share.tag,
-            share.host.to_string_lossy()
+            escape_qemu_option_value(path)
         );
         if share.read_only {
             fsdev.push_str(",readonly=on");
@@ -382,6 +388,14 @@ fn render_qemu_args(
     push(&["-netdev", &netdev]);
     push(&["-device", "virtio-net-device,netdev=n"]);
     Ok(a)
+}
+
+/// QEMU parses commas as suboption separators; its invocation reference
+/// requires doubling a literal comma inside an option value (LV-04). Without
+/// this, a stage path containing a comma — or a segment resembling another
+/// `-fsdev` suboption — could point the share elsewhere or alter parsed options.
+fn escape_qemu_option_value(value: &str) -> String {
+    value.replace(',', ",,")
 }
 
 fn remap_job(
@@ -926,6 +940,62 @@ mod tests {
             .join(" ");
         assert!(joined.contains("restrict=off"));
         assert!(render_qemu_args(&state(), &shares(), &j, "bad/id", 1000, 1000, 1).is_err());
+    }
+
+    /// QEMU's documented suboption grammar: options are separated by single
+    /// commas and a doubled comma is a literal comma inside a value. Mirrors
+    /// qemu-option.c splitting so the escaping is checked without QEMU; the
+    /// real-parser check is a boot gate.
+    fn qemu_split_options(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == ',' {
+                if chars.peek() == Some(&',') {
+                    cur.push(',');
+                    chars.next();
+                } else {
+                    out.push(std::mem::take(&mut cur));
+                }
+            } else {
+                cur.push(c);
+            }
+        }
+        out.push(cur);
+        out
+    }
+
+    #[test]
+    fn fsdev_paths_escape_commas_and_option_looking_segments() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut sh = shares();
+        // A comma-bearing stage path whose segment resembles another suboption.
+        sh[1].host = PathBuf::from("/stage/a,b/input,readonly=on");
+        let args = render_qemu_args(&state(), &sh, &job(), id, 1000, 1000, 1).unwrap();
+        let text: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let fsdev = text.iter().find(|a| a.contains("id=f2cin0,")).unwrap();
+        // The raw argument doubles every literal comma.
+        assert!(fsdev.contains("path=/stage/a,,b/input,,readonly=on"));
+        // Parsed with QEMU's grammar the path round-trips exactly and no extra
+        // suboption is injected.
+        let opts = qemu_split_options(fsdev);
+        let path_opt = opts.iter().find(|o| o.starts_with("path=")).unwrap();
+        assert_eq!(path_opt, "path=/stage/a,b/input,readonly=on");
+        let keys: Vec<&str> = opts.iter().map(|o| o.split('=').next().unwrap()).collect();
+        assert_eq!(keys, ["local", "id", "path", "security_model", "readonly"]);
+    }
+
+    #[test]
+    fn non_utf8_share_paths_are_rejected_not_lossily_converted() {
+        use std::os::unix::ffi::OsStringExt;
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut sh = shares();
+        sh[1].host = PathBuf::from(std::ffi::OsString::from_vec(b"/stage/\xff\xfe".to_vec()));
+        assert!(render_qemu_args(&state(), &sh, &job(), id, 1000, 1000, 1).is_err());
     }
 
     #[test]
