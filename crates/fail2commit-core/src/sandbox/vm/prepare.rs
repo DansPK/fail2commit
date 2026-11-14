@@ -589,6 +589,7 @@ fn run_bounded(exe: &Path, args: &[&str]) -> crate::Result<String> {
     }
 }
 
+#[derive(Debug)]
 struct GuestModule {
     name: String,
     host: PathBuf,
