@@ -49,11 +49,9 @@ pub fn run(_ctx: &Ctx, args: Args) -> CmdResult {
                     .as_str()
                     .filter(|detail| !detail.is_empty())
                     .unwrap_or("mandatory controls are unavailable");
-                return Err(Error::isolation_unavailable(
-                    format!(
-                        "hardened mode is installed but unavailable: {detail}"
-                    ),
-                ));
+                return Err(Error::isolation_unavailable(format!(
+                    "hardened mode is installed but unavailable: {detail}"
+                )));
             }
             Ok(Outcome {
                 message: "hardened mode available".into(),
