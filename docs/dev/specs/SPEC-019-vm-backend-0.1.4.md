@@ -146,6 +146,17 @@ and the microvm device-count limit. Missing or incompatible prepared support
 is unavailable, not a successful probe. Sources: [microvm](https://www.qemu.org/docs/master/system/i386/microvm.html)
 and [invocation](https://www.qemu.org/docs/master/system/invocation.html).
 
+### Linux guest stage namespace correction (CR-027)
+
+The inner Bubblewrap backend reserves `/f2c` for its own control mount. Outer
+VM job data must therefore use a distinct fixed namespace, such as
+`/mnt/fail2commit-vm/jobs/<job-id>`, with separate per-run `control` and `results`
+roots. Guest init and the bounded path envelope must agree on this layout and
+validate resolved mount identities. The package receives job work/input grants
+only, never request/result access. The inner `/f2c` mount remains unchanged.
+The earlier `/f2c/job/job.json` guest-init example is superseded by the separate
+control path. The exact generated job ID binds request, outcome and host export.
+
 ### 4.3 Probe (cached)
 
 `qemu-system-x86_64` present; `/dev/kvm` accessible; prepared initramfs +

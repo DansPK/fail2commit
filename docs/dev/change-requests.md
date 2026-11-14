@@ -34,3 +34,5 @@ Material behavior decisions made during implementation. The project rule is to l
 | CR-025 | 2026-11-14 | SPEC-019 selected microvm but used PCI-only network and implicit PCI 9p devices. | Use explicit virtio MMIO network/9p devices, validate QEMU and kernel/initramfs support and device limits, retain share permissions and fail closed on incompatible preparation. | FR-029, SPEC-019 |
 
 | CR-026 | 2026-11-14 | SPEC-019 disjoint Windows guest work/input paths fail the unchanged AppContainer common-stage validator and mix package data with control outcomes. | Use one TrustedPaths-derived fresh guest job stage for work/inputs and separate per-run request/result mappings inaccessible to the package; require resolved identity validation and valid bound outcome plus VM exit before host export. | FR-029, SPEC-019 |
+
+| CR-027 | 2026-11-14 | SPEC-019 Linux outer guest stage under /f2c is shadowed by the inner Bubblewrap control mount. | Use a distinct fixed guest job namespace with separate request/result roots, validate resolved identities and preserve the inner control mount and package grant boundary. | FR-029, SPEC-019 |
