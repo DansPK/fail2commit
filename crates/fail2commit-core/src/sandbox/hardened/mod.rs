@@ -29,6 +29,79 @@ fn should_select_hardened(choice: BackendChoice, installed: bool) -> bool {
     choice == BackendChoice::Auto && installed
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadinessFacts {
+    service_running: bool,
+    peer_authenticated: bool,
+    launcher_watchdog: bool,
+    platform_controls: bool,
+    network_effects: bool,
+    external_writer_requirement_accepted: bool,
+}
+
+impl ReadinessFacts {
+    fn complete(self) -> bool {
+        self.service_running
+            && self.peer_authenticated
+            && self.launcher_watchdog
+            && self.platform_controls
+            && self.network_effects
+            && self.external_writer_requirement_accepted
+    }
+
+    fn status_controls(self) -> serde_json::Value {
+        serde_json::json!({
+            "service_running": self.service_running,
+            "peer_authentication": self.peer_authenticated,
+            "launcher_watchdog": self.launcher_watchdog,
+            "platform_controls": self.platform_controls,
+            "network_effects": self.network_effects,
+            "external_writer_requirement_accepted": self.external_writer_requirement_accepted,
+            "readiness_complete": self.complete(),
+        })
+    }
+}
+
+fn linux_readiness(
+    service_running: bool,
+    peer_authenticated: bool,
+    platform_controls: bool,
+    network_effects: bool,
+) -> ReadinessFacts {
+    ReadinessFacts {
+        service_running,
+        peer_authenticated,
+        launcher_watchdog: platform_controls,
+        platform_controls,
+        network_effects,
+        // Linux has no Windows FirewallAPI writer acceptance condition.
+        external_writer_requirement_accepted: true,
+    }
+}
+
+fn windows_readiness(
+    service_running: bool,
+    peer_authenticated: bool,
+    effect_probe_passed: bool,
+) -> ReadinessFacts {
+    ReadinessFacts {
+        service_running,
+        peer_authenticated,
+        // These controls and the external-writer requirement are explicitly
+        // unresolved, even when the isolated traffic effect probe passes.
+        launcher_watchdog: false,
+        platform_controls: false,
+        network_effects: effect_probe_passed,
+        external_writer_requirement_accepted: false,
+    }
+}
+
+fn windows_readiness_detail(detail: &str) -> String {
+    format!(
+        "{detail}; Windows launcher/watchdog and platform controls are unresolved, and the external FirewallAPI writer requirement is not accepted"
+    )
+}
+
 pub fn install() -> crate::Result<serde_json::Value> {
     lifecycle::install()
 }
@@ -44,22 +117,21 @@ pub fn status() -> serde_json::Value {
     #[cfg(target_os = "linux")]
     {
         let (service, peer_auth, platform, network, detail) = service::probe_linux();
-        let available = service && peer_auth && platform && network;
+        let readiness = linux_readiness(service, peer_auth, platform, network);
+        let available = readiness.complete();
         if let Some(fields) = status.as_object_mut() {
             fields.insert("service_running".into(), serde_json::json!(service));
             fields.insert("peer_authenticated".into(), serde_json::json!(peer_auth));
-            fields.insert("platform_probe_available".into(), serde_json::json!(platform));
+            fields.insert(
+                "platform_probe_available".into(),
+                serde_json::json!(platform),
+            );
             fields.insert("network_probe_available".into(), serde_json::json!(network));
             fields.insert("probe_available".into(), serde_json::json!(available));
-            fields.insert(
-                "controls".into(),
-                serde_json::json!({
-                    "service_running": service,
-                    "peer_authentication": peer_auth,
-                    "launcher_watchdog_and_platform": platform,
-                    "shared_egress_effects": network,
-                }),
-            );
+            let mut controls = readiness.status_controls();
+            controls["launcher_watchdog_and_platform"] = serde_json::json!(platform);
+            controls["shared_egress_effects"] = serde_json::json!(network);
+            fields.insert("controls".into(), controls);
             fields.insert("detail".into(), serde_json::json!(detail));
         }
         return status;
@@ -68,21 +140,23 @@ pub fn status() -> serde_json::Value {
     #[cfg(windows)]
     {
         let (service, peer_auth, effect_probe, detail) = service::probe_windows();
-        let available = service && peer_auth && effect_probe;
+        let readiness = windows_readiness(service, peer_auth, effect_probe);
+        let available = readiness.complete();
         if let Some(fields) = status.as_object_mut() {
             fields.insert("service_running".into(), serde_json::json!(service));
             fields.insert("peer_authenticated".into(), serde_json::json!(peer_auth));
             fields.insert("probe_available".into(), serde_json::json!(available));
-            fields.insert("effect_probe_passed".into(), serde_json::json!(effect_probe));
             fields.insert(
-                "controls".into(),
-                serde_json::json!({
-                    "service_running": service,
-                    "peer_authentication": peer_auth,
-                    "wfp_lpac_traffic_effects": effect_probe,
-                }),
+                "effect_probe_passed".into(),
+                serde_json::json!(effect_probe),
             );
-            fields.insert("detail".into(), serde_json::json!(detail));
+            let mut controls = readiness.status_controls();
+            controls["wfp_lpac_traffic_effects"] = serde_json::json!(effect_probe);
+            fields.insert("controls".into(), controls);
+            fields.insert(
+                "detail".into(),
+                serde_json::json!(windows_readiness_detail(&detail)),
+            );
         }
         return status;
     }
@@ -475,10 +549,20 @@ impl SandboxBackend for HardenedBackend {
         #[cfg(not(any(target_os = "linux", windows)))]
         let platform_verified = false;
         #[cfg(target_os = "linux")]
-        let available = service && peer_auth && platform_controls && network_controls;
-        #[cfg(not(target_os = "linux"))]
-        let available = false;
-        let mut controls = vec![
+        let readiness = linux_readiness(service, peer_auth, platform_controls, network_controls);
+        #[cfg(windows)]
+        let readiness = windows_readiness(service, peer_auth, effect_probe);
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let readiness = ReadinessFacts {
+            service_running: false,
+            peer_authenticated: false,
+            launcher_watchdog: false,
+            platform_controls: false,
+            network_effects: false,
+            external_writer_requirement_accepted: false,
+        };
+        let available = readiness.complete();
+        let controls = vec![
             ("service_running".into(), service),
             ("peer_authentication".into(), peer_auth),
             ("launcher_watchdog".into(), launcher_verified),
@@ -486,14 +570,22 @@ impl SandboxBackend for HardenedBackend {
             ("wfp_lpac_traffic_effects".into(), effect_probe),
         ];
         #[cfg(target_os = "linux")]
-        controls.push(("service_egress_effects".into(), network_controls));
+        let controls = {
+            let mut controls = controls;
+            controls.push(("service_egress_effects".into(), network_controls));
+            controls
+        };
         #[cfg(target_os = "linux")]
         let report_detail = format!(
             "{detail}; hardened Linux launcher controls are {}; Internet egress remains disabled until its service effect probes pass",
             if available { "verified" } else { "not verified" }
         );
         #[cfg(not(target_os = "linux"))]
-        let report_detail = detail;
+        let report_detail = if cfg!(windows) {
+            windows_readiness_detail(&detail)
+        } else {
+            detail
+        };
         ProbeReport {
             backend: if cfg!(windows) {
                 "hardened-appcontainer"
@@ -552,6 +644,43 @@ mod selection_tests {
         assert!(!should_select_hardened(BackendChoice::Auto, false));
         assert!(should_select_hardened(BackendChoice::Auto, true));
         assert!(!should_select_hardened(BackendChoice::Vm, true));
+    }
+
+    #[test]
+    fn windows_effect_success_is_diagnostic_not_complete_readiness() {
+        let facts = windows_readiness(true, true, true);
+        let controls = facts.status_controls();
+        assert!(facts.network_effects);
+        assert_eq!(controls["network_effects"], true);
+        assert_eq!(controls["launcher_watchdog"], false);
+        assert_eq!(controls["platform_controls"], false);
+        assert_eq!(controls["external_writer_requirement_accepted"], false);
+        assert_eq!(controls["readiness_complete"], false);
+        assert!(!facts.complete());
+    }
+
+    #[test]
+    fn windows_unavailable_service_cannot_report_complete_readiness() {
+        let facts = windows_readiness(false, true, true);
+        assert_eq!(facts.status_controls()["service_running"], false);
+        assert!(!facts.complete());
+    }
+
+    #[test]
+    fn linux_readiness_requires_the_complete_service_probe() {
+        let complete = linux_readiness(true, true, true, true);
+        assert!(complete.complete());
+        assert_eq!(complete.status_controls()["readiness_complete"], true);
+
+        for facts in [
+            linux_readiness(false, true, true, true),
+            linux_readiness(true, false, true, true),
+            linux_readiness(true, true, false, true),
+            linux_readiness(true, true, true, false),
+        ] {
+            assert!(!facts.complete());
+            assert_eq!(facts.status_controls()["readiness_complete"], false);
+        }
     }
 
     #[test]
