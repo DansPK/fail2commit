@@ -1514,7 +1514,8 @@ impl LoopbackConfigMutex {
     #[allow(unsafe_code)]
     fn acquire() -> crate::Result<Self> {
         use windows_sys::Win32::Foundation::{
-            GetLastError, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            GetLastError, ERROR_ALREADY_EXISTS, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
         };
         use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
         let owner = crate::ipc::winsec::current_user_sid()?;
@@ -1524,10 +1525,14 @@ impl LoopbackConfigMutex {
         // SAFETY: the explicit, protected DACL remains alive through creation;
         // the named mutex serializes cooperating service instances machinewide.
         let raw = unsafe { CreateMutexW(security.attributes(), 0, name.as_ptr()) };
+        let create_error = unsafe { GetLastError() };
         if raw.is_null() {
             return Err(unavailable("CreateMutexW(loopback configuration)"));
         }
         let handle = owned(raw);
+        if create_error != ERROR_ALREADY_EXISTS {
+            crate::ipc::winsec::set_kernel_object_owner_sid(&handle, &owner)?;
+        }
         let owner_ok = crate::ipc::winsec::owner_sid(&handle)? == owner_text;
         let dacl_ok = crate::ipc::winsec::dacl_is_protected(&handle)?
             && crate::ipc::winsec::dacl_entries(&handle)?

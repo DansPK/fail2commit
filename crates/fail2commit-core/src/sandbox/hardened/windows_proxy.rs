@@ -202,6 +202,10 @@ struct SocketState {
 struct SocketRegistry {
     next_id: AtomicU64,
     closed: AtomicBool,
+    // Serializes one nonblocking write syscall against the cancellation
+    // linearization point. This is deliberately separate from SocketState;
+    // no state bookkeeping lock is held over I/O.
+    write_gate: Mutex<()>,
     state: Mutex<SocketState>,
 }
 
@@ -210,6 +214,7 @@ impl Default for SocketRegistry {
         Self {
             next_id: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            write_gate: Mutex::new(()),
             state: Mutex::new(SocketState::default()),
         }
     }
@@ -292,6 +297,10 @@ impl SocketRegistry {
         let deadline = Instant::now() + WRITE_TIMEOUT;
         let mut offset = 0;
         while offset < bytes.len() {
+            let _write_gate = self
+                .write_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             if self.closed.load(Ordering::SeqCst) {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
@@ -304,7 +313,9 @@ impl SocketRegistry {
                     "proxy write deadline elapsed",
                 ));
             }
-            match write(&bytes[offset..]) {
+            let attempt = write(&bytes[offset..]);
+            drop(_write_gate);
+            match attempt {
                 Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "socket closed")),
                 Ok(written) => {
                     offset += written;
@@ -326,7 +337,12 @@ impl SocketRegistry {
     }
 
     fn shutdown_all(&self) {
+        let write_gate = self
+            .write_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         self.closed.store(true, Ordering::SeqCst);
+        drop(write_gate);
         let state = self
             .state
             .lock()
@@ -337,7 +353,12 @@ impl SocketRegistry {
     }
 
     fn shutdown_except(&self, keep: &TcpStream) {
+        let write_gate = self
+            .write_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         self.closed.store(true, Ordering::SeqCst);
+        drop(write_gate);
         let keep_local = keep.local_addr().ok();
         let keep_peer = keep.peer_addr().ok();
         let state = self
@@ -1307,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn bait_shutdown_does_not_wait_for_a_blocked_proxy_write() {
+    fn bait_shutdown_linearizes_after_one_in_flight_nonblocking_write() {
         use std::sync::atomic::AtomicUsize;
         use std::sync::mpsc;
 
@@ -1322,17 +1343,30 @@ mod tests {
                 thread_attempts.fetch_add(1, Ordering::SeqCst);
                 entered_tx.send(()).unwrap();
                 resume_rx.recv().unwrap();
-                Ok(remaining.len().min(5))
+                Ok(remaining.len())
             })
         });
 
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let tripped_at = Instant::now();
-        registry.shutdown_all();
-        assert!(tripped_at.elapsed() < Duration::from_millis(100));
+        let stop_registry = Arc::clone(&registry);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let stop_thread = thread::spawn(move || {
+            stop_registry.shutdown_all();
+            stopped_tx.send(()).unwrap();
+        });
+        assert!(stopped_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert!(!registry.closed.load(Ordering::SeqCst));
         resume_tx.send(()).unwrap();
-        let error = writer_thread.join().unwrap().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(stopped_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        stop_thread.join().unwrap();
+        writer_thread.join().unwrap().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(registry
+            .write_if_open_with(b"after close", |_| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            })
+            .is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 

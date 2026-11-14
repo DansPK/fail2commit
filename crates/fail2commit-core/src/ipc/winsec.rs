@@ -4,7 +4,9 @@
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+use windows_sys::Win32::Security::Authorization::{
+    SetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
+};
 use windows_sys::Win32::Security::{
     AddAccessAllowedAce, AddAccessDeniedAce, GetAce, GetKernelObjectSecurity, GetLengthSid,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
@@ -389,13 +391,27 @@ pub fn owner_sid(object: &impl AsRawHandle) -> crate::Result<String> {
 /// back. The caller must hold WRITE_OWNER or an applicable take-ownership
 /// privilege; this avoids a path-based owner change race.
 pub fn set_owner_sid(object: &impl AsRawHandle, owner: &[u8]) -> crate::Result<()> {
+    set_object_owner_sid(object, SE_FILE_OBJECT, owner, "file")
+}
+
+/// Set/read back the owner of a newly-created kernel object through its handle.
+pub fn set_kernel_object_owner_sid(object: &impl AsRawHandle, owner: &[u8]) -> crate::Result<()> {
+    set_object_owner_sid(object, SE_KERNEL_OBJECT, owner, "kernel object")
+}
+
+fn set_object_owner_sid(
+    object: &impl AsRawHandle,
+    object_type: SE_OBJECT_TYPE,
+    owner: &[u8],
+    label: &str,
+) -> crate::Result<()> {
     let handle = object.as_raw_handle() as HANDLE;
     // SAFETY: the handle is live; `owner` is a validated SID byte sequence;
     // all unrelated security descriptor fields are null and untouched.
     let status = unsafe {
         SetSecurityInfo(
             handle,
-            SE_FILE_OBJECT,
+            object_type,
             OWNER_SECURITY_INFORMATION,
             owner.as_ptr().cast_mut().cast(),
             std::ptr::null_mut(),
@@ -405,14 +421,14 @@ pub fn set_owner_sid(object: &impl AsRawHandle, owner: &[u8]) -> crate::Result<(
     };
     if status != 0 {
         return Err(crate::Error::integrity(format!(
-            "SetSecurityInfo(file owner) failed with Win32 error {status}"
+            "SetSecurityInfo({label} owner) failed with Win32 error {status}"
         )));
     }
     let expected = sid_string(owner);
     if owner_sid(object)? != expected {
-        return Err(crate::Error::integrity(
-            "file owner SID did not read back as requested",
-        ));
+        return Err(crate::Error::integrity(format!(
+            "{label} owner SID did not read back as requested"
+        )));
     }
     Ok(())
 }

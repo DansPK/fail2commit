@@ -12,6 +12,7 @@ pub(crate) struct PackageGuard {
     package_sid_text: String,
     exemption_added: bool,
     keep_pending_journal: bool,
+    journal_created: bool,
     journal_path: Option<std::path::PathBuf>,
     installed: usize,
 }
@@ -50,6 +51,7 @@ impl PackageGuard {
             package_sid_text,
             exemption_added: false,
             keep_pending_journal: false,
+            journal_created: false,
             journal_path: None,
             installed: 0,
         };
@@ -63,7 +65,20 @@ impl PackageGuard {
                         "new AppContainer already has a loopback exemption",
                     ));
                 }
-                guard.journal_path = Some(write_exemption_journal(&guard.package_sid_text)?);
+                let (journal_path, mut journal_file) =
+                    create_exemption_journal(&guard.package_sid_text)?;
+                // Track this exact newly-created path before any owner,
+                // readback, write, or sync operation can fail.
+                guard.journal_path = Some(journal_path.clone());
+                guard.journal_created = true;
+                if let Err(error) = initialize_exemption_journal(
+                    &journal_path,
+                    &mut journal_file,
+                    &guard.package_sid_text,
+                ) {
+                    guard.keep_pending_journal = error.message.contains("journal cleanup failed");
+                    return Err(error);
+                }
                 if let Err(error) =
                     crate::sandbox::windows::ffi::add_loopback_exemption(&guard.package_sid_text)
                 {
@@ -422,22 +437,28 @@ impl PackageGuard {
                 ));
             }
         }
-        self.clear_exemption_journal()?;
+        if self.journal_created {
+            self.clear_exemption_journal()?;
+        }
         Ok(())
     }
 
     fn clear_exemption_journal(&mut self) -> crate::Result<()> {
-        if let Some(path) = self.journal_path.take() {
+        if self.journal_created {
+            let path = self.journal_path.as_deref().ok_or_else(|| {
+                crate::Error::integrity("created loopback journal path was not tracked")
+            })?;
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    self.journal_path = Some(path);
                     return Err(crate::Error::isolation_unavailable(format!(
                         "cannot clear loopback exemption recovery journal: {error}"
                     )));
                 }
             }
+            self.journal_created = false;
+            self.journal_path = None;
         }
         Ok(())
     }
@@ -524,7 +545,9 @@ fn validate_package_sid(sid: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn write_exemption_journal(package_sid: &str) -> crate::Result<std::path::PathBuf> {
+fn create_exemption_journal(
+    package_sid: &str,
+) -> crate::Result<(std::path::PathBuf, std::fs::File)> {
     use std::os::windows::fs::OpenOptionsExt;
     if !validate_package_sid(package_sid) {
         return Err(crate::Error::integrity(
@@ -532,14 +555,7 @@ fn write_exemption_journal(package_sid: &str) -> crate::Result<std::path::PathBu
         ));
     }
     let path = exemption_journal_path()?;
-    let record = ExemptionJournal {
-        version: 2,
-        package_sid: package_sid.to_owned(),
-        owned: false,
-    };
-    let bytes = serde_json::to_vec(&record)
-        .map_err(|_| crate::Error::internal("cannot encode loopback exemption journal"))?;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .read(true)
         .create_new(true)
@@ -554,18 +570,52 @@ fn write_exemption_journal(package_sid: &str) -> crate::Result<std::path::PathBu
                 "cannot create loopback exemption recovery journal: {error}"
             ))
         })?;
-    let system = crate::ipc::winsec::sid_from_string("S-1-5-18")
-        .ok_or_else(|| crate::Error::internal("SYSTEM SID constant is invalid"))?;
-    crate::ipc::winsec::set_owner_sid(&file, &system)?;
-    verify_journal_owner(&file)?;
-    use std::io::Write;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
-        let _ = std::fs::remove_file(&path);
-        return Err(crate::Error::isolation_unavailable(format!(
-            "cannot persist loopback exemption recovery journal: {error}"
-        )));
+    Ok((path, file))
+}
+
+#[cfg(windows)]
+fn initialize_exemption_journal(
+    path: &std::path::Path,
+    file: &mut std::fs::File,
+    package_sid: &str,
+) -> crate::Result<()> {
+    let setup = (|| {
+        let record = ExemptionJournal {
+            version: 2,
+            package_sid: package_sid.to_owned(),
+            owned: false,
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|_| crate::Error::internal("cannot encode loopback exemption journal"))?;
+        let system = crate::ipc::winsec::sid_from_string("S-1-5-18")
+            .ok_or_else(|| crate::Error::internal("SYSTEM SID constant is invalid"))?;
+        crate::ipc::winsec::set_owner_sid(file, &system)?;
+        verify_journal_owner(file)?;
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    cleanup_created_journal(path, setup, |path| std::fs::remove_file(path))
+}
+
+#[cfg(windows)]
+fn cleanup_created_journal<T>(
+    path: &std::path::Path,
+    setup: crate::Result<T>,
+    delete: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> crate::Result<T> {
+    match setup {
+        Ok(value) => Ok(value),
+        Err(setup_error) => match delete(path) {
+            Ok(()) => Err(setup_error),
+            Err(cleanup_error) => Err(crate::Error::isolation_unavailable(format!(
+                "journal cleanup failed after setup error ({}); retained recovery path: {} ({cleanup_error})",
+                setup_error.message,
+                path.display()
+            ))),
+        },
     }
-    Ok(path)
 }
 
 #[cfg(windows)]
@@ -751,6 +801,51 @@ fn exemption_recovery_never_deletes_an_unowned_sid() {
     assert_eq!(
         exemption_journal_action(true, false),
         ExemptionJournalAction::RemoveOwned
+    );
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn failed_journal_initialization_cleans_only_its_created_file() {
+    let directory = tempfile::tempdir().unwrap();
+    for stage in ["owner-set", "owner-readback", "write", "sync"] {
+        let path = directory.path().join(format!("{stage}.json"));
+        std::fs::write(&path, b"partial").unwrap();
+        let result = cleanup_created_journal(
+            &path,
+            Err::<(), _>(crate::Error::integrity(format!("injected {stage} failure"))),
+            |path| std::fs::remove_file(path),
+        );
+        assert!(result.is_err(), "{stage} error was lost");
+        assert!(!path.exists(), "{stage} left an untracked journal");
+    }
+
+    let existing = directory.path().join("pre-existing.json");
+    std::fs::write(&existing, b"do not delete").unwrap();
+    let create_new = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&existing);
+    assert!(create_new.is_err());
+    assert_eq!(std::fs::read(&existing).unwrap(), b"do not delete");
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn failed_journal_cleanup_retains_path_and_reports_refusal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pending.json");
+    std::fs::write(&path, b"partial").unwrap();
+    let error = cleanup_created_journal(
+        &path,
+        Err::<(), _>(crate::Error::integrity("injected owner setup failure")),
+        |_| Err(std::io::Error::other("injected delete failure")),
+    )
+    .unwrap_err();
+    assert!(error.message.contains("journal cleanup failed"));
+    assert!(
+        path.exists(),
+        "failed cleanup must retain recovery evidence"
     );
 }
 
