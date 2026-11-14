@@ -14,6 +14,7 @@ pub(crate) struct PackageGuard {
     keep_pending_journal: bool,
     journal_created: bool,
     journal_path: Option<std::path::PathBuf>,
+    installed_filters: Vec<windows_sys::core::GUID>,
     installed: usize,
 }
 
@@ -53,6 +54,7 @@ impl PackageGuard {
             keep_pending_journal: false,
             journal_created: false,
             journal_path: None,
+            installed_filters: Vec::new(),
             installed: 0,
         };
         let setup = (|| {
@@ -65,7 +67,7 @@ impl PackageGuard {
                         "new AppContainer already has a loopback exemption",
                     ));
                 }
-                let (journal_path, mut journal_file) =
+                let (journal_path, journal_file) =
                     create_exemption_journal(&guard.package_sid_text)?;
                 // Track this exact newly-created path before any owner,
                 // readback, write, or sync operation can fail.
@@ -73,7 +75,7 @@ impl PackageGuard {
                 guard.journal_created = true;
                 if let Err(error) = initialize_exemption_journal(
                     &journal_path,
-                    &mut journal_file,
+                    journal_file,
                     &guard.package_sid_text,
                 ) {
                     guard.keep_pending_journal = error.message.contains("journal cleanup failed");
@@ -168,6 +170,7 @@ impl PackageGuard {
             return Err(wfp_error("FwpmFilterAdd0", status));
         }
         self.installed += 1;
+        self.installed_filters.push(key);
         self.verify_filter(&key, layer)
     }
 
@@ -260,6 +263,7 @@ impl PackageGuard {
             return Err(wfp_error("FwpmFilterAdd0(proxy permit)", status));
         }
         self.installed += 1;
+        self.installed_filters.push(key);
         self.verify_proxy_permit(&key, layer, port)
     }
 
@@ -406,6 +410,7 @@ impl PackageGuard {
             self.exemption_added = false;
         }
         if self.engine.is_null() {
+            verify_filters_removed(&self.installed_filters)?;
             self.finish_journal_cleanup()?;
             return Ok(());
         }
@@ -418,6 +423,7 @@ impl PackageGuard {
             return Err(wfp_error("FwpmEngineClose0", status));
         }
         self.engine = std::ptr::null_mut();
+        verify_filters_removed(&self.installed_filters)?;
         self.finish_journal_cleanup()
     }
 
@@ -576,37 +582,53 @@ fn create_exemption_journal(
 #[cfg(windows)]
 fn initialize_exemption_journal(
     path: &std::path::Path,
-    file: &mut std::fs::File,
+    file: std::fs::File,
     package_sid: &str,
 ) -> crate::Result<()> {
-    let setup = (|| {
-        let record = ExemptionJournal {
-            version: 2,
-            package_sid: package_sid.to_owned(),
-            owned: false,
-        };
-        let bytes = serde_json::to_vec(&record)
-            .map_err(|_| crate::Error::internal("cannot encode loopback exemption journal"))?;
-        let system = crate::ipc::winsec::sid_from_string("S-1-5-18")
-            .ok_or_else(|| crate::Error::internal("SYSTEM SID constant is invalid"))?;
-        crate::ipc::winsec::set_owner_sid(file, &system)?;
-        verify_journal_owner(file)?;
-        use std::io::Write;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    cleanup_created_journal(path, setup, |path| std::fs::remove_file(path))
+    let record = ExemptionJournal {
+        version: 2,
+        package_sid: package_sid.to_owned(),
+        owned: false,
+    };
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|_| crate::Error::internal("cannot encode loopback exemption journal"))?;
+    let system = crate::ipc::winsec::sid_from_string("S-1-5-18")
+        .ok_or_else(|| crate::Error::internal("SYSTEM SID constant is invalid"))?;
+    initialize_created_journal_with(
+        path,
+        file,
+        &bytes,
+        |file| crate::ipc::winsec::set_owner_sid(file, &system),
+        verify_journal_owner,
+        |file, bytes| {
+            use std::io::Write;
+            file.write_all(bytes).map_err(Into::into)
+        },
+        |file| file.sync_all().map_err(Into::into),
+        |path| std::fs::remove_file(path),
+    )
 }
 
 #[cfg(windows)]
-fn cleanup_created_journal<T>(
+fn initialize_created_journal_with(
     path: &std::path::Path,
-    setup: crate::Result<T>,
+    mut file: std::fs::File,
+    bytes: &[u8],
+    set_owner: impl FnOnce(&std::fs::File) -> crate::Result<()>,
+    verify_owner: impl FnOnce(&std::fs::File) -> crate::Result<()>,
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> crate::Result<()>,
+    sync: impl FnOnce(&std::fs::File) -> crate::Result<()>,
     delete: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
-) -> crate::Result<T> {
+) -> crate::Result<()> {
+    let setup = (|| {
+        set_owner(&file)?;
+        verify_owner(&file)?;
+        write(&mut file, bytes)?;
+        sync(&file)
+    })();
+    drop(file);
     match setup {
-        Ok(value) => Ok(value),
+        Ok(()) => Ok(()),
         Err(setup_error) => match delete(path) {
             Ok(()) => Err(setup_error),
             Err(cleanup_error) => Err(crate::Error::isolation_unavailable(format!(
@@ -736,6 +758,53 @@ fn wfp_error(operation: &str, status: u32) -> crate::Error {
     ))
 }
 
+/// Reopen WFP after the per-job dynamic session closes and independently
+/// verify every filter key added by this guard has disappeared.
+#[cfg(windows)]
+fn verify_filters_removed(keys: &[windows_sys::core::GUID]) -> crate::Result<()> {
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
+    use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+    let mut session: wfp::FWPM_SESSION0 = unsafe { std::mem::zeroed() };
+    let mut engine = std::ptr::null_mut();
+    let status = unsafe {
+        wfp::FwpmEngineOpen0(
+            std::ptr::null(),
+            RPC_C_AUTHN_WINNT,
+            std::ptr::null(),
+            &mut session,
+            &mut engine,
+        )
+    };
+    if status != 0 || engine.is_null() {
+        return Err(wfp_error("FwpmEngineOpen0(cleanup readback)", status));
+    }
+    let mut result = Ok(());
+    for key in keys {
+        let mut filter = std::ptr::null_mut();
+        let status = unsafe { wfp::FwpmFilterGetByKey0(engine, key, &mut filter) };
+        if status == windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND as u32 {
+            continue;
+        }
+        if status == 0 && !filter.is_null() {
+            unsafe { wfp::FwpmFreeMemory0(&mut filter.cast()) };
+            result = Err(crate::Error::isolation_unavailable(
+                "a per-job WFP filter remained after its dynamic session closed",
+            ));
+            break;
+        }
+        result = Err(wfp_error("FwpmFilterGetByKey0(cleanup readback)", status));
+        break;
+    }
+    let close_status = unsafe { wfp::FwpmEngineClose0(engine) };
+    if close_status != 0 {
+        return Err(wfp_error(
+            "FwpmEngineClose0(cleanup readback)",
+            close_status,
+        ));
+    }
+    result
+}
+
 #[cfg(windows)]
 fn fresh_filter_key() -> crate::Result<windows_sys::core::GUID> {
     let mut bytes = [0u8; 16];
@@ -810,10 +879,44 @@ fn failed_journal_initialization_cleans_only_its_created_file() {
     let directory = tempfile::tempdir().unwrap();
     for stage in ["owner-set", "owner-readback", "write", "sync"] {
         let path = directory.path().join(format!("{stage}.json"));
-        std::fs::write(&path, b"partial").unwrap();
-        let result = cleanup_created_journal(
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let result = initialize_created_journal_with(
             &path,
-            Err::<(), _>(crate::Error::integrity(format!("injected {stage} failure"))),
+            file,
+            b"partial",
+            |_| {
+                if stage == "owner-set" {
+                    Err(crate::Error::integrity("injected owner-set failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                if stage == "owner-readback" {
+                    Err(crate::Error::integrity("injected owner-readback failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            |file, bytes| {
+                if stage == "write" {
+                    Err(crate::Error::integrity("injected write failure"))
+                } else {
+                    use std::io::Write;
+                    file.write_all(bytes).map_err(Into::into)
+                }
+            },
+            |file| {
+                if stage == "sync" {
+                    Err(crate::Error::integrity("injected sync failure"))
+                } else {
+                    file.sync_all().map_err(Into::into)
+                }
+            },
             |path| std::fs::remove_file(path),
         );
         assert!(result.is_err(), "{stage} error was lost");
@@ -835,10 +938,19 @@ fn failed_journal_initialization_cleans_only_its_created_file() {
 fn failed_journal_cleanup_retains_path_and_reports_refusal() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("pending.json");
-    std::fs::write(&path, b"partial").unwrap();
-    let error = cleanup_created_journal(
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let error = initialize_created_journal_with(
         &path,
-        Err::<(), _>(crate::Error::integrity("injected owner setup failure")),
+        file,
+        b"partial",
+        |_| Err(crate::Error::integrity("injected owner setup failure")),
+        |_| Ok(()),
+        |_, _| Ok(()),
+        |_| Ok(()),
         |_| Err(std::io::Error::other("injected delete failure")),
     )
     .unwrap_err();

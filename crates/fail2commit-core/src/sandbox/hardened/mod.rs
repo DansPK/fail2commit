@@ -3,6 +3,8 @@
 pub mod lifecycle;
 pub mod protocol;
 pub mod service;
+#[cfg(windows)]
+mod windows_effect_probe;
 #[cfg(any(windows, test))]
 pub(super) mod windows_proxy;
 #[cfg(windows)]
@@ -47,6 +49,34 @@ pub fn serve() -> crate::Result<()> {
     #[cfg(not(any(windows, target_os = "linux")))]
     {
         Err(crate::Error::isolation_unavailable("unsupported platform"))
+    }
+}
+
+/// Fixed hidden payload entry point for the service-owned, authenticated
+/// Windows traffic-effect probe. It has no command, URI, or path parameters.
+pub fn run_network_effect_probe_child() -> crate::Result<()> {
+    #[cfg(windows)]
+    {
+        let report = windows_effect_probe::run_child()?;
+        let bytes = serde_json::to_vec(&report)
+            .map_err(|_| crate::Error::internal("cannot encode Windows effect probe result"))?;
+        use std::io::Write;
+        std::io::stdout().write_all(&bytes)?;
+        std::io::stdout().write_all(b"\n")?;
+        std::io::stdout().flush()?;
+        if report.complete() {
+            Ok(())
+        } else {
+            Err(crate::Error::isolation_unavailable(
+                "one or more mandatory LPAC/WFP traffic-effect probes failed",
+            ))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err(crate::Error::rejected(
+            "Windows traffic-effect probe is unavailable on this platform",
+        ))
     }
 }
 
@@ -258,13 +288,16 @@ impl SandboxBackend for HardenedBackend {
         #[cfg(target_os = "linux")]
         let (service, peer_auth, detail) = service::probe_linux();
         #[cfg(windows)]
-        let (service, peer_auth, detail) = service::probe_windows();
+        let (service, peer_auth, effect_probe, detail) = service::probe_windows();
         #[cfg(not(any(target_os = "linux", windows)))]
-        let (service, peer_auth, detail) = (
+        let (service, peer_auth, effect_probe, detail) = (
+            false,
             false,
             false,
             String::from("service transport is not verified"),
         );
+        #[cfg(target_os = "linux")]
+        let effect_probe = false;
         ProbeReport {
             backend: if cfg!(windows) {
                 "hardened-appcontainer"
@@ -278,6 +311,7 @@ impl SandboxBackend for HardenedBackend {
                 ("peer_authentication".into(), peer_auth),
                 ("launcher_watchdog".into(), false),
                 ("platform_controls".into(), false),
+                ("wfp_lpac_traffic_effects".into(), effect_probe),
             ],
         }
     }

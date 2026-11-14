@@ -128,6 +128,13 @@ fn main() -> ExitCode {
     if let Command::Sandbox(args) = &cli.command {
         match &args.action {
             cmd::sandbox::Action::Serve => return exit(cmd::sandbox::serve().map_or(70, |_| 0)),
+            cmd::sandbox::Action::EgressProbe => {
+                return exit(
+                    fail2commit_core::sandbox::hardened::run_network_effect_probe_child()
+                        .map_or(70, |_| 0),
+                );
+            }
+            #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
             cmd::sandbox::Action::Launch {
                 jobfile,
                 watchdog,

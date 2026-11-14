@@ -1,8 +1,8 @@
 //! TCP loopback transport for the shared SPEC-018 egress policy.
 //!
-//! This transport is deliberately not wired into hardened job launch yet:
-//! Internet jobs remain unavailable until per-package WFP loopback allowance
-//! and the complete direct-route refusal probe are implemented and verified.
+//! Internet jobs remain unavailable until the service-launched per-package
+//! WFP/LPAC effect probe passes on the supported Windows VM and the separate
+//! machine-wide FirewallAPI external-writer limitation is resolved.
 
 #![allow(dead_code)]
 

@@ -38,6 +38,9 @@ pub enum Action {
         #[arg(long, hide = true)]
         test_diagnostic: bool,
     },
+    /// Fixed internal payload for the authenticated Windows network probe.
+    #[command(hide = true)]
+    EgressProbe,
 }
 
 pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
@@ -50,7 +53,7 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
                 .sandbox
                 .enabled
         }
-        Action::Serve | Action::Launch { .. } => {
+        Action::Serve | Action::Launch { .. } | Action::EgressProbe => {
             return Err(fail2commit_core::Error::rejected(
                 "private sandbox entry point was not routed",
             ));

@@ -29,6 +29,8 @@ struct Response {
     ok: bool,
     service_running: bool,
     probe_available: bool,
+    #[serde(default)]
+    effect_probe_passed: bool,
     #[serde(default = "default_true")]
     containment_confirmed: bool,
     detail: String,
@@ -232,6 +234,7 @@ fn response(ok: bool, detail: impl Into<String>) -> Response {
         ok,
         service_running: true,
         probe_available: false,
+        effect_probe_passed: false,
         containment_confirmed: true,
         detail: detail.into(),
     }
@@ -485,7 +488,7 @@ pub(super) fn probe_linux() -> (bool, bool, String) {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-pub(super) fn probe_windows() -> (bool, bool, String) {
+pub(super) fn probe_windows() -> (bool, bool, bool, String) {
     use crate::ipc::winsec;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -549,7 +552,7 @@ pub(super) fn probe_windows() -> (bool, bool, String) {
             ));
         }
         let mut file = std::fs::File::from(handle);
-        file.write_all(b"{\"op\":\"STATUS\"}\n")?;
+        file.write_all(b"{\"op\":\"PROBE\"}\n")?;
         let mut line = Vec::new();
         let mut reader = BufReader::new(file);
         reader
@@ -568,8 +571,8 @@ pub(super) fn probe_windows() -> (bool, bool, String) {
         Ok(reply)
     })();
     match result {
-        Ok(reply) => (true, true, reply.detail),
-        Err(e) => (false, false, e.message),
+        Ok(reply) => (true, true, reply.effect_probe_passed, reply.detail),
+        Err(e) => (false, false, false, e.message),
     }
 }
 
@@ -1981,6 +1984,41 @@ fn service_loop_windows() -> crate::Result<()> {
                 true,
                 "service authenticated peer; launcher and platform controls are not verified",
             ),
+            "PROBE" if request.job_dir.is_some() => {
+                response(false, "probe operation does not accept a caller job path")
+            }
+            "PROBE" if LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst) => {
+                let mut reply = response(
+                    false,
+                    "an unresolved launcher containment marker blocks traffic-effect probing",
+                );
+                reply.containment_confirmed = false;
+                reply
+            }
+            "PROBE" if request.job_dir.is_none() => {
+                match probe_windows_effects(raw, &sandbox_sid) {
+                    Ok(()) => {
+                        let mut reply = response(
+                        true,
+                        "service-launched LPAC/WFP traffic effects passed; normal Internet jobs remain unavailable because FirewallAPI whole-list updates are not atomic against external writers",
+                    );
+                        reply.effect_probe_passed = true;
+                        reply
+                    }
+                    Err(error) => {
+                        let mut reply = response(
+                        true,
+                        format!(
+                            "service-launched LPAC/WFP traffic effects failed; Internet jobs remain unavailable: {}",
+                            bounded_error_detail(&error.message)
+                        ),
+                    );
+                        reply.containment_confirmed =
+                            !LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst);
+                        reply
+                    }
+                }
+            }
             "LAUNCH" if request.job_dir.is_none() => {
                 response(false, "job_dir is required; job was not started")
             }
@@ -2239,6 +2277,17 @@ fn sweep_stale_snapshots(path: &Path) -> crate::Result<()> {
                 "stale service snapshot is not SYSTEM-owned",
             ));
         }
+        for child in std::fs::read_dir(&dir)? {
+            let child = child?;
+            if !matches!(
+                child.file_name().to_str(),
+                Some("input" | "output" | "stage")
+            ) {
+                return Err(crate::Error::integrity(
+                    "stale service snapshot contains an unexpected top-level object",
+                ));
+            }
+        }
         for subdir in ["input", "output"] {
             let child = dir.join(subdir);
             match std::fs::symlink_metadata(&child) {
@@ -2273,7 +2322,58 @@ fn sweep_stale_snapshots(path: &Path) -> crate::Result<()> {
             }
             std::fs::remove_dir(child)?;
         }
+        let stage = dir.join("stage");
+        match std::fs::symlink_metadata(&stage) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.is_dir() && metadata.file_attributes() & REPARSE == 0 => {
+                let stage_handle = open_windows_object(
+                    &stage,
+                    true,
+                    windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                        | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+                )?;
+                if crate::ipc::winsec::owner_sid(&stage_handle)? != "S-1-5-18" {
+                    return Err(crate::Error::integrity(
+                        "stale service probe stage is not SYSTEM-owned",
+                    ));
+                }
+                remove_plain_service_tree(&stage)?;
+            }
+            Ok(_) => {
+                return Err(crate::Error::integrity(
+                    "stale service probe stage is not a plain directory",
+                ));
+            }
+        }
         std::fs::remove_dir(dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_plain_service_tree(path: &Path) -> crate::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    let reparse = metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0;
+    if reparse {
+        return Err(crate::Error::integrity(
+            "service probe cleanup encountered a reparse point",
+        ));
+    }
+    if metadata.is_dir() {
+        for child in std::fs::read_dir(path)? {
+            remove_plain_service_tree(&child?.path())?;
+        }
+        std::fs::remove_dir(path)?;
+    } else if metadata.is_file() {
+        std::fs::remove_file(path)?;
+    } else {
+        return Err(crate::Error::integrity(
+            "service probe cleanup encountered an unexpected filesystem object",
+        ));
     }
     Ok(())
 }
@@ -3489,6 +3589,315 @@ fn launch_windows_request(
         })?;
     file.write_all(&bytes)?;
     file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+struct ProbeTcpFixture {
+    listener: std::net::TcpListener,
+    endpoint: std::net::SocketAddr,
+}
+
+#[cfg(windows)]
+impl ProbeTcpFixture {
+    fn bind(address: std::net::SocketAddr) -> crate::Result<Self> {
+        let listener = std::net::TcpListener::bind(address)?;
+        listener.set_nonblocking(true)?;
+        let endpoint = listener.local_addr()?;
+        Ok(Self { listener, endpoint })
+    }
+
+    fn host_round_trip(&self) -> crate::Result<()> {
+        let client = std::net::TcpStream::connect_timeout(
+            &self.endpoint,
+            std::time::Duration::from_millis(750),
+        )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    drop(stream);
+                    drop(client);
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(crate::Error::isolation_unavailable(
+                            "host could not connect to a probe fixture",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn assert_quiet(&self) -> crate::Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    drop(stream);
+                    return Err(crate::Error::isolation_unavailable(
+                        "an LPAC direct-route probe reached a host fixture",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn local_route_source(destination: std::net::SocketAddr) -> crate::Result<std::net::SocketAddr> {
+    let bind = match destination {
+        std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+        std::net::SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = std::net::UdpSocket::bind(bind)?;
+    socket.connect(destination)?;
+    let source = socket.local_addr()?;
+    if source.ip().is_loopback() || source.ip().is_unspecified() {
+        return Err(crate::Error::isolation_unavailable(
+            "no non-loopback interface is available for the traffic-effect fixture",
+        ));
+    }
+    Ok(match source {
+        std::net::SocketAddr::V4(address) => {
+            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(*address.ip(), 0))
+        }
+        std::net::SocketAddr::V6(address) => std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            *address.ip(),
+            0,
+            0,
+            address.scope_id(),
+        )),
+    })
+}
+
+#[cfg(windows)]
+fn probe_windows_effects(
+    client_pipe: windows_sys::Win32::Foundation::HANDLE,
+    sandbox_sid: &str,
+) -> crate::Result<()> {
+    use crate::isolation::{JobLimits, JobSpec, JobStatus, NetworkMode};
+    use std::os::windows::fs::MetadataExt;
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ};
+
+    let state = super::lifecycle::installed_state()?;
+    if state.sandbox_sid.as_deref() != Some(sandbox_sid) {
+        return Err(crate::Error::integrity(
+            "effect probe sandbox identity differs from installed service state",
+        ));
+    }
+    let executable = Path::new(&state.executable);
+    let current_exe = std::env::current_exe()?;
+    if !same_windows_path(&current_exe.canonicalize()?, &executable.canonicalize()?) {
+        return Err(crate::Error::integrity(
+            "effect probe service executable differs from the installed binary",
+        ));
+    }
+    let source = open_windows_object(executable, false, FILE_SHARE_READ)?;
+    let source_metadata = source.metadata()?;
+    if !source_metadata.is_file()
+        || source_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || source_metadata.len() == 0
+        || source_metadata.len() > 256 * 1024 * 1024
+    {
+        return Err(crate::Error::integrity(
+            "installed probe executable is unsafe or oversized",
+        ));
+    }
+
+    let state_path = super::machine_state_path()?;
+    let data_dir = state_path
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("install state has no parent"))?;
+    let jobs = ensure_snapshot_store(&data_dir.join("jobs"))?;
+    let snapshot = tempfile::Builder::new().prefix("job-").tempdir_in(&jobs)?;
+    set_snapshot_acl(snapshot.path(), sandbox_sid, "RX")?;
+    let input_dir = snapshot.path().join("input");
+    let output_dir = snapshot.path().join("output");
+    let stage_root = snapshot.path().join("stage");
+    std::fs::create_dir(&input_dir)?;
+    std::fs::create_dir(&output_dir)?;
+    std::fs::create_dir(&stage_root)?;
+    set_snapshot_acl(&input_dir, sandbox_sid, "RX")?;
+    set_snapshot_acl(&output_dir, sandbox_sid, "M")?;
+    set_snapshot_acl(&stage_root, sandbox_sid, "RX")?;
+    let job_stage = stage_root.join("probe");
+    let read_only = job_stage.join("read-only");
+    let work_dir = job_stage.join("work");
+    std::fs::create_dir(&job_stage)?;
+    std::fs::create_dir(&read_only)?;
+    std::fs::create_dir(&work_dir)?;
+    set_snapshot_acl(&job_stage, sandbox_sid, "RX")?;
+    set_snapshot_acl(&read_only, sandbox_sid, "RX")?;
+    set_snapshot_acl(&work_dir, sandbox_sid, "M")?;
+
+    let fixture_other = ProbeTcpFixture::bind((std::net::Ipv4Addr::LOCALHOST, 0).into())?;
+    let fixture_other_v6 = ProbeTcpFixture::bind((std::net::Ipv6Addr::LOCALHOST, 0).into())?;
+    let source_v4 = local_route_source("1.1.1.1:53".parse().unwrap())?;
+    if !matches!(source_v4, std::net::SocketAddr::V4(_)) {
+        return Err(crate::Error::isolation_unavailable(
+            "IPv4 traffic-effect fixture resolved to a non-IPv4 interface",
+        ));
+    }
+    let fixture_private_v4 = ProbeTcpFixture::bind(source_v4)?;
+    let source_v6 = local_route_source("[2606:4700:4700::1111]:53".parse().unwrap())?;
+    if !matches!(source_v6, std::net::SocketAddr::V6(_)) {
+        return Err(crate::Error::isolation_unavailable(
+            "IPv6 traffic-effect fixture resolved to a non-IPv6 interface",
+        ));
+    }
+    let fixture_private_v6 = ProbeTcpFixture::bind(source_v6)?;
+    for fixture in [
+        &fixture_other,
+        &fixture_other_v6,
+        &fixture_private_v4,
+        &fixture_private_v6,
+    ] {
+        fixture.host_round_trip()?;
+    }
+
+    let staged_executable = read_only.join("fail2commit-probe.exe");
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged_executable)?;
+    let mut limited_source = source.take(source_metadata.len() + 1);
+    std::io::copy(&mut limited_source, &mut target)?;
+    target.sync_all()?;
+    drop(target);
+    let copied = open_windows_object(&staged_executable, false, FILE_SHARE_READ)?;
+    if copied.metadata()?.len() != source_metadata.len() {
+        return Err(crate::Error::integrity(
+            "staged probe executable did not match the installed binary length",
+        ));
+    }
+
+    let job = JobSpec {
+        program: staged_executable,
+        args: vec!["sandbox".into(), "egress-probe".into()],
+        cwd: work_dir.clone(),
+        env: vec![
+            (
+                "F2C_PROBE_OTHER_LOOPBACK".into(),
+                fixture_other.endpoint.to_string().into(),
+            ),
+            (
+                "F2C_PROBE_OTHER_LOOPBACK_V6".into(),
+                fixture_other_v6.endpoint.to_string().into(),
+            ),
+            (
+                "F2C_PROBE_INTERFACE_V4".into(),
+                fixture_private_v4.endpoint.to_string().into(),
+            ),
+            (
+                "F2C_PROBE_INTERFACE_V6".into(),
+                fixture_private_v6.endpoint.to_string().into(),
+            ),
+        ],
+        read_only: vec![read_only],
+        work_dir,
+        exports: Vec::new(),
+        export_to: None,
+        limits: JobLimits {
+            timeout: std::time::Duration::from_secs(20),
+            memory_bytes: Some(256 * 1024 * 1024),
+            max_processes: Some(8),
+            max_output_bytes: 16 * 1024,
+            disk_bytes: Some(16 * 1024 * 1024),
+        },
+        network: NetworkMode::Internet,
+        bait: false,
+    };
+    let job_bytes = super::protocol::encode_hardened_job(&job, &stage_root)?;
+    let jobfile = input_dir.join("job.json");
+    std::fs::write(&jobfile, job_bytes)?;
+    let jobfile_handle = open_windows_object(&jobfile, false, FILE_SHARE_READ)?;
+    if crate::ipc::winsec::owner_sid(&jobfile_handle)? != "S-1-5-18" {
+        return Err(crate::Error::integrity(
+            "service-generated effect probe snapshot is not SYSTEM-owned",
+        ));
+    }
+
+    let before_exemptions = crate::sandbox::windows::ffi::loopback_exempt_sids()?;
+    let exit =
+        match run_snapshot_as_sandbox(&jobfile, client_pipe, sandbox_sid, &job, &stage_root, false)
+        {
+            Ok(exit) => exit,
+            Err(error) if LAUNCHER_CONTAINMENT_FAILED.load(Ordering::SeqCst) => {
+                let _retained_snapshot = retain_snapshot_if_unconfirmed(snapshot, true);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+    if exit != 0 {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "fixed LPAC effect probe launcher exited with code {exit}"
+        )));
+    }
+    for fixture in [
+        &fixture_other,
+        &fixture_other_v6,
+        &fixture_private_v4,
+        &fixture_private_v6,
+    ] {
+        fixture.assert_quiet()?;
+    }
+    for fixture in [
+        &fixture_other,
+        &fixture_other_v6,
+        &fixture_private_v4,
+        &fixture_private_v6,
+    ] {
+        fixture.host_round_trip()?;
+    }
+    let mut after_exemptions = crate::sandbox::windows::ffi::loopback_exempt_sids()?;
+    let mut expected_exemptions = before_exemptions;
+    after_exemptions.sort_by_key(|sid| sid.to_ascii_lowercase());
+    expected_exemptions.sort_by_key(|sid| sid.to_ascii_lowercase());
+    if after_exemptions != expected_exemptions {
+        return Err(crate::Error::isolation_unavailable(
+            "effect probe did not restore the machine loopback exemption list exactly",
+        ));
+    }
+    let outcome_path = output_dir.join("outcome.json");
+    let outcome_file = open_windows_object(&outcome_path, false, FILE_SHARE_READ)?;
+    let metadata = outcome_file.metadata()?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > super::protocol::MAX_OUTCOME_BYTES as u64
+    {
+        return Err(crate::Error::integrity(
+            "fixed effect probe outcome is unsafe or oversized",
+        ));
+    }
+    let mut outcome_bytes = Vec::new();
+    outcome_file
+        .take((super::protocol::MAX_OUTCOME_BYTES + 1) as u64)
+        .read_to_end(&mut outcome_bytes)?;
+    let outcome = super::protocol::decode_outcome(&outcome_bytes)?;
+    let result: super::windows_effect_probe::EffectResults =
+        serde_json::from_slice(&outcome.stdout).map_err(|_| {
+            crate::Error::integrity("fixed effect probe returned a malformed result record")
+        })?;
+    if !result.complete() || outcome.status != JobStatus::Exited(0) {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "LPAC/WFP effect report failed checks {:?} (launcher status {:?})",
+            result.failed_checks(),
+            outcome.status
+        )));
+    }
     Ok(())
 }
 
