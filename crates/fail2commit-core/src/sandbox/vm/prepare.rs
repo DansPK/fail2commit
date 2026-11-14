@@ -928,19 +928,25 @@ fn render_init(
             "$BB mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 {tag} {dir} || $BB poweroff -f\n"
         ));
     }
-    s.push_str("id=; uid=; gid=\n");
-    s.push_str("for a in $(cat /proc/cmdline); do case $a in f2c_job_id=*) id=${a#f2c_job_id=};; f2c_uid=*) uid=${a#f2c_uid=};; f2c_gid=*) gid=${a#f2c_gid=};; esac; done\n");
+    s.push_str("id=; uid=; gid=; inputs=\n");
+    s.push_str("for a in $($BB cat /proc/cmdline); do case $a in f2c_job_id=*) id=${a#f2c_job_id=};; f2c_uid=*) uid=${a#f2c_uid=};; f2c_gid=*) gid=${a#f2c_gid=};; f2c_inputs=*) inputs=${a#f2c_inputs=};; esac; done\n");
     s.push_str("case \"$id\" in *[!0-9a-f]*|\"\") $BB poweroff -f;; esac\n");
     s.push_str("[ ${#id} -eq 32 ] || $BB poweroff -f\n");
     s.push_str("case \"$uid$gid\" in *[!0-9]*|\"\") $BB poweroff -f;; esac\n");
+    // LV-01: the host encodes how many input shares it actually supplied.
+    // Every configured slot gets a mount point; only the required ones are
+    // mounted, and a failed required mount fails closed before dispatch.
+    s.push_str("case \"$inputs\" in *[!0-9]*|\"\") $BB poweroff -f;; esac\n");
+    s.push_str(&format!(
+        "[ \"$inputs\" -ge 1 ] && [ \"$inputs\" -le {max_inputs} ] || $BB poweroff -f\n"
+    ));
     s.push_str(&format!("R={root}\n"));
     s.push_str("$BB mkdir -p $R/jobs/$id/work $R/control/$id $R/results/$id\n");
+    s.push_str(&format!(
+        "i=0\nwhile [ $i -lt {max_inputs} ]; do $BB mkdir -p $R/jobs/$id/input-$i; i=$((i+1)); done\n"
+    ));
     s.push_str("$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=524288 f2cwork $R/jobs/$id/work || $BB poweroff -f\n");
-    for index in 0..max_inputs {
-        s.push_str(&format!(
-            "$BB mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 f2cin{index} $R/jobs/$id/input-{index} 2>/dev/null\n"
-        ));
-    }
+    s.push_str("i=0\nwhile [ $i -lt \"$inputs\" ]; do $BB mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 f2cin$i $R/jobs/$id/input-$i || $BB poweroff -f; i=$((i+1)); done\n");
     s.push_str("$BB mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 f2cctl $R/control/$id || $BB poweroff -f\n");
     s.push_str("$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=524288 f2cres $R/results/$id || $BB poweroff -f\n");
     s.push_str("export HOME=/tmp\n");
@@ -1069,17 +1075,18 @@ mod tests {
             .contains("mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 f2cusr /usr"));
         assert!(init.contains("kmod modprobe 9p"));
         assert!(init.contains("f2c_job_id="));
+        assert!(init.contains("f2c_inputs="));
         assert!(init.contains("[ ${#id} -eq 32 ]"));
-        assert!(init.contains("f2cin0"));
-        assert!(init.contains("f2cin1"));
-        assert!(!init.contains("f2cin2"));
+        // Every configured slot gets a mount point; required mounts fail closed.
+        assert!(init.contains("while [ $i -lt 2 ]; do $BB mkdir -p $R/jobs/$id/input-$i"));
+        assert!(init.contains("while [ $i -lt \"$inputs\" ]"));
+        assert!(init.contains("f2cin$i $R/jobs/$id/input-$i || $BB poweroff -f"));
+        assert!(init.contains("[ \"$inputs\" -le 2 ]"));
         assert!(init.contains("setpriv --reuid=$uid --regid=$gid --clear-groups"));
         assert!(init.contains("$R/control/$id/job.json --vm-guest"));
         assert!(init.contains("R=/mnt/fail2commit-vm"));
         assert!(init.ends_with("$BB poweroff -f\n"));
-        // Mandatory mounts poweroff on failure; optional inputs do not.
         assert!(init.contains("f2cwork $R/jobs/$id/work || $BB poweroff -f"));
-        assert!(!init.contains("f2cin0 $R/jobs/$id/input-0 || $BB poweroff -f"));
     }
 
     #[test]
@@ -1207,6 +1214,203 @@ kernel/net/9p/9pnet_virtio.ko.xz: kernel/net/9p/9pnet.ko.zst kernel/drivers/virt
         );
         let err = resolve_modules_in(dir2.path()).expect_err("virtio_net is missing");
         assert!(err.message.contains("virtio_net"), "{}", err.message);
+    }
+
+    // ---- Executable init fixture (LV-01) ----
+    // Runs the generated init under /bin/sh with fake guest tools that log
+    // every command, really create mount points under a fake root, and can
+    // simulate mount failures. This verifies actual commands and fail-closed
+    // behavior, not string fragments. Needs no root and no real mounts.
+
+    const FIX_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    struct InitFixture {
+        dir: tempfile::TempDir,
+        root: PathBuf,
+        log: PathBuf,
+        init: PathBuf,
+    }
+
+    fn fixture_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    fn init_fixture(max_inputs: usize, shares: &[String]) -> InitFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let root = d.join("mnt");
+        let log = d.join("log");
+        let busybox = fixture_script(
+            d,
+            "busybox",
+            r#"#!/bin/sh
+echo "busybox $*" >> "$F2C_INIT_LOG"
+cmd="$1"; shift
+case "$cmd" in
+  mkdir)
+    for a in "$@"; do
+      case "$a" in "$F2C_INIT_ROOT"/*) /bin/mkdir -p "$a" ;; esac
+    done ;;
+  cat)
+    if [ "$1" = "/proc/cmdline" ]; then printf '%s\n' "$F2C_INIT_CMDLINE"; else exec /bin/cat "$@"; fi ;;
+  mount)
+    for t in $F2C_INIT_FAIL_TAGS; do
+      for a in "$@"; do
+        if [ "$a" = "$t" ]; then exit 1; fi
+      done
+    done ;;
+  poweroff) echo "POWEROFF" >> "$F2C_INIT_LOG"; exit 0 ;;
+  chmod) ;;
+  test) [ "$@" ]; exit $? ;;
+  *) ;;
+esac
+exit 0
+"#,
+        );
+        let setpriv = fixture_script(
+            d,
+            "setpriv",
+            "#!/bin/sh\necho \"setpriv $*\" >> \"$F2C_INIT_LOG\"\nexit 0\n",
+        );
+        let kmod = fixture_script(
+            d,
+            "kmod",
+            "#!/bin/sh\necho \"kmod $*\" >> \"$F2C_INIT_LOG\"\nexit 0\n",
+        );
+        let tools = GuestTools {
+            busybox,
+            setpriv,
+            kmod: Some(kmod),
+        };
+        let modules = vec![GuestModule {
+            name: "9p".into(),
+            host: PathBuf::from("/lib/modules/x/9p.ko"),
+        }];
+        let text = render_init(shares, &modules, max_inputs, &tools, &root);
+        let init = d.join("init");
+        fs::write(&init, text).unwrap();
+        InitFixture {
+            dir,
+            root,
+            log,
+            init,
+        }
+    }
+
+    fn run_init(f: &InitFixture, cmdline: &str, fail_tags: &str) {
+        let out = Command::new("/bin/sh")
+            .arg(&f.init)
+            .env("F2C_INIT_LOG", &f.log)
+            .env("F2C_INIT_ROOT", &f.root)
+            .env("F2C_INIT_CMDLINE", cmdline)
+            .env("F2C_INIT_FAIL_TAGS", fail_tags)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "init shell crashed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_log(f: &InitFixture) -> String {
+        fs::read_to_string(&f.log).unwrap_or_default()
+    }
+
+    fn fix_cmdline(inputs: &str) -> String {
+        format!(
+            "console=ttyS0 quiet f2c_job_id={FIX_ID} f2c_uid=1000 f2c_gid=1000 f2c_inputs={inputs}"
+        )
+    }
+
+    #[test]
+    fn init_exec_creates_every_mountpoint_and_mounts_required_inputs() {
+        let f = init_fixture(3, &["/usr".to_owned()]);
+        run_init(&f, &fix_cmdline("1"), "");
+        let log = init_log(&f);
+        let jobs = f.root.join("jobs").join(FIX_ID);
+        // Every configured input mount point really exists, unused slots too.
+        for i in 0..3 {
+            let mp = jobs.join(format!("input-{i}"));
+            assert!(mp.is_dir(), "input-{i} mount point must exist");
+            assert!(log.contains(&format!("mkdir -p {}", mp.display())));
+        }
+        assert!(jobs.join("work").is_dir());
+        assert!(f.root.join("control").join(FIX_ID).is_dir());
+        assert!(f.root.join("results").join(FIX_ID).is_dir());
+        // The required input is mounted; unused slots are not.
+        assert!(log.contains(&format!("f2cin0 {}", jobs.join("input-0").display())));
+        assert!(!log.contains("f2cin1 "));
+        assert!(!log.contains("f2cin2 "));
+        assert!(log.contains(&format!("f2cwork {}", jobs.join("work").display())));
+        assert!(log.contains(&format!(
+            "f2cctl {}",
+            f.root.join("control").join(FIX_ID).display()
+        )));
+        assert!(log.contains(&format!(
+            "f2cres {}",
+            f.root.join("results").join(FIX_ID).display()
+        )));
+        // Modules loaded and dispatch reached with the boot uid/gid.
+        assert!(log.contains("kmod modprobe 9p"));
+        assert!(log.contains("setpriv --reuid=1000 --regid=1000 --clear-groups"));
+        assert!(log.contains(&format!(
+            "{}/bin/fail2commit sandbox launch {}/control/{FIX_ID}/job.json --vm-guest",
+            f.root.display(),
+            f.root.display()
+        )));
+    }
+
+    #[test]
+    fn init_exec_fails_closed_on_required_mount_errors() {
+        // A supplied input whose mount fails must poweroff before dispatch.
+        let f = init_fixture(3, &[]);
+        run_init(&f, &fix_cmdline("2"), "f2cin1");
+        let log = init_log(&f);
+        assert!(log.contains("POWEROFF"));
+        assert!(!log.contains("setpriv"));
+        assert!(log.contains("f2cin0 "));
+        assert!(!log.contains("f2cctl "));
+        // A failed work mount also fails closed, before any input mount.
+        let f2 = init_fixture(3, &[]);
+        run_init(&f2, &fix_cmdline("1"), "f2cwork");
+        let log2 = init_log(&f2);
+        assert!(log2.contains("POWEROFF"));
+        assert!(!log2.contains("setpriv"));
+        assert!(!log2.contains("f2cin0 "));
+    }
+
+    #[test]
+    fn init_exec_rejects_missing_or_invalid_input_count() {
+        for bad in ["", "0", "4", "x", "1x"] {
+            let f = init_fixture(3, &[]);
+            let cmdline = if bad.is_empty() {
+                format!("console=ttyS0 f2c_job_id={FIX_ID} f2c_uid=1000 f2c_gid=1000")
+            } else {
+                fix_cmdline(bad)
+            };
+            run_init(&f, &cmdline, "");
+            let log = init_log(&f);
+            assert!(log.contains("POWEROFF"), "inputs={bad:?}");
+            assert!(!log.contains("setpriv"), "inputs={bad:?}");
+            assert!(!log.contains("f2cwork "), "inputs={bad:?}");
+        }
+    }
+
+    #[test]
+    fn init_exec_rejects_bad_boot_identity() {
+        let f = init_fixture(2, &[]);
+        run_init(
+            &f,
+            "console=ttyS0 f2c_job_id=ZZZ f2c_uid=1000 f2c_gid=1000 f2c_inputs=1",
+            "",
+        );
+        let log = init_log(&f);
+        assert!(log.contains("POWEROFF"));
+        assert!(!log.contains("setpriv"));
     }
 
     #[test]

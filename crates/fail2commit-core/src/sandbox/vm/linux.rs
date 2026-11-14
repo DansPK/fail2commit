@@ -266,7 +266,15 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     // SAFETY: geteuid/getgid have no preconditions.
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getgid() };
-    let args = render_qemu_args(&host.state, &shares, job, &job_id, uid, gid)?;
+    let args = render_qemu_args(
+        &host.state,
+        &shares,
+        job,
+        &job_id,
+        uid,
+        gid,
+        validated.read_only.len(),
+    )?;
 
     // Re-walk identities and pin every mount anchor open until QEMU exits.
     let revalidated = ValidatedPaths::new(job, &stage_root)?;
@@ -325,6 +333,7 @@ fn render_qemu_args(
     job_id: &str,
     uid: u32,
     gid: u32,
+    inputs: usize,
 ) -> crate::Result<Vec<OsString>> {
     if !valid_job_id(job_id) {
         return Err(crate::Error::integrity("invalid VM job identity"));
@@ -340,7 +349,11 @@ fn render_qemu_args(
     } else {
         "on"
     };
-    let append = format!("console=ttyS0 quiet f2c_job_id={job_id} f2c_uid={uid} f2c_gid={gid}");
+    // LV-01: the required input share count travels to init so it mounts
+    // exactly the supplied slots and fails closed on a required mount error.
+    let append = format!(
+        "console=ttyS0 quiet f2c_job_id={job_id} f2c_uid={uid} f2c_gid={gid} f2c_inputs={inputs}"
+    );
     let mut a: Vec<OsString> = Vec::new();
     let mut push = |items: &[&str]| a.extend(items.iter().map(OsString::from));
     push(&["-M", "microvm,accel=kvm", "-cpu", "host"]);
@@ -879,7 +892,7 @@ mod tests {
     #[test]
     fn qemu_uses_explicit_mmio_devices_and_no_pci_shorthand() {
         let id = "0123456789abcdef0123456789abcdef";
-        let args = render_qemu_args(&state(), &shares(), &job(), id, 1000, 1000).unwrap();
+        let args = render_qemu_args(&state(), &shares(), &job(), id, 1000, 1000, 1).unwrap();
         let text: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -894,6 +907,7 @@ mod tests {
         assert!(joined.contains("restrict=on"));
         assert!(joined.contains(&format!("f2c_job_id={id}")));
         assert!(joined.contains("f2c_uid=1000"));
+        assert!(joined.contains("f2c_inputs=1"));
         // The writable work share is not marked readonly.
         let work_fsdev = text.iter().find(|a| a.contains("id=f2cwork,")).unwrap();
         assert!(!work_fsdev.contains("readonly=on"));
@@ -904,14 +918,14 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef";
         let mut j = job();
         j.network = crate::isolation::NetworkMode::Internet;
-        let args = render_qemu_args(&state(), &shares(), &j, id, 1000, 1000).unwrap();
+        let args = render_qemu_args(&state(), &shares(), &j, id, 1000, 1000, 1).unwrap();
         let joined: String = args
             .iter()
             .map(|a| a.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
         assert!(joined.contains("restrict=off"));
-        assert!(render_qemu_args(&state(), &shares(), &j, "bad/id", 1000, 1000).is_err());
+        assert!(render_qemu_args(&state(), &shares(), &j, "bad/id", 1000, 1000, 1).is_err());
     }
 
     #[test]
