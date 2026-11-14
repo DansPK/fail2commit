@@ -173,9 +173,10 @@ struct Share {
     host: PathBuf,
     tag: String,
     read_only: bool,
-    /// Explicitly inherited O_PATH pin fd (LV-05). When set, QEMU maps
+    /// Fixed child-side pin slot (LV-05). When set, QEMU maps
     /// `/proc/self/fd/N` instead of the pathname, so a later rename/replace of
-    /// the host path cannot redirect the share to a different inode.
+    /// the host path cannot redirect the share to a different inode. Only the
+    /// QEMU spawn duplicates descriptors into these slots (R2-03).
     fd: Option<RawFd>,
 }
 
@@ -282,10 +283,13 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
             "staged paths changed while preparing the micro-VM",
         ));
     }
-    // LV-05: pin each share anchor with an explicitly inherited O_PATH fd and
-    // map it via /proc/self/fd/N, so a pathname swap after this point cannot
-    // redirect a share. The pins stay open until the process group is dead.
-    let _pins = pin_shares(&mut shares, &revalidated.identities)?;
+    // LV-05: pin each share anchor with an O_PATH descriptor and map it via a
+    // fixed child slot /proc/self/fd/N, so a pathname swap after this point
+    // cannot redirect a share. The pins stay open until the group is dead.
+    // R2-03: the parent descriptors stay close-on-exec; only this QEMU spawn
+    // installs the slot allowlist.
+    let pins = pin_shares(&mut shares, &revalidated.identities)?;
+    let inherit: Vec<(RawFd, RawFd)> = pins.iter().map(|p| (p.file.as_raw_fd(), p.slot)).collect();
 
     let args = render_qemu_args(
         &host.state,
@@ -301,14 +305,20 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     // representability failure can never leave a live VM with dropped guards.
     let deadline = boot_deadline(job.limits.timeout)?;
 
-    let mut child = Command::new(&host.state.qemu)
-        .args(&args)
+    let mut cmd = Command::new(&host.state.qemu);
+    cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .process_group(0)
+        .process_group(0);
+    add_slot_inheritance(&mut cmd, inherit);
+    let mut child = cmd
         .spawn()
         .map_err(|e| crate::Error::isolation_unavailable(format!("start QEMU: {e}")))?;
+    // The guards (pins plus control/result dirs) must outlive every post-spawn
+    // path until the process group is confirmed dead (R2-01); they are handed
+    // to the containment registry if that confirmation fails.
+    let _pins = pins;
     // Every post-spawn path confirms the whole process group is dead before
     // the control/result guards and mount pins are released.
     let exit = match wait_child(&mut child, deadline) {
@@ -717,22 +727,36 @@ impl ValidatedPaths {
     }
 }
 
-/// Pin each share's mount anchor with an explicitly inherited O_PATH fd and
-/// record it on the share so QEMU maps `/proc/self/fd/N` (LV-05).
+/// A pinned share anchor: the parent descriptor (kept close-on-exec, R2-03)
+/// and the fixed child-side slot number QEMU will see.
+struct PinnedShare {
+    file: File,
+    slot: RawFd,
+}
+
+/// First fixed child-side descriptor slot for share pins. 0/1/2 are stdio and
+/// QEMU's own low descriptors; high fixed slots avoid collision with anything
+/// QEMU opens after exec (the kernel allocates lowest-free, so it never takes
+/// 64+ while lower numbers are available).
+const PIN_SLOT_BASE: RawFd = 64;
+
+/// Pin each share's mount anchor with an O_PATH descriptor and assign it a
+/// fixed child-side slot so QEMU maps `/proc/self/fd/<slot>` (LV-05).
 ///
 /// `O_PATH` alone does NOT block pathname replacement: `rename(2)` leaves open
 /// descriptors untouched, so the pinned inode and a later pathname can diverge.
-/// Passing the fd-backed path means QEMU resolves the pinned inode no matter
-/// what happens to the pathname after this point. Job anchors are also checked
-/// against the re-walked identity; control/result are fresh per-run dirs and
-/// system shares are root-owned. The returned pins must stay open until the
-/// QEMU process group is confirmed dead.
+/// The fd-backed slot resolves to the pinned inode no matter what happens to
+/// the pathname afterwards. R2-03: the parent descriptor stays FD_CLOEXEC —
+/// unrelated children never inherit it — and only the QEMU spawn installs the
+/// slot allowlist via `add_slot_inheritance`. Job anchors are checked against
+/// the re-walked identity; control/result are fresh per-run dirs and system
+/// shares are root-owned. Pins stay open until the process group is dead.
 fn pin_shares(
     shares: &mut [Share],
     identities: &[(PathBuf, (u64, u64))],
-) -> crate::Result<Vec<File>> {
+) -> crate::Result<Vec<PinnedShare>> {
     let mut held = Vec::new();
-    for share in shares.iter_mut() {
+    for (index, share) in shares.iter_mut().enumerate() {
         let path = &share.host;
         let md = fs::symlink_metadata(path)?;
         if !md.is_dir() {
@@ -757,20 +781,54 @@ fn pin_shares(
                 )));
             }
         }
-        let fd = file.as_raw_fd();
-        // Clear FD_CLOEXEC so QEMU inherits this pin; std sets it on every open.
-        // SAFETY: fcntl on a live fd we own; F_GETFD reads the descriptor flags
-        // and F_SETFD only clears FD_CLOEXEC.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        // R2-03: the parent keeps FD_CLOEXEC (std sets it on every open); the
+        // slot is duplicated into place only inside the QEMU child pre_exec.
+        // SAFETY: F_GETFD on a live fd we own only reads descriptor flags.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        if flags < 0 || flags & libc::FD_CLOEXEC == 0 {
             return Err(crate::Error::integrity(
-                "cannot make VM share pin inheritable",
+                "VM share pin must stay close-on-exec in the parent",
             ));
         }
-        share.fd = Some(fd);
-        held.push(file);
+        let slot = PIN_SLOT_BASE + index as RawFd;
+        share.fd = Some(slot);
+        held.push(PinnedShare { file, slot });
     }
     Ok(held)
+}
+
+/// Register the QEMU-only descriptor allowlist on the command: in the forked
+/// child before exec, duplicate each pinned source fd onto its fixed slot and
+/// clear close-on-exec on the slot, so exactly these descriptors survive exec.
+/// The parent's source descriptors keep FD_CLOEXEC and are never handed to any
+/// other spawn (R2-03).
+fn add_slot_inheritance(cmd: &mut Command, pairs: Vec<(RawFd, RawFd)>) {
+    // SAFETY: the pre_exec hook runs in the child between fork and exec, so it
+    // only calls async-signal-safe functions (dup2, fcntl) and reads a slice
+    // allocated before the fork; no allocation, lock, or other libc state is
+    // touched. Failures abort the spawn, which is fail closed.
+    unsafe {
+        cmd.pre_exec(move || {
+            for (src, slot) in pairs.iter() {
+                loop {
+                    // SAFETY: dup2/fcntl as above on descriptor numbers we own.
+                    let dup = unsafe { libc::dup2(*src, *slot) };
+                    if dup >= 0 {
+                        break;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if unsafe { libc::fcntl(*slot, libc::F_SETFD, 0) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        })
+    };
 }
 
 fn identity(path: &Path) -> crate::Result<(u64, u64)> {
@@ -1228,8 +1286,8 @@ mod tests {
     #[test]
     fn fd_backed_pin_resists_pathname_swap() {
         // LV-05: a same-uid swap between validation and share-open must not
-        // redirect the mapping. The pinned fd keeps resolving to the original
-        // inode even after the pathname is replaced with an attacker tree.
+        // redirect the mapping. The pinned descriptor keeps resolving to the
+        // original inode even after the pathname is attacker-replaced.
         let dir = tempfile::tempdir().unwrap();
         let anchor = dir.path().join("stage");
         fs::create_dir(&anchor).unwrap();
@@ -1242,15 +1300,14 @@ mod tests {
         }];
         let identities = vec![(anchor.clone(), identity(&anchor).unwrap())];
         let pins = pin_shares(&mut shares, &identities).unwrap();
-        let fd = shares[0].fd.expect("share must be fd-backed");
-        let fd_path = PathBuf::from(format!("/proc/self/fd/{fd}"));
-
-        // The pin is explicitly inheritable (FD_CLOEXEC cleared).
+        let slot = shares[0].fd.expect("share must be slot-backed");
+        assert_eq!(slot, pins[0].slot);
+        // R2-03: the parent descriptor stays close-on-exec.
         // SAFETY: F_GETFD reads descriptor flags of a live fd we own.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let flags = unsafe { libc::fcntl(pins[0].file.as_raw_fd(), libc::F_GETFD) };
         assert!(
-            flags >= 0 && flags & libc::FD_CLOEXEC == 0,
-            "pin must be inherited"
+            flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+            "parent pin must stay close-on-exec"
         );
 
         // Swap: rename the validated tree away and plant an attacker tree at
@@ -1262,9 +1319,57 @@ mod tests {
 
         // The bare pathname now resolves to the attacker tree...
         assert_eq!(fs::read(anchor.join("marker")).unwrap(), b"attacker");
-        // ...but the fd-backed path still resolves to the pinned original inode.
+        // ...but the pinned descriptor still resolves to the original inode.
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", pins[0].file.as_raw_fd()));
         assert_eq!(fs::read(fd_path.join("marker")).unwrap(), b"original");
-        assert_eq!(identity_of(&pins[0]).unwrap(), identities[0].1);
+        assert_eq!(identity_of(&pins[0].file).unwrap(), identities[0].1);
+    }
+
+    #[test]
+    fn slot_child_sees_pinned_inode_after_swap() {
+        // R2-03: exercise the exact inheritance mechanism QEMU gets. The child
+        // receives the share only on its fixed slot through the allowlist, and
+        // exec'd children never see the parent source descriptor.
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("stage");
+        fs::create_dir(&anchor).unwrap();
+        fs::write(anchor.join("marker"), b"original").unwrap();
+        let mut shares = vec![Share {
+            host: anchor.clone(),
+            tag: "f2cin0".into(),
+            read_only: true,
+            fd: None,
+        }];
+        let identities = vec![(anchor.clone(), identity(&anchor).unwrap())];
+        let pins = pin_shares(&mut shares, &identities).unwrap();
+        let slot = shares[0].fd.unwrap();
+        // Swap the pathname before the child execs, like the attacker case.
+        fs::rename(&anchor, dir.path().join("hidden")).unwrap();
+        fs::create_dir(&anchor).unwrap();
+        fs::write(anchor.join("marker"), b"attacker").unwrap();
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("cat /proc/self/fd/{slot}/marker"))
+            .stdout(std::process::Stdio::piped());
+        add_slot_inheritance(&mut cmd, vec![(pins[0].file.as_raw_fd(), slot)]);
+        let out = cmd.output().unwrap();
+        assert_eq!(out.stdout, b"original");
+
+        // The slot survives, but nothing else of the pin leaks: a plain child
+        // of the same program sees neither the source fd nor the slot.
+        let plain = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "ls -l /proc/self/fd 2>/dev/null; readlink /proc/self/fd/{slot}"
+            ))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&plain.stdout);
+        assert!(
+            !text.contains("stage") && !text.contains("hidden"),
+            "unrelated child must not inherit share roots: {text}"
+        );
     }
 
     #[test]
