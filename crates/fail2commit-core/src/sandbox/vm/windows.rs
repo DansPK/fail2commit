@@ -1,6 +1,6 @@
 //! Windows Sandbox transport and lifecycle for the VM backend.
 
-use super::super::windows::{self as appcontainer, AppContainer, ValidatedPaths};
+use super::super::windows::{self as appcontainer, ValidatedPaths};
 use super::PlatformFallback;
 use crate::isolation::{
     ActivityReport, JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend,
@@ -9,28 +9,17 @@ use crate::sandbox::hardened::protocol::{self, MAX_OUTCOME_BYTES};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::os::windows::process::ExitStatusExt;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::System::StationsAndDesktops::{
-    GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
-};
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, ERROR_BROKEN_PIPE};
-use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{IsProcessorFeaturePresent, PF_VIRT_FIRMWARE_ENABLED};
 
 const BOOT_GRACE: Duration = Duration::from_secs(45);
 const CONTROL_GRACE: Duration = Duration::from_secs(20);
-const CONTROL_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
-const MAX_CONTROL_OUTPUT: usize = 16 * 1024;
 const MAX_GUEST_ID: usize = 32;
 const XML_HEADER: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>";
 
@@ -116,56 +105,19 @@ fn unavailable(detail: String) -> ProbeReport {
 }
 
 fn preflight() -> Result<ReadyHost, ProbeFailure> {
-    let system_dir = trusted_system_dir().map_err(ProbeFailure::Failed)?;
-    let feature_state = query_feature_state(&system_dir).map_err(ProbeFailure::Failed)?;
-    match feature_disposition(&feature_state) {
-        Some(true) => {}
-        Some(false) => {
-            return Err(ProbeFailure::Absent(
-                "Windows Sandbox optional feature is disabled".into(),
-            ));
-        }
-        None => {
-            return Err(ProbeFailure::Failed(format!(
-                "Windows Sandbox feature state is not definitive: {feature_state}"
-            )));
-        }
-    }
-    if !firmware_virtualization_enabled() {
+    preflight_for_hardware(firmware_virtualization_enabled())
+}
+
+fn preflight_for_hardware(firmware_virtualization: bool) -> Result<ReadyHost, ProbeFailure> {
+    if !firmware_virtualization {
         return Err(ProbeFailure::Absent(
             "firmware virtualization is not enabled".into(),
         ));
     }
-    let sandbox_exe = system_dir.join("WindowsSandbox.exe");
-    let meta = fs::metadata(&sandbox_exe).map_err(|error| {
-        ProbeFailure::Failed(format!(
-            "Windows Sandbox feature is enabled but its trusted executable is unavailable: {error}"
-        ))
-    })?;
-    if !meta.is_file() {
-        return Err(ProbeFailure::Failed(
-            "WindowsSandbox.exe is not a regular system file".into(),
-        ));
-    }
-    if !interactive_desktop_available() {
-        return Err(ProbeFailure::Failed(
-            "Windows Sandbox requires an interactive desktop session".into(),
-        ));
-    }
-    let inner = AppContainer.probe();
-    if !inner.available {
-        return Err(ProbeFailure::Failed(format!(
-            "inner AppContainer controls failed: {}",
-            inner.detail
-        )));
-    }
-    // Microsoft documents launching WSB through a .wsb file and Hyper-V's
-    // generic Msvm_ComputerSystem state, but no supported instance handle or
-    // correlation from WindowsSandbox.exe to one disposable WSB guest. A
-    // process exit therefore cannot authorize outcome acceptance or export.
-    // Treat that missing capability as an implementation failure, not feature
-    // absence, so backend selection stays fail-closed without fallback.
-    let _ = (system_dir, sandbox_exe);
+    // WSB instance shutdown correlation and trusted guest-context verification
+    // are implementation gaps. Keep selection unavailable before probing
+    // feature state with a subprocess, checking install paths, or staging any
+    // mapping. Unknown feature/permission state is therefore never fallback.
     Err(lifecycle_unsupported())
 }
 
@@ -173,69 +125,6 @@ fn preflight() -> Result<ReadyHost, ProbeFailure> {
 fn firmware_virtualization_enabled() -> bool {
     // SAFETY: IsProcessorFeaturePresent takes a documented processor feature ID.
     unsafe { IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED) != 0 }
-}
-
-fn query_feature_state(system_dir: &Path) -> Result<String, String> {
-    let powershell = system_dir.join("WindowsPowerShell\\v1.0\\powershell.exe");
-    if !powershell.is_file() {
-        return Err("trusted Windows PowerShell executable is missing".into());
-    }
-    let script = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; try { $f=Get-CimInstance -Namespace 'root/cimv2' -ClassName Win32_OptionalFeature -Filter 'Name=\"Containers-DisposableClientVM\"'; if ($null -eq $f) { [Console]::Out.Write('Absent') } else { [Console]::Out.Write($f.InstallState) } } catch { [Console]::Error.Write($_.Exception.Message); exit 3 }";
-    let mut command = Command::new(powershell);
-    command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ]);
-    let output = run_bounded_control(command, CONTROL_GRACE, MAX_CONTROL_OUTPUT)?;
-    if !output.status.success() {
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Windows Sandbox feature state could not be queried (permission/OS query failure): {}",
-            bounded_text(&diagnostic, MAX_CONTROL_OUTPUT)
-        ));
-    }
-    if output.stdout_overflow || output.stderr_overflow {
-        return Err("Windows Sandbox feature query returned oversized output".into());
-    }
-    let state = String::from_utf8(output.stdout)
-        .map_err(|_| "Windows Sandbox feature query returned non-UTF-8 output".to_owned())?;
-    Ok(state.trim().to_owned())
-}
-
-#[allow(unsafe_code)]
-fn trusted_system_dir() -> Result<PathBuf, String> {
-    let mut buffer = vec![0u16; 32_768];
-    // SAFETY: writable buffer is valid and its length fits in u32.
-    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if len == 0 || len >= buffer.len() {
-        return Err("GetSystemDirectoryW failed".into());
-    }
-    Ok(PathBuf::from(OsString::from_wide(&buffer[..len])))
-}
-
-#[allow(unsafe_code)]
-fn interactive_desktop_available() -> bool {
-    // SAFETY: a valid process window station handle is returned by the OS.
-    let station = unsafe { GetProcessWindowStation() };
-    if station.is_null() {
-        return false;
-    }
-    let mut flags = USEROBJECTFLAGS::default();
-    let mut needed = 0u32;
-    // SAFETY: flags is a correctly sized writable USEROBJECTFLAGS output buffer.
-    let ok = unsafe {
-        GetUserObjectInformationW(
-            station,
-            UOI_FLAGS,
-            (&mut flags as *mut USEROBJECTFLAGS).cast(),
-            std::mem::size_of::<USEROBJECTFLAGS>() as u32,
-            &mut needed,
-        )
-    };
-    ok != 0 && (flags.dwFlags & 1) != 0 // WSF_VISIBLE
 }
 
 struct HostMappings {
@@ -321,9 +210,9 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     let duration = timeout_deadline(job.limits.timeout).ok_or_else(|| {
         crate::Error::isolation_unavailable("job timeout plus VM boot grace cannot be represented")
     })?;
-    let deadline = Instant::now().checked_add(duration).ok_or_else(|| {
-        crate::Error::isolation_unavailable("job deadline cannot be represented")
-    })?;
+    let deadline = Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| crate::Error::isolation_unavailable("job deadline cannot be represented"))?;
     let mut child = Command::new(&host.sandbox_exe)
         .arg(&config_path)
         .stdin(Stdio::null())
@@ -670,202 +559,6 @@ fn wait_child_until(child: &mut Child, deadline: Instant) -> Result<ExitStatus, 
     }
 }
 
-struct CappedPipeReader {
-    reader: std::fs::File,
-    bytes: Vec<u8>,
-    overflow: bool,
-    closed: bool,
-}
-
-#[allow(unsafe_code)]
-impl CappedPipeReader {
-    fn new(reader: std::fs::File) -> Self {
-        Self { reader, bytes: Vec::new(), overflow: false, closed: false }
-    }
-
-    /// Drain at most one immediately available chunk; the caller checks the
-    /// shared absolute deadline before every call, so a continuously writable
-    /// pipe cannot extend query time.
-    fn drain_chunk(&mut self, deadline: Instant, cap: usize) -> Result<(), String> {
-        if Instant::now() >= deadline || self.closed {
-            return Ok(());
-        }
-        let mut available = 0u32;
-        let handle = self.reader.as_raw_handle() as HANDLE;
-        // SAFETY: this owner exclusively accesses the live anonymous pipe;
-        // optional buffers are null and `available` is writable.
-        let peeked = unsafe {
-            PeekNamedPipe(
-                handle,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut available,
-                std::ptr::null_mut(),
-            )
-        };
-        if peeked == 0 {
-            // SAFETY: GetLastError reads the immediately preceding Win32 error.
-            let code = unsafe { GetLastError() };
-            if code == ERROR_BROKEN_PIPE {
-                self.closed = true;
-                return Ok(());
-            }
-            return Err(format!("inspect query pipe failed with Win32 error {code}"));
-        }
-        if available == 0 {
-            return Ok(());
-        }
-        let mut buffer = [0u8; 4096];
-        let read_len = available.min(buffer.len() as u32) as usize;
-        let count = self
-            .reader
-            .read(&mut buffer[..read_len])
-            .map_err(|error| format!("read query pipe: {error}"))?;
-        if count == 0 {
-            return Err("query pipe returned zero bytes while data was available".into());
-        }
-        let remaining = cap.saturating_sub(self.bytes.len());
-        let take = remaining.min(count);
-        self.bytes.extend_from_slice(&buffer[..take]);
-        self.overflow |= take != count;
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct ControlOutput {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    stdout_overflow: bool,
-    stderr_overflow: bool,
-}
-
-/// Spawn one trusted host query in an owned job object. One absolute deadline
-/// covers the launch, both output streams, parent exit and descendant exit.
-fn run_bounded_control(
-    command: Command,
-    timeout: Duration,
-    cap: usize,
-) -> Result<ControlOutput, String> {
-    run_bounded_control_with(command, timeout, cap, |tree| tree.terminate())
-}
-
-fn run_bounded_control_with(
-    command: Command,
-    timeout: Duration,
-    cap: usize,
-    terminate: impl Fn(&crate::sandbox::windows::ffi::VmControlTree) -> crate::Result<()>,
-) -> Result<ControlOutput, String> {
-    run_bounded_control_with_resume(command, timeout, cap, terminate, || {})
-}
-
-fn run_bounded_control_with_resume(
-    command: Command,
-    timeout: Duration,
-    cap: usize,
-    terminate: impl Fn(&crate::sandbox::windows::ffi::VmControlTree) -> crate::Result<()>,
-    before_resume: impl FnOnce(),
-) -> Result<ControlOutput, String> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| "feature query deadline cannot be represented".to_owned())?;
-    let program = PathBuf::from(command.get_program());
-    let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
-    let cwd = command.get_current_dir();
-    let tree = crate::sandbox::windows::ffi::VmControlTree::new()
-        .map_err(|error| format!("create feature query job object: {}", error.message))?;
-    let (process, stdout, stderr) = crate::sandbox::windows::ffi::spawn_vm_control(
-        &program, &args, cwd, &tree, before_resume,
-    ).map_err(|error| format!("create suspended owned feature query: {}", error.message))?;
-    // The controlling thread owns both pipe handles. PeekNamedPipe makes each
-    // read nonblocking, while alternating streams prevents either pipe from
-    // filling and stalling the other.
-    let mut stdout = CappedPipeReader::new(stdout);
-    let mut stderr = CappedPipeReader::new(stderr);
-    let mut failure = None;
-    let mut exit = None;
-    loop {
-        if Instant::now() >= deadline {
-            failure = Some("feature query exceeded its deadline".to_owned());
-            break;
-        }
-        if let Err(error) = stdout.drain_chunk(deadline, cap) {
-            failure = Some(format!("query stdout failed: {error}"));
-            break;
-        }
-        if let Err(error) = stderr.drain_chunk(deadline, cap) {
-            failure = Some(format!("query stderr failed: {error}"));
-            break;
-        }
-        match process.exit_code() {
-            Ok(Some(code)) => exit = Some(ExitStatus::from_raw(code)),
-            Ok(None) => {}
-            Err(error) => {
-                failure = Some(format!("wait for feature query process: {}", error.message));
-                break;
-            }
-        }
-        match tree.active_processes() {
-            Ok(0) if exit.is_some() && stdout.closed && stderr.closed => break,
-            Ok(_) => {}
-            Err(error) => {
-                failure = Some(format!("query process-tree status is uncertain: {}", error.message));
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    let cleanup = if failure.is_some() {
-        Some(terminate_control_tree(&tree, &process, &terminate))
-    } else {
-        None
-    };
-    if let Some(reason) = failure {
-        return match cleanup {
-            Some(Ok(())) => Err(reason),
-            Some(Err(error)) => Err(format!("{reason}; owned process-tree cleanup unconfirmed: {}", error.message)),
-            None => Err(reason),
-        };
-    }
-    let status = exit.ok_or_else(|| "feature query exited without a process status".to_owned())?;
-    if !stdout.closed || !stderr.closed {
-        return Err("feature query pipes remained open after the owned process tree exited".into());
-    }
-    Ok(ControlOutput {
-        status,
-        stdout: stdout.bytes,
-        stderr: stderr.bytes,
-        stdout_overflow: stdout.overflow,
-        stderr_overflow: stderr.overflow,
-    })
-}
-
-fn terminate_control_tree(
-    tree: &crate::sandbox::windows::ffi::VmControlTree,
-    process: &crate::sandbox::windows::ffi::VmControlProcess,
-    terminate: &impl Fn(&crate::sandbox::windows::ffi::VmControlTree) -> crate::Result<()>,
-) -> crate::Result<()> {
-    let tree_termination = terminate(tree);
-    let root_termination = process.terminate_and_wait(CONTROL_CLEANUP_GRACE);
-    if let Err(tree_error) = tree_termination {
-        return match root_termination {
-            Ok(()) => Err(tree_error),
-            Err(root_error) => Err(crate::Error::isolation_unavailable(format!(
-                "query process-tree termination failed: {}; root termination also failed: {}",
-                tree_error.message, root_error.message
-            ))),
-        };
-    }
-    root_termination?;
-    let deadline = Instant::now()
-        .checked_add(CONTROL_CLEANUP_GRACE)
-        .ok_or_else(|| crate::Error::isolation_unavailable("query cleanup deadline overflow"))?;
-    tree.wait_empty(deadline)
-}
-
 fn terminate_process_tree(child: &mut Child, system_dir: &Path) -> crate::Result<()> {
     let pid = child.id();
     let taskkill = system_dir.join("taskkill.exe");
@@ -956,10 +649,6 @@ fn valid_job_id(id: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-fn bounded_text(text: &str, cap: usize) -> String {
-    text.chars().take(cap).collect()
-}
-
 fn path_under(child: &Path, parent: &Path) -> bool {
     let mut child = child.components();
     let mut parent = parent.components();
@@ -1010,75 +699,32 @@ mod lifecycle_gate_tests {
     fn unsupported_lifecycle_is_selected_unavailable_without_fallback() {
         let reason = match lifecycle_unsupported() {
             ProbeFailure::Failed(reason) => reason,
-            ProbeFailure::Absent(reason) => panic!("lifecycle gap misclassified as absence: {reason}"),
+            ProbeFailure::Absent(reason) => {
+                panic!("lifecycle gap misclassified as absence: {reason}")
+            }
         };
-        let probe = WindowsSandbox { selection: Selection::Failed(reason) }.probe();
+        let probe = WindowsSandbox {
+            selection: Selection::Failed(reason),
+        }
+        .probe();
         assert!(!probe.available);
         assert!(probe.detail.contains("instance-specific lifecycle proof"));
-        assert!(!probe.controls.iter().any(|(name, _)| name == "vm_fallback_to_platform"));
+        assert!(!probe
+            .controls
+            .iter()
+            .any(|(name, _)| name == "vm_fallback_to_platform"));
     }
 
-    fn query_fixture(temp: &Path, descendant_ping_count: u32, continuous: bool) -> Command {
-        let descendant = temp.join("descendant.cmd");
-        let parent = temp.join("parent.cmd");
-        let descendant_contents = if continuous {
-            "@echo off\r\n:again\r\necho descendant-out\r\necho descendant-err 1>&2\r\ngoto again\r\n".to_owned()
-        } else {
-            format!(
-                "@echo off\r\nping -n {descendant_ping_count} 127.0.0.1 >nul\r\necho descendant-out\r\necho descendant-err 1>&2\r\n"
-            )
+    #[test]
+    fn active_preflight_never_launches_a_feature_query_for_unknown_support() {
+        let error = match preflight_for_hardware(true) {
+            Ok(_) => panic!("unsupported WSB lifecycle must remain unavailable"),
+            Err(error) => error,
         };
-        fs::write(
-            &descendant,
-            descendant_contents,
-        )
-        .unwrap();
-        fs::write(
-            &parent,
-            "@echo off\r\necho started>query.started\r\nstart \"\" /b cmd.exe /d /c descendant.cmd\r\nfor /L %%i in (1,1,4000) do (\r\n echo noisy-out-%%i\r\n echo noisy-err-%%i 1>&2\r\n)\r\n",
-        )
-        .unwrap();
-        let system_root = std::env::var_os("SystemRoot").expect("Windows system root");
-        let cmd = PathBuf::from(system_root).join("System32").join("cmd.exe");
-        let mut command = Command::new(cmd);
-        command.args(["/d", "/c", "parent.cmd"]).current_dir(temp);
-        command
-    }
+        assert!(matches!(error, ProbeFailure::Failed(_)));
 
-    #[test]
-    fn fast_spawning_child_stays_suspended_during_delayed_containment_verification() {
-        let temp = tempfile::tempdir().unwrap();
-        let started = Instant::now();
-        let output = run_bounded_control_with_resume(
-            query_fixture(temp.path(), 2, false),
-            Duration::from_secs(5),
-            1024,
-            |tree| tree.terminate(),
-            || {
-                thread::sleep(Duration::from_millis(250));
-                assert!(!temp.path().join("query.started").exists());
-            },
-        )
-        .expect("suspended query should remain contained while resume is delayed");
-        assert!(output.status.success());
-        assert!(output.stdout_overflow);
-        assert!(output.stderr_overflow);
-        assert!(temp.path().join("query.started").exists());
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn retained_descendant_is_terminated_when_the_whole_query_deadline_expires() {
-        let temp = tempfile::tempdir().unwrap();
-        let started = Instant::now();
-        let result = run_bounded_control_with(
-            query_fixture(temp.path(), 10, true),
-            Duration::from_millis(500),
-            1024,
-            |_| Err(crate::Error::isolation_unavailable("injected termination failure")),
-        );
-        assert!(result.unwrap_err().contains("injected termination failure"));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let hardware_absence = preflight_for_hardware(false);
+        assert!(matches!(hardware_absence, Err(ProbeFailure::Absent(_))));
     }
 }
 
@@ -1165,6 +811,20 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_preflight_blocks_probe_and_run_before_vm_launch() {
+        let reason = match preflight_for_hardware(true) {
+            Err(ProbeFailure::Failed(reason)) => reason,
+            _ => panic!("unsupported WSB lifecycle must fail closed"),
+        };
+        let backend = WindowsSandbox {
+            selection: Selection::Failed(reason),
+        };
+        assert!(!backend.probe().available);
+        let error = backend.run(&job()).unwrap_err();
+        assert!(error.to_string().contains("Windows Sandbox unavailable"));
+    }
+
+    #[test]
     fn outcome_reader_rejects_missing_and_oversized_or_invalid_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome.json");
@@ -1248,22 +908,5 @@ mod tests {
             .to_string_lossy()
             .contains(&input.to_string_lossy().to_string()));
         assert!(guest.args[0].to_string_lossy().contains(&id));
-    }
-
-    #[test]
-    fn known_absence_is_distinct_from_unknown_state() {
-        assert_eq!(feature_disposition("Disabled"), Some(false));
-        assert_eq!(feature_disposition("Enabled"), Some(true));
-        assert_eq!(feature_disposition("EnablePending"), None);
-    }
-}
-
-fn feature_disposition(state: &str) -> Option<bool> {
-    match state {
-        "Enabled" | "1" => Some(true),
-        // WMI InstallState: disabled or absent. Neither provides the optional
-        // Windows Sandbox feature required by this backend.
-        "Disabled" | "DisabledWithPayloadRemoved" | "Absent" | "2" | "3" => Some(false),
-        _ => None,
     }
 }
