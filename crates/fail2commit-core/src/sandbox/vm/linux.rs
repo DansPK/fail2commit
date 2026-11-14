@@ -173,6 +173,10 @@ struct Share {
     host: PathBuf,
     tag: String,
     read_only: bool,
+    /// Explicitly inherited O_PATH pin fd (LV-05). When set, QEMU maps
+    /// `/proc/self/fd/N` instead of the pathname, so a later rename/replace of
+    /// the host path cannot redirect the share to a different inode.
+    fd: Option<RawFd>,
 }
 
 struct HostMappings {
@@ -232,6 +236,7 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
             host: PathBuf::from(dir),
             tag: prepare::system_share_tag(dir),
             read_only: true,
+            fd: None,
         });
     }
     for (index, input) in validated.read_only.iter().enumerate() {
@@ -239,22 +244,26 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
             host: input.clone(),
             tag: format!("f2cin{index}"),
             read_only: true,
+            fd: None,
         });
     }
     shares.push(Share {
         host: validated.work_dir.clone(),
         tag: "f2cwork".into(),
         read_only: false,
+        fd: None,
     });
     shares.push(Share {
         host: control_dir.path().to_path_buf(),
         tag: "f2cctl".into(),
         read_only: true,
+        fd: None,
     });
     shares.push(Share {
         host: result_dir.path().to_path_buf(),
         tag: "f2cres".into(),
         read_only: false,
+        fd: None,
     });
     if shares.len() + 1 > MICROVM_MAX_DEVICES {
         return Err(crate::Error::isolation_unavailable(
@@ -265,6 +274,19 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     // SAFETY: geteuid/getgid have no preconditions.
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getgid() };
+
+    // Re-walk identities to detect any change since validation.
+    let revalidated = ValidatedPaths::new(job, &stage_root)?;
+    if revalidated.identities != validated.identities {
+        return Err(crate::Error::integrity(
+            "staged paths changed while preparing the micro-VM",
+        ));
+    }
+    // LV-05: pin each share anchor with an explicitly inherited O_PATH fd and
+    // map it via /proc/self/fd/N, so a pathname swap after this point cannot
+    // redirect a share. The pins stay open until the process group is dead.
+    let _pins = pin_shares(&mut shares, &revalidated.identities)?;
+
     let args = render_qemu_args(
         &host.state,
         &shares,
@@ -274,15 +296,6 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
         gid,
         validated.read_only.len(),
     )?;
-
-    // Re-walk identities and pin every mount anchor open until QEMU exits.
-    let revalidated = ValidatedPaths::new(job, &stage_root)?;
-    if revalidated.identities != validated.identities {
-        return Err(crate::Error::integrity(
-            "staged paths changed while preparing the micro-VM",
-        ));
-    }
-    let _pins = revalidated.pin_mounts()?;
 
     // LV-03: compute the checked absolute deadline before any spawn, so a
     // representability failure can never leave a live VM with dropped guards.
@@ -380,16 +393,24 @@ fn render_qemu_args(
     push(&["-m", &mib.to_string()]);
     push(&["-smp", "2", "-no-reboot", "-nographic", "-nodefaults"]);
     for share in shares {
-        // LV-04: reject lossy non-UTF-8 paths and escape commas per QEMU's
-        // option syntax, so a stage path cannot redirect the share or inject
-        // a suboption. Separate Command arguments do not stop suboption parsing.
-        let path = share.host.to_str().ok_or_else(|| {
-            crate::Error::isolation_unavailable("VM share path is not valid UTF-8")
-        })?;
+        // LV-05: a pinned share is mapped through its inherited fd, which always
+        // resolves to the pinned inode regardless of any later pathname swap.
+        // LV-04: an unpinned path must be UTF-8 and comma-escaped per QEMU's
+        // option syntax so it cannot redirect the share or inject a suboption.
+        let path = match share.fd {
+            Some(fd) => format!("/proc/self/fd/{fd}"),
+            None => share
+                .host
+                .to_str()
+                .ok_or_else(|| {
+                    crate::Error::isolation_unavailable("VM share path is not valid UTF-8")
+                })?
+                .to_owned(),
+        };
         let mut fsdev = format!(
             "local,id={},path={},security_model=passthrough",
             share.tag,
-            escape_qemu_option_value(path)
+            escape_qemu_option_value(&path)
         );
         if share.read_only {
             fsdev.push_str(",readonly=on");
@@ -694,34 +715,62 @@ impl ValidatedPaths {
             identities,
         })
     }
+}
 
-    /// Hold every mount anchor open (O_PATH, no follow) and confirm its
-    /// resolved identity, blocking replacement while QEMU maps the shares.
-    fn pin_mounts(&self) -> crate::Result<Vec<File>> {
-        let mut held = Vec::new();
-        for (path, expected) in &self.identities {
-            let md = fs::symlink_metadata(path)?;
-            let mut flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            if md.is_dir() {
-                flags |= libc::O_DIRECTORY;
-            }
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(flags)
-                .open(path)
-                .map_err(|e| {
-                    crate::Error::integrity(format!("pin VM mount {}: {e}", path.display()))
-                })?;
-            if identity_of(&file)? != *expected {
+/// Pin each share's mount anchor with an explicitly inherited O_PATH fd and
+/// record it on the share so QEMU maps `/proc/self/fd/N` (LV-05).
+///
+/// `O_PATH` alone does NOT block pathname replacement: `rename(2)` leaves open
+/// descriptors untouched, so the pinned inode and a later pathname can diverge.
+/// Passing the fd-backed path means QEMU resolves the pinned inode no matter
+/// what happens to the pathname after this point. Job anchors are also checked
+/// against the re-walked identity; control/result are fresh per-run dirs and
+/// system shares are root-owned. The returned pins must stay open until the
+/// QEMU process group is confirmed dead.
+fn pin_shares(
+    shares: &mut [Share],
+    identities: &[(PathBuf, (u64, u64))],
+) -> crate::Result<Vec<File>> {
+    let mut held = Vec::new();
+    for share in shares.iter_mut() {
+        let path = &share.host;
+        let md = fs::symlink_metadata(path)?;
+        if !md.is_dir() {
+            return Err(crate::Error::integrity(format!(
+                "VM share anchor is not a directory: {}",
+                path.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| {
+                crate::Error::integrity(format!("pin VM share {}: {e}", path.display()))
+            })?;
+        let actual = identity_of(&file)?;
+        if let Some((_, expected)) = identities.iter().find(|(p, _)| p == path) {
+            if actual != *expected {
                 return Err(crate::Error::integrity(format!(
                     "staged object identity changed before VM mapping: {}",
                     path.display()
                 )));
             }
-            held.push(file);
         }
-        Ok(held)
+        let fd = file.as_raw_fd();
+        // Clear FD_CLOEXEC so QEMU inherits this pin; std sets it on every open.
+        // SAFETY: fcntl on a live fd we own; F_GETFD reads the descriptor flags
+        // and F_SETFD only clears FD_CLOEXEC.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            return Err(crate::Error::integrity(
+                "cannot make VM share pin inheritable",
+            ));
+        }
+        share.fd = Some(fd);
+        held.push(file);
     }
+    Ok(held)
 }
 
 fn identity(path: &Path) -> crate::Result<(u64, u64)> {
@@ -744,7 +793,7 @@ fn identity_of(file: &File) -> crate::Result<(u64, u64)> {
     Ok((stat.st_dev, stat.st_ino))
 }
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
 fn walk_plain(root: &Path, identities: &mut Vec<(PathBuf, (u64, u64))>) -> crate::Result<()> {
     let mut stack = vec![root.to_path_buf()];
@@ -866,26 +915,31 @@ mod tests {
                 host: "/usr".into(),
                 tag: "f2cusr".into(),
                 read_only: true,
+                fd: None,
             },
             Share {
                 host: "/stage/job/input-0".into(),
                 tag: "f2cin0".into(),
                 read_only: true,
+                fd: None,
             },
             Share {
                 host: "/stage/job/work".into(),
                 tag: "f2cwork".into(),
                 read_only: false,
+                fd: None,
             },
             Share {
                 host: "/stage/control".into(),
                 tag: "f2cctl".into(),
                 read_only: true,
+                fd: None,
             },
             Share {
                 host: "/stage/result".into(),
                 tag: "f2cres".into(),
                 read_only: false,
+                fd: None,
             },
         ]
     }
@@ -1159,5 +1213,75 @@ mod tests {
         let err2 = run_job(&host, &j).expect_err("no outcome was written");
         assert!(sentinel.exists(), "control case must spawn QEMU");
         assert!(err2.message.contains("outcome"), "{}", err2.message);
+    }
+
+    #[test]
+    fn fd_backed_pin_resists_pathname_swap() {
+        // LV-05: a same-uid swap between validation and share-open must not
+        // redirect the mapping. The pinned fd keeps resolving to the original
+        // inode even after the pathname is replaced with an attacker tree.
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("stage");
+        fs::create_dir(&anchor).unwrap();
+        fs::write(anchor.join("marker"), b"original").unwrap();
+        let mut shares = vec![Share {
+            host: anchor.clone(),
+            tag: "f2cin0".into(),
+            read_only: true,
+            fd: None,
+        }];
+        let identities = vec![(anchor.clone(), identity(&anchor).unwrap())];
+        let pins = pin_shares(&mut shares, &identities).unwrap();
+        let fd = shares[0].fd.expect("share must be fd-backed");
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+
+        // The pin is explicitly inheritable (FD_CLOEXEC cleared).
+        // SAFETY: F_GETFD reads descriptor flags of a live fd we own.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0 && flags & libc::FD_CLOEXEC == 0,
+            "pin must be inherited"
+        );
+
+        // Swap: rename the validated tree away and plant an attacker tree at
+        // the same pathname.
+        let hidden = dir.path().join("hidden");
+        fs::rename(&anchor, &hidden).unwrap();
+        fs::create_dir(&anchor).unwrap();
+        fs::write(anchor.join("marker"), b"attacker").unwrap();
+
+        // The bare pathname now resolves to the attacker tree...
+        assert_eq!(fs::read(anchor.join("marker")).unwrap(), b"attacker");
+        // ...but the fd-backed path still resolves to the pinned original inode.
+        assert_eq!(fs::read(fd_path.join("marker")).unwrap(), b"original");
+        assert_eq!(identity_of(&pins[0]).unwrap(), identities[0].1);
+    }
+
+    #[test]
+    fn pinned_share_renders_fd_backed_path_and_identity_change_is_refused() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut sh = shares();
+        sh[1].fd = Some(7);
+        let args = render_qemu_args(&state(), &sh, &job(), id, 1000, 1000, 1).unwrap();
+        let text: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let fsdev = text.iter().find(|a| a.contains("id=f2cin0,")).unwrap();
+        assert!(fsdev.contains("path=/proc/self/fd/7,"), "{fsdev}");
+        assert!(!fsdev.contains("/stage/job/input-0"));
+
+        // A share anchor whose identity changed since the re-walk is refused.
+        let dir = tempfile::tempdir().unwrap();
+        let anchor = dir.path().join("stage");
+        fs::create_dir(&anchor).unwrap();
+        let stale = vec![(anchor.clone(), (999_999, 999_999))];
+        let mut shares = vec![Share {
+            host: anchor.clone(),
+            tag: "f2cin0".into(),
+            read_only: true,
+            fd: None,
+        }];
+        assert!(pin_shares(&mut shares, &stale).is_err());
     }
 }
