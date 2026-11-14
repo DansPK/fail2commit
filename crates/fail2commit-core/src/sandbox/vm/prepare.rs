@@ -17,10 +17,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Root-owned record of the prepared image and its hashes.
@@ -73,6 +74,10 @@ const GUEST_BIN_DIR: &str = "/mnt/fail2commit-vm/bin";
 const GUEST_ROOT: &str = "/mnt/fail2commit-vm";
 const CONTROL_GRACE: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Minimum bounded window in which a just-SIGKILLed group leader is reaped
+/// even when the caller's deadline has already expired (R3-04). Prevents
+/// retaining an unreaped-but-dead leader that recovery could never clear.
+const REAP_FLOOR: Duration = Duration::from_millis(250);
 const MAX_QUERY_OUTPUT: usize = 1024 * 1024;
 const MAX_ETC_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -141,6 +146,9 @@ fn prepare_inner(state_path: &Path, lib_dir: &Path) -> crate::Result<String> {
                 "qemu-system-x86_64 is not installed as a trusted system executable",
             )
         })?;
+    // Create the library dir first so an unconfirmed capability query can
+    // persist its containment record durably (R3-04).
+    fs::create_dir_all(lib_dir)?;
     let qemu_version = verify_qemu_support(&qemu)?;
     let qemu_sha256 = hash_file(&qemu)?;
 
@@ -523,20 +531,20 @@ fn first_trusted(paths: &[&str], what: &str) -> crate::Result<PathBuf> {
 /// Verify QEMU offers the microvm machine and the explicit MMIO devices
 /// (CR-025) without starting a VM. Bounded output and deadline.
 fn verify_qemu_support(qemu: &Path) -> crate::Result<String> {
-    let version = run_bounded(qemu, &["--version"])?;
+    let version = run_bounded(qemu, &["--version"], Some(Path::new(LIB_DIR)))?;
     let version = version
         .lines()
         .next()
         .unwrap_or("unknown")
         .trim()
         .to_owned();
-    let machines = run_bounded(qemu, &["-M", "help"])?;
+    let machines = run_bounded(qemu, &["-M", "help"], Some(Path::new(LIB_DIR)))?;
     if !machines.split_whitespace().any(|w| w == "microvm") {
         return Err(Error::isolation_unavailable(
             "qemu-system-x86_64 does not support the microvm machine",
         ));
     }
-    let devices = run_bounded(qemu, &["-device", "help"])?;
+    let devices = run_bounded(qemu, &["-device", "help"], Some(Path::new(LIB_DIR)))?;
     for device in ["virtio-9p-device", "virtio-net-device"] {
         if !devices
             .lines()
@@ -719,13 +727,18 @@ pub(super) fn contain_group(
         // the deadline proves it unkillable (then the caller retains it).
         // SAFETY: kill targets this child's own process group with a signal.
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        // R3-04: a SIGKILLed leader is normally reaped in microseconds;
+        // allow a small bounded floor past a nearly-expired deadline so a
+        // dead leader is never left as an unreaped (and therefore
+        // permanently "live") zombie in the caller's retained guard.
+        let reap_deadline = deadline.max(Instant::now() + REAP_FLOOR);
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 // ECHILD: already reaped; proceed to the member scan.
                 Err(_) => break,
                 Ok(None) => {
-                    if Instant::now() >= deadline {
+                    if Instant::now() >= reap_deadline {
                         return Containment::Unconfirmed {
                             live: vec![pgid],
                             uncertain: false,
@@ -810,8 +823,48 @@ pub(super) fn contain_group(
     }
 }
 
-fn run_bounded(exe: &Path, args: &[&str]) -> crate::Result<String> {
-    run_bounded_with_grace(exe, args, CONTROL_GRACE)
+fn run_bounded(exe: &Path, args: &[&str], quarantine: Option<&Path>) -> crate::Result<String> {
+    run_bounded_with_grace(exe, args, CONTROL_GRACE, quarantine)
+}
+
+/// R3-04: when a query's group containment cannot be confirmed, retain the
+/// owned process (with a durable record when a quarantine directory exists)
+/// instead of dropping the Child and pretending cleanup happened — the same
+/// discipline VM runs use.
+fn query_containment_retained(
+    quarantine: Option<&Path>,
+    pgid: i32,
+    containment: Containment,
+    context: &str,
+    child: Option<Child>,
+) -> crate::Error {
+    let (live, uncertain) = match containment {
+        Containment::Unconfirmed { live, uncertain } => (live, uncertain),
+        Containment::Confirmed => (Vec::new(), false),
+    };
+    retain_containment(
+        quarantine,
+        Contained {
+            record: QuarantineRecord {
+                reason: format!(
+                    "qemu query containment unconfirmed ({context}; live pids {live:?}{}) while the owned query process and its resources were retained",
+                    if uncertain { ", membership scan incomplete" } else { "" }
+                ),
+                pgid: pgid as u32,
+                bound_ticks: group_bound_ticks_now(),
+                control_dir: None,
+                result_dir: None,
+                created_unix: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            },
+            _pins: Vec::new(),
+            _control: None,
+            _result: None,
+            _child: child,
+        },
+    )
 }
 
 /// Bounded QEMU capability query (LV-06, R2-02). One absolute whole-query
@@ -822,7 +875,12 @@ fn run_bounded(exe: &Path, args: &[&str]) -> crate::Result<String> {
 /// (minimum 50 ms) is reserved so cleanup still completes inside the
 /// advertised bound even when the leader exits near the deadline. Cleanup
 /// uncertainty is surfaced, and every path is bounded by that one deadline.
-fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::Result<String> {
+fn run_bounded_with_grace(
+    exe: &Path,
+    args: &[&str],
+    grace: Duration,
+    quarantine: Option<&Path>,
+) -> crate::Result<String> {
     let deadline = Instant::now()
         .checked_add(grace)
         .ok_or_else(|| Error::isolation_unavailable("qemu query deadline cannot be represented"))?;
@@ -850,10 +908,18 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
         || unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0
     {
         let containment = contain_group(Some(&mut child), pgid, deadline);
-        return Err(Error::isolation_unavailable(format!(
-            "cannot set nonblocking qemu query pipe (containment: {:?})",
-            containment
-        )));
+        return Err(match containment {
+            Containment::Confirmed => {
+                Error::isolation_unavailable("cannot set nonblocking qemu query pipe")
+            }
+            other => query_containment_retained(
+                quarantine,
+                pgid,
+                other,
+                "cannot set nonblocking qemu query pipe",
+                Some(child),
+            ),
+        });
     }
     let mut out: Vec<u8> = Vec::new();
     let mut total = 0usize;
@@ -902,15 +968,35 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
             Ok(None) => {}
             Err(e) => {
                 let containment = contain_group(Some(&mut child), pgid, deadline);
-                return Err(Error::isolation_unavailable(format!(
-                    "wait for qemu query: {e} (containment: {containment:?})"
-                )));
+                return Err(match containment {
+                    Containment::Confirmed => {
+                        Error::isolation_unavailable(format!("wait for qemu query: {e}"))
+                    }
+                    other => query_containment_retained(
+                        quarantine,
+                        pgid,
+                        other,
+                        &format!("wait for qemu query: {e}"),
+                        Some(child),
+                    ),
+                });
             }
         }
         if Instant::now() >= leader_deadline {
             // Stop the still-running leader now so containment and the final
             // drain complete within the single advertised deadline.
             let containment = contain_group(Some(&mut child), pgid, deadline);
+            if !matches!(containment, Containment::Confirmed) {
+                // R3-04: an unconfirmed query keeps its owned process and
+                // resources with durable recovery, not a silent drop.
+                return Err(query_containment_retained(
+                    quarantine,
+                    pgid,
+                    containment,
+                    "qemu query timed out",
+                    Some(child),
+                ));
+            }
             drain(
                 &mut stdout,
                 &mut buf,
@@ -919,19 +1005,7 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
                 &mut eof,
                 deadline,
             );
-            return Err(Error::isolation_unavailable(match containment {
-                Containment::Confirmed => "qemu query timed out".to_owned(),
-                Containment::Unconfirmed { live, uncertain } => {
-                    format!(
-                        "qemu query timed out; cleanup unconfirmed (live pids {live:?}{})",
-                        if uncertain {
-                            ", membership scan incomplete"
-                        } else {
-                            ""
-                        }
-                    )
-                }
-            }));
+            return Err(Error::isolation_unavailable("qemu query timed out"));
         }
         std::thread::sleep(POLL_INTERVAL);
     };
@@ -951,18 +1025,17 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
             std::thread::sleep(POLL_INTERVAL);
         }
     }
-    match containment {
-        Containment::Unconfirmed { live, uncertain } => {
-            return Err(Error::isolation_unavailable(format!(
-                "qemu query cleanup unconfirmed (live pids {live:?}{})",
-                if uncertain {
-                    ", membership scan incomplete"
-                } else {
-                    ""
-                }
-            )));
-        }
-        Containment::Confirmed => {}
+    if let Containment::Unconfirmed { .. } = containment {
+        // R3-04: unconfirmed membership after the leader exited still keeps
+        // owned recovery rather than silently dropping resources. The leader
+        // itself was reaped by try_wait, so no child needs retaining.
+        return Err(query_containment_retained(
+            quarantine,
+            pgid,
+            containment,
+            "qemu query exited with retained members",
+            None,
+        ));
     }
     if !eof {
         return Err(Error::isolation_unavailable(
@@ -1442,6 +1515,307 @@ impl Cpio {
         }
     }
 }
+
+// ---- Bounded containment ownership and durable quarantine ----
+// (R2-01, R3-03, R3-04.) These protect every owned process — VM runs and
+// root-owned capability queries alike — whose termination cannot be
+// confirmed within its bound: guards never drop while the exact identity is
+// possibly live, and the refusal survives process restart durably.
+
+/// Durable quarantine record under the stage/containment directory.
+pub(super) const CONTAINMENT_FILE: &str = "f2c-vm-containment.json";
+const MAX_CONTAINMENT_BYTES: u64 = 64 * 1024;
+/// How many unresolved contained identities the durable record holds before
+/// persistence fails closed instead of dropping evidence (R3-03).
+pub(super) const MAX_CONTAINMENT_RECORDS: usize = 8;
+
+/// Durable refusal/recovery record for an owned group whose containment
+/// could not be confirmed. `pgid` + `bound_ticks` give the exact identity
+/// used to decide "still live" (pid reuse cannot resurrect or fake liveness).
+#[derive(Serialize, Deserialize)]
+pub(super) struct QuarantineRecord {
+    pub(super) reason: String,
+    pub(super) pgid: u32,
+    pub(super) bound_ticks: u64,
+    pub(super) control_dir: Option<String>,
+    pub(super) result_dir: Option<String>,
+    pub(super) created_unix: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct QuarantineFile {
+    pub(super) version: u32,
+    pub(super) records: Vec<QuarantineRecord>,
+}
+
+/// The retained containment owner for one unconfirmed group: the VM guards
+/// (share pins, control dir, result dir) plus any unreaped child stay held
+/// here for the process lifetime, so a live QEMU can never observe released
+/// or recycled exchanges (R2-01). A query guard retains only the owned
+/// process (R3-04). Recovery drops entries only after the group's exact
+/// identity is proven gone.
+pub(super) struct Contained {
+    pub(super) record: QuarantineRecord,
+    pub(super) _pins: Vec<File>,
+    pub(super) _control: Option<tempfile::TempDir>,
+    pub(super) _result: Option<tempfile::TempDir>,
+    pub(super) _child: Option<Child>,
+}
+
+/// Process-lifetime registry of retained containment owners. A mutex poison
+/// only means a quarantining path panicked; the inner Vec is still valid.
+static CONTAINED: Mutex<Vec<Contained>> = Mutex::new(Vec::new());
+
+pub(super) fn contained_registry() -> std::sync::MutexGuard<'static, Vec<Contained>> {
+    CONTAINED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Persist the durable quarantine record. Written 0600 with create+rename
+/// and a parent-directory fsync so a crash cannot lose an unresolved
+/// identity whose inherited pins still live in the child (R3-03).
+fn persist_quarantine(quarantine_dir: &Path, record: &QuarantineRecord) -> crate::Result<()> {
+    let path = quarantine_dir.join(CONTAINMENT_FILE);
+    let mut file = if path.exists() {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .and_then(|f| {
+                let mut b = Vec::new();
+                let mut limited = f.take(MAX_CONTAINMENT_BYTES + 1);
+                limited.read_to_end(&mut b)?;
+                Ok::<Vec<u8>, std::io::Error>(b)
+            })
+            .and_then(|b| {
+                serde_json::from_slice::<QuarantineFile>(&b).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })
+            })
+            .map_err(|e| {
+                Error::integrity(format!(
+                    "VM containment record is unreadable or corrupt ({e}); resolve the contained process group and remove {}",
+                    path.display()
+                ))
+            })?
+    } else {
+        QuarantineFile {
+            version: 1,
+            records: Vec::new(),
+        }
+    };
+    // R3-03: never evict an unresolved identity. When the cap is reached,
+    // persistence fails closed and the caller keeps the in-memory refusal.
+    if file.records.len() >= MAX_CONTAINMENT_RECORDS {
+        return Err(Error::isolation_unavailable(format!(
+            "VM containment quarantine is full ({MAX_CONTAINMENT_RECORDS} unresolved identities); refusing to evict live containment evidence"
+        )));
+    }
+    file.records.push(QuarantineRecord {
+        reason: record.reason.clone(),
+        pgid: record.pgid,
+        bound_ticks: record.bound_ticks,
+        control_dir: record.control_dir.clone(),
+        result_dir: record.result_dir.clone(),
+        created_unix: record.created_unix,
+    });
+    let json = serde_json::to_vec_pretty(&file)
+        .map_err(|e| Error::internal(format!("serialize containment record: {e}")))?;
+    let tmp = quarantine_dir.join(format!("{CONTAINMENT_FILE}.tmp"));
+    write_new_file_force(&tmp, &json)?;
+    fs::rename(&tmp, &path)?;
+    // Crash safety: the rename itself must be durable before we treat the
+    // identity as recorded across a restart (R3-03).
+    sync_dir(quarantine_dir)
+}
+
+/// fsync a directory so entry creation/removal survives process or machine
+/// crash (R3-03).
+fn sync_dir(path: &Path) -> crate::Result<()> {
+    let dir = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            Error::isolation_unavailable(format!("open containment dir {}: {e}", path.display()))
+        })?;
+    // SAFETY: fsync on a live directory descriptor this function just opened.
+    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+        return Err(Error::isolation_unavailable(format!(
+            "sync containment dir {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+/// Replaces-or-creates writer for the containment record tmp.
+fn write_new_file_force(path: &Path, bytes: &[u8]) -> crate::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| Error::isolation_unavailable(format!("create VM containment tmp: {e}")))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Hand the mapped guards (or the owned query process) to the retained
+/// containment owner and produce the fail-closed error (R2-01, R3-04).
+/// Guards stay retained in memory even when durable persistence fails or is
+/// unavailable.
+pub(super) fn retain_containment(quarantine_dir: Option<&Path>, guards: Contained) -> crate::Error {
+    let record = QuarantineRecord {
+        reason: guards.record.reason.clone(),
+        pgid: guards.record.pgid,
+        bound_ticks: guards.record.bound_ticks,
+        control_dir: guards.record.control_dir.clone(),
+        result_dir: guards.record.result_dir.clone(),
+        created_unix: guards.record.created_unix,
+    };
+    let persist = match quarantine_dir {
+        Some(dir) => persist_quarantine(dir, &record),
+        None => Err(Error::isolation_unavailable(
+            "no durable containment directory was provided",
+        )),
+    };
+    contained_registry().push(guards);
+    match (persist, quarantine_dir) {
+        (Ok(()), Some(dir)) => Error::isolation_unavailable(format!(
+            "micro-VM containment unconfirmed; mapped state is quarantined in memory and {} for recovery",
+            dir.join(CONTAINMENT_FILE).display()
+        )),
+        _ => Error::isolation_unavailable(
+            "micro-VM containment unconfirmed and the durable quarantine record failed to persist; mapped state stays quarantined in memory",
+        ),
+    }
+}
+
+/// True only when a complete, deadline-bounded identity scan proves the
+/// contained group has no bound-matching members. An uncertain scan is
+/// never "gone" (R3-01): recovery refuses while membership is unproven.
+pub(super) fn group_proven_gone(pgid: i32, bound: u64) -> bool {
+    matches!(
+        group_members_checked(pgid, bound, Instant::now() + Duration::from_secs(2)),
+        MemberScan::Complete(members) if members.is_empty()
+    )
+}
+
+/// Refuse or recover before touching a new VM or query (R2-01): while any
+/// contained group from a prior attempt is still live, work stays refused;
+/// once the exact identities are proven gone, retained guards drop, the
+/// quarantined per-run directories delete, and the durable record clears.
+pub(super) fn recover_or_refuse(stage_root: &Path) -> crate::Result<()> {
+    let mut retained: Vec<Contained> = Vec::new();
+    {
+        let mut reg = contained_registry();
+        std::mem::swap(&mut *reg, &mut retained);
+    }
+    let mut live_in_process = 0usize;
+    for guard in retained.into_iter() {
+        if group_proven_gone(guard.record.pgid as i32, guard.record.bound_ticks) {
+            // Confirmed gone: dropping the guards releases pins and deletes
+            // the per-run control/result directories through their owners.
+            continue;
+        }
+        live_in_process += 1;
+        // Still live (or unproven): re-retain (never drop while contained).
+        contained_registry().push(guard);
+    }
+    if live_in_process > 0 {
+        return Err(Error::isolation_unavailable(format!(
+            "a previous micro-VM's process group is still contained ({live_in_process}); VM jobs stay refused until containment recovers"
+        )));
+    }
+    // Cross-process recovery from the durable record.
+    let path = stage_root.join(CONTAINMENT_FILE);
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .and_then(|f| {
+            let mut b = Vec::new();
+            let mut limited = f.take(MAX_CONTAINMENT_BYTES + 1);
+            limited.read_to_end(&mut b)?;
+            Ok::<Vec<u8>, std::io::Error>(b)
+        })
+        .map_err(|e| {
+            Error::integrity(format!(
+                "read VM containment record {}: {e}",
+                path.display()
+            ))
+        })?;
+    let file: QuarantineFile = serde_json::from_slice(&bytes).map_err(|e| {
+        Error::integrity(format!(
+            "VM containment record is corrupt ({e}); resolve the contained process group and remove {}",
+            path.display()
+        ))
+    })?;
+    let mut live_records = Vec::new();
+    let mut dead_records = Vec::new();
+    for record in file.records {
+        if group_proven_gone(record.pgid as i32, record.bound_ticks) {
+            dead_records.push(record);
+        } else {
+            live_records.push(record);
+        }
+    }
+    // Proven-dead exchanges release now, so the cap only ever holds
+    // genuinely unresolved identities (R3-03).
+    for record in &dead_records {
+        release_record_dirs(record);
+    }
+    if !live_records.is_empty() {
+        // Keep every unresolved identity durably — never evict — and refuse
+        // BEFORE launching any additional job (R3-03).
+        let pruned = QuarantineFile {
+            version: 1,
+            records: live_records,
+        };
+        let json = serde_json::to_vec_pretty(&pruned)
+            .map_err(|e| Error::internal(format!("serialize containment record: {e}")))?;
+        let tmp = stage_root.join(format!("{CONTAINMENT_FILE}.tmp"));
+        write_new_file_force(&tmp, &json)?;
+        fs::rename(&tmp, &path)?;
+        sync_dir(stage_root)?;
+        return Err(Error::isolation_unavailable(format!(
+            "a previously contained micro-VM process group is still live; VM jobs stay refused until it exits (see {})",
+            path.display()
+        )));
+    }
+    fs::remove_file(&path)?;
+    sync_dir(stage_root)?;
+    Ok(())
+}
+
+/// Delete a recovered record's per-run exchange directories; only plain
+/// directories this feature created, never a symlink target.
+fn release_record_dirs(record: &QuarantineRecord) {
+    for dir in [record.control_dir.as_deref(), record.result_dir.as_deref()] {
+        let Some(dir) = dir else { continue };
+        let p = Path::new(dir);
+        let Ok(md) = fs::symlink_metadata(p) else {
+            continue;
+        };
+        if md.is_dir() {
+            let _ = fs::remove_dir_all(p);
+        }
+    }
+}
+
+/// Serializes tests that touch the process-global containment registry or
+/// FAIL2COMMIT_HOME (the registry is production state; tests that retain,
+/// refuse, or recover must not interleave with each other).
+#[cfg(test)]
+pub(super) static VM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -2002,11 +2376,15 @@ exit 0
 
     // ---- Bounded query fixtures (LV-06) ----
 
-    fn query_retry(exe: &Path, grace: Duration) -> crate::Result<String> {
+    fn query_retry(
+        exe: &Path,
+        grace: Duration,
+        quarantine: Option<&Path>,
+    ) -> crate::Result<String> {
         // Same freshly-written-script ETXTBSY window as the init fixture.
         let mut last = None;
         for _ in 0..10 {
-            let result = run_bounded_with_grace(exe, &[], grace);
+            let result = run_bounded_with_grace(exe, &[], grace, quarantine);
             match result {
                 Err(e) if e.message.contains("Text file busy") => {
                     std::thread::sleep(Duration::from_millis(25));
@@ -2027,7 +2405,7 @@ exit 0
             "q",
             "#!/bin/sh\nn=0\nwhile [ $n -lt 200 ]; do printf '%01024d' 0; n=$((n+1)); done\n",
         );
-        let out = query_retry(&script, Duration::from_secs(10)).unwrap();
+        let out = query_retry(&script, Duration::from_secs(10), Some(dir.path())).unwrap();
         assert_eq!(out.len(), 200 * 1024);
     }
 
@@ -2042,7 +2420,7 @@ exit 0
             "#!/bin/sh\necho leader-output\n(sleep 30) &\nexit 0\n",
         );
         let start = Instant::now();
-        let out = query_retry(&script, Duration::from_secs(5)).unwrap();
+        let out = query_retry(&script, Duration::from_secs(5), Some(dir.path())).unwrap();
         assert!(out.contains("leader-output"));
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -2059,7 +2437,7 @@ exit 0
             "q",
             &format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", pidfile.display()),
         );
-        let err = query_retry(&script, Duration::from_secs(1)).unwrap_err();
+        let err = query_retry(&script, Duration::from_secs(1), Some(dir.path())).unwrap_err();
         assert!(err.message.contains("timed out"), "{}", err.message);
         let pid: i32 = fs::read_to_string(&pidfile)
             .unwrap()
@@ -2078,7 +2456,7 @@ exit 0
             "q",
             "#!/bin/sh\nn=0\nwhile [ $n -lt 1100 ]; do printf '%01024d' 0; n=$((n+1)); done\n",
         );
-        let err = query_retry(&script, Duration::from_secs(10)).unwrap_err();
+        let err = query_retry(&script, Duration::from_secs(10), Some(dir.path())).unwrap_err();
         assert!(err.message.contains("oversized"), "{}", err.message);
     }
 
@@ -2095,13 +2473,70 @@ exit 0
             "#!/bin/sh\nsleep 0.55\necho near-deadline\n(sleep 30) &\nexit 0\n",
         );
         let start = Instant::now();
-        let out = query_retry(&script, Duration::from_secs(1)).unwrap();
+        let out = query_retry(&script, Duration::from_secs(1), Some(dir.path())).unwrap();
         let elapsed = start.elapsed();
         assert!(out.contains("near-deadline"), "{out}");
         assert!(
             elapsed < Duration::from_millis(1500),
-            "whole query exceeded its bound: {elapsed:?}"
+            "whole query exceeded its bound: {elapsed:?}",
         );
+    }
+
+    #[test]
+    fn bounded_query_budget_exhaustion_retains_and_recovers() {
+        // R3-04 production injection: the query leader is still running at
+        // the reserve boundary and its group holds a member that can never
+        // be reaped inside the bound (its parent moved out of the group and
+        // never waits). The query must fail bounded as containment
+        // unconfirmed, retain the owned process with a durable record, and
+        // clear only once the exact identity is gone.
+        let _g = super::VM_TEST_LOCK.lock().unwrap();
+        assert!(contained_registry().is_empty(), "clean registry needed");
+        let dir = tempfile::tempdir().unwrap();
+        let hfile = dir.path().join("h.pid");
+        let zfile = dir.path().join("z.pid");
+        let moved = dir.path().join("h.moved");
+        let script = fixture_script(
+            dir.path(),
+            "q",
+            &format!(
+                "#!/bin/sh\nperl -e 'my $z=fork; exit 1 unless defined $z; if($z==0){{ sleep 60; exit }} open(F,\">\",\"{z}\") or exit 1; print F \"$z\\n\"; close F; syscall(109,0,0); open(G,\">\",\"{m}\") or exit 1; close G; sleep 600;' &\nhp=$!\necho $hp > '{h}'\ni=0; while [ ! -s '{m}' ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.05; done\nsleep 30\nexit 0\n",
+                z = zfile.display(),
+                m = moved.display(),
+                h = hfile.display(),
+            ),
+        );
+        let start = Instant::now();
+        let err = query_retry(&script, Duration::from_millis(400), Some(dir.path())).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.message.contains("unconfirmed"), "{}", err.message);
+        assert!(
+            elapsed < Duration::from_millis(1200),
+            "retained query blew its bound: {elapsed:?}"
+        );
+        let text = fs::read_to_string(dir.path().join(CONTAINMENT_FILE)).unwrap();
+        assert!(
+            text.contains("qemu query containment unconfirmed"),
+            "{text}"
+        );
+        assert_eq!(contained_registry().len(), 1);
+
+        // Recovery: end Z's non-reaping parent so the kernel reaps the
+        // killed member; the production recovery helper then drops the
+        // guard and clears the durable record.
+        let hpid: i32 = fs::read_to_string(&hfile).unwrap().trim().parse().unwrap();
+        // SAFETY: hpid is the helper process this fixture created.
+        unsafe { libc::kill(hpid, libc::SIGKILL) };
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if recover_or_refuse(dir.path()).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < until, "query containment never recovered");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(contained_registry().is_empty());
+        assert!(!dir.path().join(CONTAINMENT_FILE).exists());
     }
 
     #[test]

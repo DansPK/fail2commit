@@ -17,7 +17,6 @@ use crate::isolation::{
 };
 use crate::sandbox::hardened::protocol::{self, MAX_VM_OUTCOME_BYTES};
 use crate::sandbox::Bubblewrap;
-use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -25,7 +24,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOOT_GRACE: Duration = Duration::from_secs(45);
@@ -190,299 +188,13 @@ struct HostMappings {
 /// How long to keep trying to contain a QEMU process group after the run
 /// ends or its deadline fires. Bounded; expiry means containment Unconfirmed.
 const CLEANUP_GRACE: Duration = Duration::from_secs(5);
-/// Durable quarantine record (R2-01) under the sandbox stage root.
-const CONTAINMENT_FILE: &str = "f2c-vm-containment.json";
-const MAX_CONTAINMENT_BYTES: u64 = 64 * 1024;
-
-/// Durable refusal/recovery record for a micro-VM whose process group could
-/// not be confirmed dead. `pgid` + `bound_ticks` give the exact identity used
-/// to decide "still live" (pid reuse cannot resurrect or fake liveness).
-#[derive(Serialize, Deserialize)]
-struct QuarantineRecord {
-    reason: String,
-    pgid: u32,
-    bound_ticks: u64,
-    control_dir: Option<String>,
-    result_dir: Option<String>,
-    created_unix: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct QuarantineFile {
-    version: u32,
-    records: Vec<QuarantineRecord>,
-}
-
-/// The retained containment owner for one unconfirmed VM: every mapped guard
-/// (share pins, control dir, result dir) plus the unreaped child stays held
-/// here for the process lifetime, so a live QEMU can never observe released
-/// or recycled exchanges (R2-01). Recovery later drops these entries only
-/// after the group's exact identity is proven gone.
-struct Contained {
-    record: QuarantineRecord,
-    _pins: Vec<File>,
-    _control: tempfile::TempDir,
-    _result: tempfile::TempDir,
-    _child: Option<Child>,
-}
-
-/// Process-lifetime registry of retained containment owners. A mutex poison
-/// only means a quarantining path panicked; the inner Vec is still valid.
-static CONTAINED: Mutex<Vec<Contained>> = Mutex::new(Vec::new());
-
-fn contained_registry() -> std::sync::MutexGuard<'static, Vec<Contained>> {
-    CONTAINED
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-}
-
-/// Persist the durable quarantine record. Written 0600 with create+rename so
-/// the next process can find exactly which group and directories to check.
-fn persist_quarantine(stage_root: &Path, record: &QuarantineRecord) -> crate::Result<()> {
-    let path = stage_root.join(CONTAINMENT_FILE);
-    let mut file = if path.exists() {
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .and_then(|f| {
-                let mut b = Vec::new();
-                let mut limited = f.take(MAX_CONTAINMENT_BYTES + 1);
-                limited.read_to_end(&mut b)?;
-                Ok::<Vec<u8>, std::io::Error>(b)
-            })
-            .and_then(|b| {
-                serde_json::from_slice::<QuarantineFile>(&b).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                })
-            })
-            .map_err(|e| {
-                crate::Error::integrity(format!(
-                    "VM containment record is unreadable or corrupt ({e}); resolve the contained process group and remove {}",
-                    path.display()
-                ))
-            })?
-    } else {
-        QuarantineFile {
-            version: 1,
-            records: Vec::new(),
-        }
-    };
-    // R3-03: never evict an unresolved identity. When the cap is reached,
-    // persistence fails closed and the caller keeps the in-memory refusal.
-    if file.records.len() >= MAX_CONTAINMENT_RECORDS {
-        return Err(crate::Error::isolation_unavailable(format!(
-            "VM containment quarantine is full ({MAX_CONTAINMENT_RECORDS} unresolved identities); refusing to evict live containment evidence"
-        )));
-    }
-    file.records.push(QuarantineRecord {
-        reason: record.reason.clone(),
-        pgid: record.pgid,
-        bound_ticks: record.bound_ticks,
-        control_dir: record.control_dir.clone(),
-        result_dir: record.result_dir.clone(),
-        created_unix: record.created_unix,
-    });
-    let json = serde_json::to_vec_pretty(&file)
-        .map_err(|e| crate::Error::internal(format!("serialize containment record: {e}")))?;
-    let tmp = stage_root.join(format!("{CONTAINMENT_FILE}.tmp"));
-    write_new_file_force(&tmp, &json)?;
-    fs::rename(&tmp, &path)?;
-    // Crash safety: the rename itself must be durable before we treat the
-    // identity as recorded across a restart (R3-03).
-    sync_dir(stage_root)
-}
-
-/// How many unresolved contained identities the durable record holds before
-/// persistence fails closed instead of dropping evidence (R3-03).
-const MAX_CONTAINMENT_RECORDS: usize = 8;
-
-/// fsync a directory so entry creation/removal survives process or machine
-/// crash (R3-03).
-fn sync_dir(path: &Path) -> crate::Result<()> {
-    let dir = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| {
-            crate::Error::isolation_unavailable(format!(
-                "open containment dir {}: {e}",
-                path.display()
-            ))
-        })?;
-    // SAFETY: fsync on a live directory descriptor this function just opened.
-    if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
-        return Err(crate::Error::isolation_unavailable(format!(
-            "sync containment dir {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
-}
-
-/// Like `write_new_file` but replaces a stale tmp left by an earlier crash.
-fn write_new_file_force(path: &Path, bytes: &[u8]) -> crate::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| {
-            crate::Error::isolation_unavailable(format!("create VM containment tmp: {e}"))
-        })?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-/// Hand the mapped guards to the retained containment owner and produce the
-/// fail-closed error (R2-01). Persistence failure does not release the guards.
-fn retain_containment(stage_root: &Path, guards: Contained) -> crate::Error {
-    let record = QuarantineRecord {
-        reason: guards.record.reason.clone(),
-        pgid: guards.record.pgid,
-        bound_ticks: guards.record.bound_ticks,
-        control_dir: guards.record.control_dir.clone(),
-        result_dir: guards.record.result_dir.clone(),
-        created_unix: guards.record.created_unix,
-    };
-    let persist = persist_quarantine(stage_root, &record);
-    contained_registry().push(guards);
-    match persist {
-        Ok(()) => crate::Error::isolation_unavailable(format!(
-            "micro-VM containment unconfirmed; mapped state is quarantined in memory and {} for recovery",
-            stage_root.join(CONTAINMENT_FILE).display()
-        )),
-        Err(e) => crate::Error::isolation_unavailable(format!(
-            "micro-VM containment unconfirmed and the durable quarantine record failed to persist ({e}); mapped state stays quarantined in memory"
-        )),
-    }
-}
-
-/// True only when a complete, deadline-bounded identity scan proves the
-/// contained group has no bound-matching members. An uncertain scan is
-/// never "gone" (R3-01): recovery refuses while membership is unproven.
-fn group_proven_gone(pgid: i32, bound: u64) -> bool {
-    matches!(
-        prepare::group_members_checked(pgid, bound, Instant::now() + Duration::from_secs(2)),
-        prepare::MemberScan::Complete(members) if members.is_empty()
-    )
-}
-
-/// Refuse or recover before touching a new VM (R2-01): while any contained
-/// group from a prior attempt is still live, every new VM run stays refused;
-/// once the exact identities are proven gone, retained guards drop, the
-/// quarantined per-run directories delete, and the durable record clears.
-fn recover_or_refuse(stage_root: &Path) -> crate::Result<()> {
-    let mut retained: Vec<Contained> = Vec::new();
-    {
-        let mut reg = contained_registry();
-        std::mem::swap(&mut *reg, &mut retained);
-    }
-    let mut live_in_process = 0usize;
-    for guard in retained.into_iter() {
-        if group_proven_gone(guard.record.pgid as i32, guard.record.bound_ticks) {
-            // Confirmed gone: dropping the guards releases pins and deletes
-            // the per-run control/result directories through their owners.
-            continue;
-        }
-        live_in_process += 1;
-        // Still live (or unproven): re-retain (never drop while contained).
-        contained_registry().push(guard);
-    }
-    if live_in_process > 0 {
-        return Err(crate::Error::isolation_unavailable(format!(
-            "a previous micro-VM's process group is still contained ({live_in_process}); VM jobs stay refused until containment recovers"
-        )));
-    }
-    // Cross-process recovery from the durable record.
-    let path = stage_root.join(CONTAINMENT_FILE);
-    if !path.exists() {
-        return Ok(());
-    }
-    let bytes = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-        .and_then(|f| {
-            let mut b = Vec::new();
-            let mut limited = f.take(MAX_CONTAINMENT_BYTES + 1);
-            limited.read_to_end(&mut b)?;
-            Ok::<Vec<u8>, std::io::Error>(b)
-        })
-        .map_err(|e| {
-            crate::Error::integrity(format!(
-                "read VM containment record {}: {e}",
-                path.display()
-            ))
-        })?;
-    let file: QuarantineFile = serde_json::from_slice(&bytes).map_err(|e| {
-        crate::Error::integrity(format!(
-            "VM containment record is corrupt ({e}); resolve the contained process group and remove {}",
-            path.display()
-        ))
-    })?;
-    let mut live_records = Vec::new();
-    let mut dead_records = Vec::new();
-    for record in file.records {
-        if group_proven_gone(record.pgid as i32, record.bound_ticks) {
-            dead_records.push(record);
-        } else {
-            live_records.push(record);
-        }
-    }
-    // Proven-dead exchanges release now, so the cap only ever holds
-    // genuinely unresolved identities (R3-03).
-    for record in &dead_records {
-        release_record_dirs(record);
-    }
-    if !live_records.is_empty() {
-        // Keep every unresolved identity durably — never evict — and refuse
-        // BEFORE launching any additional job (R3-03).
-        let pruned = QuarantineFile {
-            version: 1,
-            records: live_records,
-        };
-        let json = serde_json::to_vec_pretty(&pruned)
-            .map_err(|e| crate::Error::internal(format!("serialize containment record: {e}")))?;
-        let tmp = stage_root.join(format!("{CONTAINMENT_FILE}.tmp"));
-        write_new_file_force(&tmp, &json)?;
-        fs::rename(&tmp, &path)?;
-        sync_dir(stage_root)?;
-        return Err(crate::Error::isolation_unavailable(format!(
-            "a previously contained micro-VM process group is still live; VM jobs stay refused until it exits (see {})",
-            path.display()
-        )));
-    }
-    fs::remove_file(&path)?;
-    sync_dir(stage_root)?;
-    Ok(())
-}
-
-/// Delete a recovered record's per-run exchange directories; only plain
-/// directories this feature created, never a symlink target.
-fn release_record_dirs(record: &QuarantineRecord) {
-    for dir in [record.control_dir.as_deref(), record.result_dir.as_deref()] {
-        let Some(dir) = dir else { continue };
-        let p = Path::new(dir);
-        let Ok(md) = fs::symlink_metadata(p) else {
-            continue;
-        };
-        if md.is_dir() {
-            let _ = fs::remove_dir_all(p);
-        }
-    }
-}
-
 fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     let stage_root = crate::paths::TrustedPaths::resolve()?
         .cache_dir
         .join("sandbox-stage");
     // R2-01: refuse while any previous run's group remains contained; recover
     // the quarantine once its exact identity is proven gone.
-    recover_or_refuse(&stage_root)?;
+    prepare::recover_or_refuse(&stage_root)?;
     let validated = ValidatedPaths::new(job, &stage_root)?;
     if validated.read_only.len() > host.state.max_inputs {
         return Err(crate::Error::isolation_unavailable(format!(
@@ -620,7 +332,7 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
                        control: tempfile::TempDir,
                        result: tempfile::TempDir,
                        child: Option<Child>| {
-        let record = QuarantineRecord {
+        let record = prepare::QuarantineRecord {
             reason,
             pgid: pgid as u32,
             bound_ticks: prepare::group_bound_ticks_now(),
@@ -631,13 +343,13 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         };
-        retain_containment(
-            &stage_root,
-            Contained {
+        prepare::retain_containment(
+            Some(&stage_root),
+            prepare::Contained {
                 record,
                 _pins: pins,
-                _control: control,
-                _result: result,
+                _control: Some(control),
+                _result: Some(result),
                 _child: child,
             },
         )
@@ -1620,9 +1332,6 @@ mod tests {
         }
     }
 
-    /// Serializes tests that relocate FAIL2COMMIT_HOME and drive run_job.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     /// A minimal fake QEMU: records its sentinel marker and exits cleanly.
     fn plain_fake_qemu(home: &Path, tag: &str) -> (PathBuf, PathBuf) {
         let sentinel = home.join(format!("sentinel-{tag}"));
@@ -1663,7 +1372,7 @@ mod tests {
         // LV-03 spawn sentinel: a fake QEMU records a marker when launched. An
         // unrepresentable timeout must refuse before any spawn (marker absent);
         // a representable timeout spawns and then reports the missing outcome.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = prepare::VM_TEST_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("FAIL2COMMIT_HOME");
         std::env::set_var("FAIL2COMMIT_HOME", home.path());
@@ -1713,7 +1422,7 @@ mod tests {
         // Unconfirmed and run_job must retain every mapped guard, persist a
         // durable quarantine, refuse later VM runs while the identity is
         // live, and recover only after it is gone.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = prepare::VM_TEST_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("FAIL2COMMIT_HOME");
         std::env::set_var("FAIL2COMMIT_HOME", home.path());
@@ -1768,7 +1477,7 @@ mod tests {
 
         // Durable refusal/recovery state exists and the retained guards are
         // still on disk: containment failure must not delete mapped exchanges.
-        let qpath = stage_root.join(CONTAINMENT_FILE);
+        let qpath = stage_root.join(prepare::CONTAINMENT_FILE);
         let doc: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&qpath).unwrap()).unwrap();
         let records = doc["records"].as_array().unwrap();
@@ -1798,11 +1507,11 @@ mod tests {
         let pgid = rec["pgid"].as_u64().unwrap() as i32;
         let bound = rec["bound_ticks"].as_u64().unwrap();
         let until = Instant::now() + Duration::from_secs(5);
-        while !group_proven_gone(pgid, bound) && Instant::now() < until {
+        while !prepare::group_proven_gone(pgid, bound) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            group_proven_gone(pgid, bound),
+            prepare::group_proven_gone(pgid, bound),
             "contained identity never recovered"
         );
 
@@ -1982,12 +1691,12 @@ mod tests {
 
     #[test]
     fn quarantine_capacity_never_evicts_and_retains_refusal() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = prepare::VM_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let stage = dir.path();
         let now = prepare::group_bound_ticks_now();
-        for i in 0..MAX_CONTAINMENT_RECORDS {
-            let rec = QuarantineRecord {
+        for i in 0..prepare::MAX_CONTAINMENT_RECORDS {
+            let rec = prepare::QuarantineRecord {
                 reason: format!("fixture {i}"),
                 pgid: 900_000 + i as u32,
                 bound_ticks: now,
@@ -1995,9 +1704,9 @@ mod tests {
                 result_dir: None,
                 created_unix: i as u64,
             };
-            persist_quarantine(stage, &rec).unwrap();
+            prepare::persist_quarantine(stage, &rec).unwrap();
         }
-        let extra = QuarantineRecord {
+        let extra = prepare::QuarantineRecord {
             reason: "overflow".into(),
             pgid: 900_099,
             bound_ticks: now,
@@ -2005,23 +1714,24 @@ mod tests {
             result_dir: None,
             created_unix: 99,
         };
-        let err = persist_quarantine(stage, &extra).expect_err("full quarantine must refuse");
+        let err =
+            prepare::persist_quarantine(stage, &extra).expect_err("full quarantine must refuse");
         assert!(err.message.contains("full"), "{}", err.message);
         // No eviction: the first unresolved identity survives in the file.
-        let text = fs::read_to_string(stage.join(CONTAINMENT_FILE)).unwrap();
+        let text = fs::read_to_string(stage.join(prepare::CONTAINMENT_FILE)).unwrap();
         assert!(text.contains("fixture 0"), "{text}");
         // Persistence failure retains the guards and the in-memory refusal.
-        let guards = Contained {
+        let guards = prepare::Contained {
             record: extra,
             _pins: Vec::new(),
-            _control: tempfile::tempdir().unwrap(),
-            _result: tempfile::tempdir().unwrap(),
+            _control: Some(tempfile::tempdir().unwrap()),
+            _result: Some(tempfile::tempdir().unwrap()),
             _child: None,
         };
-        let err = retain_containment(stage, guards);
+        let err = prepare::retain_containment(Some(stage), guards);
         assert!(err.message.contains("stays quarantined in memory"), "{err}");
-        assert_eq!(contained_registry().len(), 1);
-        contained_registry().clear();
+        assert_eq!(prepare::contained_registry().len(), 1);
+        prepare::contained_registry().clear();
     }
 
     #[test]
@@ -2031,9 +1741,9 @@ mod tests {
         // with no in-process guards. Recovery must refuse before any work,
         // keep the unresolved identity durably, and clear only once the exact
         // identity is proven gone.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = prepare::VM_TEST_LOCK.lock().unwrap();
         assert!(
-            contained_registry().is_empty(),
+            prepare::contained_registry().is_empty(),
             "fixture needs a clean registry"
         );
         let home = tempfile::tempdir().unwrap();
@@ -2059,7 +1769,7 @@ mod tests {
         // Group `pgid` still holds Z; persist as a crashed host would.
         let control = stage_root.join("f2c-vm-control-restart");
         fs::create_dir(&control).unwrap();
-        let rec = QuarantineRecord {
+        let rec = prepare::QuarantineRecord {
             reason: "restart fixture".into(),
             pgid: pgid as u32,
             bound_ticks: prepare::group_bound_ticks_now(),
@@ -2067,13 +1777,14 @@ mod tests {
             result_dir: None,
             created_unix: 1,
         };
-        persist_quarantine(&stage_root, &rec).unwrap();
+        prepare::persist_quarantine(&stage_root, &rec).unwrap();
 
-        let err = recover_or_refuse(&stage_root).expect_err("live durable identity must refuse");
+        let err =
+            prepare::recover_or_refuse(&stage_root).expect_err("live durable identity must refuse");
         assert!(err.message.contains("still live"), "{}", err.message);
         assert!(control.is_dir(), "refusal must not release exchanges");
         assert!(
-            stage_root.join(CONTAINMENT_FILE).exists(),
+            stage_root.join(prepare::CONTAINMENT_FILE).exists(),
             "refusal must keep the record"
         );
 
@@ -2085,13 +1796,13 @@ mod tests {
         unsafe { libc::kill(zpid, libc::SIGKILL) };
         unsafe { libc::kill(hpid, libc::SIGKILL) };
         let until = Instant::now() + Duration::from_secs(8);
-        while !group_proven_gone(pgid, rec.bound_ticks) && Instant::now() < until {
+        while !prepare::group_proven_gone(pgid, rec.bound_ticks) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
-        recover_or_refuse(&stage_root).expect("recovery must proceed once gone");
+        prepare::recover_or_refuse(&stage_root).expect("recovery must proceed once gone");
         assert!(!control.exists(), "recovery must delete the exchange dir");
         assert!(
-            !stage_root.join(CONTAINMENT_FILE).exists(),
+            !stage_root.join(prepare::CONTAINMENT_FILE).exists(),
             "recovery must clear the record"
         );
     }
