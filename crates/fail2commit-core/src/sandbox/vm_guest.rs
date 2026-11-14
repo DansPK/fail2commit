@@ -336,8 +336,7 @@ fn verify_prepared_capability(cap_path: &Path, fd: std::os::fd::RawFd) -> crate:
             "prepared guest capability fd does not match the prepared file",
         ));
     }
-    // The token is 64 lowercase hex bytes; read it bounded without closing the
-    // borrowed descriptor.
+    // The token is 64 lowercase hex bytes.
     let mut buf = [0u8; 65];
     // SAFETY: buf is a valid writable buffer of the given length; fd is the
     // live inherited capability descriptor. read does not take ownership.
@@ -351,6 +350,11 @@ fn verify_prepared_capability(cap_path: &Path, fd: std::os::fd::RawFd) -> crate:
             "prepared guest capability token is malformed",
         ));
     }
+    // Consume the capability: the inner Bubblewrap child must not keep or be
+    // able to re-present the fd that authenticates prepared-guest dispatch.
+    // SAFETY: fd is the live descriptor this launcher owns (handed by init);
+    // after verification it is closed exactly once here.
+    unsafe { libc::close(fd) };
     Ok(())
 }
 
