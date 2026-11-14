@@ -1,0 +1,50 @@
+# FR-029 Linux VM fix review, round 2
+
+Date: 2026-11-15. Review branch: `DansPK/f2c-014-vm-linux-review-r2`.
+
+Source pin: `1d43e94c5ce9a74a41f1550abf459d8462c8cd26`.
+Worker evidence snapshot: `2a8658d3aa2a6192c34857d00c053fa05aa8553a` (`docs/dev/verify/2026-11-15-fr029-lv-review-fixes.md`).
+Source base: `42687e6fd2bf9d21655d6ef97e3b1e921f8a8d1f`.
+Prior review: `94e0fd7b062a65f84184bb60e93e0ea0787db78d` (`docs/dev/verify/REVIEW-2026-11-14-vm-linux.md`).
+
+## Verdict
+
+**Changes requested for the Linux source.** The seven original findings have substantive production fixes, but LV-03 and LV-06 do not meet their claimed whole-operation deadline because shared cleanup can wait indefinitely. A cleanup error also returns from `run_job` while the mapped-state guards are dropped without confirmed group death. Keep this source separate from runtime acceptance: no root preparation, KVM boot, QEMU 9p fd-path mapping, or export/lifecycle test ran. Do not treat the self-skipped integration cases as passes. Windows refusal from manager commit `27378f2` must survive integration; this Linux pin does not include it.
+
+## Original finding dispositions
+
+| Finding | Disposition at source pin | Evidence and remaining gate |
+|---|---|---|
+| LV-01 required input mountpoints/count | **Partially fixed; fail-closed edge R2-04.** | `vm/linux.rs:242-249,382-386` passes the actual input count; generated init creates all configured mountpoints, validates count, and mounts only required slots (`vm/prepare.rs:1039-1059`). Executable shell fixture tests cover success, invalid count, and a failing required mount when the poweroff stub kills its process group (`vm/prepare.rs:1449-1534`). Real 9p mounts and kernel shutdown remain untested. |
+| LV-02 KVM guest context | **Source fix substantially accepted; privileged success pending.** | `vm_guest.rs:258-355` checks boot identity, KVM CPUID signature, root-owned capability inode and a bounded token from inherited fd 3 before reading the control job (`vm_guest.rs:17-24`). Prepare bakes mode 0400 capability and generated root init opens it before `setpriv` (`vm/prepare.rs:245-255,1061-1068`). Job id alone is not the authority. Tests check outside-guest refusal and CPUID helper; they do not exercise a real root-owned capability success in KVM. The fd remains open in the launcher; the inner Bubblewrap child overwrites fd 3 with its status pipe (`sandbox/linux.rs:761-765,969-984`), but a live guest test is still needed to confirm the complete boundary. |
+| LV-03 pre-spawn deadline and cleanup | **Partially fixed; blocking cleanup finding R2-01.** | `vm/linux.rs:300-311` computes the checked deadline before QEMU spawn; the actual `run_job` sentinel test covers overflow (`vm/linux.rs:1163-1217`). All post-spawn branches invoke `stop_process_group` (`vm/linux.rs:314-341`), but its leader wait is unbounded after the grace (`vm/prepare.rs:562-575`) and a cleanup error releases guards before confirmed death. |
+| LV-04 QEMU suboptions and paths | **Source fix accepted; real QEMU parser pending.** | `vm/linux.rs:395-436` uses fd paths for pinned shares, doubles commas in `-fsdev` option values, and rejects non-UTF-8 unpinned paths. Render tests exercise option-looking text; the actual comma-path boot case self-skipped (`tests/sandbox_vm_linux.rs:236-268`). No QEMU `/proc/self/fd/N` or comma-path acceptance has been demonstrated. |
+| LV-05 stable share identity | **Source mechanism present; runtime and inheritance review pending.** | `vm/linux.rs:278-298,720-773` re-walks stage identities, opens directory anchors with `O_PATH|O_NOFOLLOW|O_DIRECTORY`, verifies stage inode identities, explicitly clears `FD_CLOEXEC`, and holds pins in `run_job`. Swap tests prove `/proc/self/fd/N` resolves the original inode in the *test process* (`vm/linux.rs:1219-1287`); they do not spawn QEMU or prove its 9p local backend accepts that root path. See R2-01 for early pin release if cleanup fails and R2-03 for descriptor inheritance scope. |
+| LV-06 bounded QEMU queries | **Partially fixed; blocking cleanup finding R2-01.** | `vm/prepare.rs:608-690` starts a process group, drains a capped stdout concurrently, detects oversized output and attempts to stop descendants. Tests exercise pipe pressure, background `sleep`, timeout, and cap (`vm/prepare.rs:1538-1600`). `stop_process_group` can block indefinitely, and after leader exit the code gives cleanup plus reader separate full grace windows beyond the original deadline. See R2-02. |
+| LV-07 selected tools and compressed modules | **Source fix accepted; preparation/boot pending.** | `vm/prepare.rs:186-202,274-285,993-1069` selects trusted paths and renders the actual busybox/setpriv/kmod paths. `module_base_name` handles `.ko`, `.ko.xz`, `.ko.zst` and recursive closure from `modules.dep` (`vm/prepare.rs:718-789`); fixtures exercise normalized names and missing modules. This does not prove distro-specific module loading or initramfs boot. |
+
+## Concrete residual findings
+
+### R2-01 — High: cleanup is neither bounded nor guaranteed before mapped state is released
+
+**Trigger:** QEMU or a query child ignores/fails to terminate promptly, or `try_wait` repeatedly returns `Ok(None)` after `SIGKILL` (for example uninterruptible kernel sleep). In `vm/prepare.rs:562-575`, expiration of `CONTROL_GRACE` calls blocking `child.wait()` with no deadline. The cleanup function therefore has no actual upper bound. If its later group probe returns an error, `run_job` propagates `?` at `vm/linux.rs:317,327,334,340`, returning while `_pins`, `control_dir`, and `result_dir` drop even though group death was not confirmed. This violates the claimed pin and mapping lifetime and can leave a live QEMU with removed exchanges. **Fix:** use a truly bounded reap/probe path, define the fail-closed owner of mapped guards when termination cannot be confirmed, and test an injected nonterminating/failed cleanup path through the production `run_job` call site. A group kill by itself is insufficient proof that the guards may drop.
+
+### R2-02 — Medium: feature query's absolute deadline does not cover cleanup or reader completion
+
+**Trigger:** the query leader exits near its deadline while a descendant retains stdout, or cleanup takes its allowed grace. `vm/prepare.rs:645-670` waits for the leader until the first absolute deadline, then starts a fresh `CONTROL_GRACE` for `stop_process_group` and another full `grace` for `recv_timeout` at lines 669-675. The query can exceed the advertised whole-query deadline even when the unbounded wait in R2-01 is repaired. A descendant that escaped the group can keep the detached reader blocked after the caller returns on receive timeout; there is no owned reader join or cancellation path. **Fix:** pass one absolute deadline through leader wait, group stop, and reader completion; ensure reader termination is owned and confirmed or use bounded nonblocking pipe reads in the caller. Add a production-path test with a leader exiting just before deadline and a retained pipe.
+
+### R2-03 — Low: all share pins are inheritable during the host spawn window
+
+**Trigger:** another thread in the host process spawns an unrelated child between `pin_shares` and pin drop. `vm/linux.rs:744-771` clears `FD_CLOEXEC` on each descriptor in the parent process; `vm/linux.rs:288-341` keeps them open throughout the QEMU lifetime. Any concurrently spawned child inherits those stage, control, and result path handles unless its own launch explicitly closes them. The pin unit test proves the flag is clear but does not assert a QEMU-only inheritance allowlist. **Fix:** arrange descriptor inheritance only for QEMU (for example child-side duplication/allowlisting under a controlled spawn) and retain close-on-exec in the parent. This is a descriptor scope finding, not proof of a new same-user filesystem authorization bypass.
+
+### R2-04 — Medium: init continues after a failed shutdown command
+
+**Trigger:** a required 9p mount or module load fails, and `busybox poweroff -f` itself returns unsuccessfully (or returns before shutdown). Each generated branch uses `command || $BB poweroff -f` (`vm/prepare.rs:1023-1037,1056-1059`) with no subsequent `exit`; the shell proceeds to the next mount and ultimately `setpriv` dispatch. The fixture's fake poweroff kills the entire test process group (`vm/prepare.rs:1383,1428-1430`), so it cannot detect this path. **Fix:** make every failure branch terminate init regardless of shutdown command result, and add a fixture where poweroff returns failure while asserting the launcher is never reached.
+
+## Evidence and acceptance limits
+
+- Inspected the delta in `vm/linux.rs`, `vm/prepare.rs`, `vm_guest.rs`, and the Linux integration tests against the pinned base and worker report. `git diff --check` on the base-to-pin diff was clean. This review made no production edits and did not repeat the worker's broad cold build.
+- Worker reports `cargo test -p fail2commit-core --lib vm`: 38 pass; protocol: 9 pass; Linux integration: 7 functions, 3 exercised and 4 self-skipped; workspace check: exit 0; changed files clippy clean while untouched Linux baseline warnings fail `-D warnings`; fmt clean. I treated these as reported evidence, not independently rerun results.
+- The executable init fixtures use fake mount/poweroff tools, and the fd pin tests use `/proc/self/fd` in the test process. Neither establishes actual guest boot, QEMU option parsing, 9p local backend fd-root acceptance, root capability success, mounted control/result isolation, or VM exit/export authority. Those remain runtime gates after R2-01/R2-02 source fixes.
+- `tests/sandbox_vm_linux.rs:93-136,175-268` gates root preparation and three boot/lifecycle cases behind root, QEMU, KVM, preparation, and explicit opt-in. On the reported host they did not run. Actual QEMU process-tree cleanup, export only after valid outcome and clean VM exit, and host stage lifetime remain pending.
+- Integration must preserve the manager's Windows VM probe/run/guest refusal from `27378f2`; this Linux source branch does not itself establish that merged behavior.
