@@ -597,55 +597,103 @@ pub(super) fn stop_process_group(child: &mut Child) -> crate::Result<()> {
 }
 
 fn run_bounded(exe: &Path, args: &[&str]) -> crate::Result<String> {
+    run_bounded_with_grace(exe, args, CONTROL_GRACE)
+}
+
+/// Bounded QEMU capability query (LV-06). The whole owned process group is
+/// deadline-bound, stdout is cap-drained concurrently (a full pipe must never
+/// block the child), and reader completion is bounded too (a descendant may
+/// hold the pipe after the leader exits). Kill/wait failures are surfaced, not
+/// ignored. The output cap alone is not a time bound; the deadlines are.
+fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::Result<String> {
+    let deadline = Instant::now()
+        .checked_add(grace)
+        .ok_or_else(|| Error::isolation_unavailable("qemu query deadline cannot be represented"))?;
     let mut child = Command::new(exe)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .map_err(|e| Error::isolation_unavailable(format!("start {}: {e}", exe.display())))?;
-    let deadline = Instant::now() + CONTROL_GRACE;
-    loop {
+    let stdout = child.stdout.take().expect("piped stdout");
+    // Cap-drain on a thread so a verbose response cannot fill the pipe and
+    // block the child, and keep counting past the cap to detect oversize.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut total = 0usize;
+        let mut buf = [0u8; 16 * 1024];
+        let mut r = stdout;
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total = total.saturating_add(n);
+                    if out.len() <= MAX_QUERY_OUTPUT {
+                        let keep = n.min(MAX_QUERY_OUTPUT + 1 - out.len());
+                        out.extend_from_slice(&buf[..keep]);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send((out, total));
+    });
+    // Wait for the leader within the deadline.
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut out = Vec::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    stdout
-                        .by_ref()
-                        .take(MAX_QUERY_OUTPUT as u64 + 1)
-                        .read_to_end(&mut out)?;
-                }
-                if !status.success() {
-                    return Err(Error::isolation_unavailable(format!(
-                        "{} {:?} exited unsuccessfully",
-                        exe.display(),
-                        args
-                    )));
-                }
-                if out.len() > MAX_QUERY_OUTPUT {
-                    return Err(Error::isolation_unavailable(
-                        "qemu query output is oversized",
-                    ));
-                }
-                return String::from_utf8(out)
-                    .map_err(|_| Error::isolation_unavailable("qemu query output is not UTF-8"));
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Error::isolation_unavailable("qemu query timed out"));
+                let cleanup = stop_process_group(&mut child);
+                return Err(Error::isolation_unavailable(format!(
+                    "qemu query timed out{}",
+                    cleanup_suffix(cleanup)
+                )));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let cleanup = stop_process_group(&mut child);
                 return Err(Error::isolation_unavailable(format!(
-                    "wait for qemu query: {e}"
+                    "wait for qemu query: {e}{}",
+                    cleanup_suffix(cleanup)
                 )));
             }
         }
+    };
+    // The leader exited; descendants may still hold stdout. Stop the whole
+    // group so the reader gets EOF, then bound reader completion and surface
+    // any cleanup uncertainty.
+    let cleanup = stop_process_group(&mut child);
+    let received = rx.recv_timeout(grace);
+    cleanup?;
+    let (out, total) = received.map_err(|_| {
+        Error::isolation_unavailable(
+            "qemu query output reader did not finish after the process group was stopped",
+        )
+    })?;
+    if !status.success() {
+        return Err(Error::isolation_unavailable(format!(
+            "{} {:?} exited unsuccessfully",
+            exe.display(),
+            args
+        )));
+    }
+    if total > MAX_QUERY_OUTPUT {
+        return Err(Error::isolation_unavailable(
+            "qemu query output is oversized",
+        ));
+    }
+    String::from_utf8(out)
+        .map_err(|_| Error::isolation_unavailable("qemu query output is not UTF-8"))
+}
+
+fn cleanup_suffix(cleanup: crate::Result<()>) -> String {
+    match cleanup {
+        Ok(()) => String::new(),
+        Err(e) => format!("; cleanup uncertain: {}", e.message),
     }
 }
 
@@ -1481,6 +1529,72 @@ exit 0
         let log = init_log(&f);
         assert!(log.contains("POWEROFF"));
         assert!(!log.contains("setpriv"));
+    }
+
+    // ---- Bounded query fixtures (LV-06) ----
+
+    #[test]
+    fn bounded_query_drains_pipe_pressure_concurrently() {
+        // >64KB pipe buffer: waiting for exit before draining would deadlock.
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(
+            dir.path(),
+            "q",
+            "#!/bin/sh\nn=0\nwhile [ $n -lt 200 ]; do printf '%01024d' 0; n=$((n+1)); done\n",
+        );
+        let out = run_bounded_with_grace(&script, &[], Duration::from_secs(10)).unwrap();
+        assert_eq!(out.len(), 200 * 1024);
+    }
+
+    #[test]
+    fn bounded_query_stops_descendant_held_pipe() {
+        // The leader exits but a background descendant keeps stdout open; the
+        // group stop must close the pipe so the reader finishes promptly.
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(
+            dir.path(),
+            "q",
+            "#!/bin/sh\necho leader-output\n(sleep 30) &\nexit 0\n",
+        );
+        let start = Instant::now();
+        let out = run_bounded_with_grace(&script, &[], Duration::from_secs(5)).unwrap();
+        assert!(out.contains("leader-output"));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "must not wait for the descendant-held pipe"
+        );
+    }
+
+    #[test]
+    fn bounded_query_times_out_and_kills_the_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = fixture_script(
+            dir.path(),
+            "q",
+            &format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", pidfile.display()),
+        );
+        let err = run_bounded_with_grace(&script, &[], Duration::from_secs(1)).unwrap_err();
+        assert!(err.message.contains("timed out"), "{}", err.message);
+        let pid: i32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: a zero signal only probes existence of the killed leader.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "leader must be dead");
+    }
+
+    #[test]
+    fn bounded_query_rejects_oversized_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fixture_script(
+            dir.path(),
+            "q",
+            "#!/bin/sh\nn=0\nwhile [ $n -lt 1100 ]; do printf '%01024d' 0; n=$((n+1)); done\n",
+        );
+        let err = run_bounded_with_grace(&script, &[], Duration::from_secs(10)).unwrap_err();
+        assert!(err.message.contains("oversized"), "{}", err.message);
     }
 
     #[test]
