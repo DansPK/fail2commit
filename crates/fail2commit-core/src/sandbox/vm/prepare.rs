@@ -14,7 +14,7 @@ use crate::Error;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -1575,7 +1575,10 @@ pub(super) fn contained_registry() -> std::sync::MutexGuard<'static, Vec<Contain
 /// Persist the durable quarantine record. Written 0600 with create+rename
 /// and a parent-directory fsync so a crash cannot lose an unresolved
 /// identity whose inherited pins still live in the child (R3-03).
-fn persist_quarantine(quarantine_dir: &Path, record: &QuarantineRecord) -> crate::Result<()> {
+pub(super) fn persist_quarantine(
+    quarantine_dir: &Path,
+    record: &QuarantineRecord,
+) -> crate::Result<()> {
     let path = quarantine_dir.join(CONTAINMENT_FILE);
     let mut file = if path.exists() {
         fs::OpenOptions::new()
