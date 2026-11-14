@@ -11,6 +11,8 @@ use std::path::Path;
 const MAX_REQUEST: usize = 16 * 1024;
 #[cfg(any(target_os = "linux", windows))]
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(any(windows, test))]
+const RESPONSE_ACK: &[u8] = b"F2C-RESPONSE-READ\n";
 
 #[cfg(any(target_os = "linux", windows, test))]
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -56,7 +58,7 @@ struct PrepareAck {
     detail: String,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const MAX_PREPARE_FRAME: usize = 4096;
 
 #[cfg(any(target_os = "linux", windows, test))]
@@ -191,13 +193,19 @@ fn service_request_on_pipe(pipe: &mut std::fs::File, request: &Request) -> crate
     pipe.write_all(&encoded)?;
     pipe.write_all(b"\n")?;
     pipe.flush()?;
-    let mut reader = BufReader::new(pipe);
+    let mut reader = BufReader::new(&mut *pipe);
     let mut line = Vec::new();
     reader
         .by_ref()
         .take(MAX_REQUEST as u64)
         .read_until(b'\n', &mut line)?;
-    decode_response(&line)
+    let reply = decode_response(&line)?;
+    // The server disconnects only after it sees this private completion frame,
+    // proving the entire bounded response line was consumed by the client.
+    drop(reader);
+    pipe.write_all(RESPONSE_ACK)?;
+    pipe.flush()?;
+    Ok(reply)
 }
 
 #[cfg(any(target_os = "linux", windows, test))]
@@ -220,6 +228,47 @@ fn response(ok: bool, detail: impl Into<String>) -> Response {
         containment_confirmed: true,
         detail: detail.into(),
     }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipeConnectDecision {
+    InitialAvailability,
+    Connected,
+    Listening,
+    PreviousClientClosed,
+    Unexpected,
+}
+
+#[cfg(any(windows, test))]
+fn classify_pipe_connect(
+    first_call: bool,
+    call_succeeded: bool,
+    error: u32,
+    pipe_connected: u32,
+    pipe_listening: u32,
+    no_data: u32,
+) -> PipeConnectDecision {
+    if call_succeeded {
+        if first_call {
+            PipeConnectDecision::InitialAvailability
+        } else {
+            PipeConnectDecision::Unexpected
+        }
+    } else if error == pipe_connected {
+        PipeConnectDecision::Connected
+    } else if error == pipe_listening {
+        PipeConnectDecision::Listening
+    } else if error == no_data {
+        PipeConnectDecision::PreviousClientClosed
+    } else {
+        PipeConnectDecision::Unexpected
+    }
+}
+
+#[cfg(any(windows, test))]
+fn valid_response_ack(bytes: &[u8]) -> bool {
+    bytes == RESPONSE_ACK
 }
 
 #[cfg(any(windows, test))]
@@ -495,16 +544,15 @@ pub(super) fn probe_windows() -> (bool, bool, String) {
         let mut file = std::fs::File::from(handle);
         file.write_all(b"{\"op\":\"STATUS\"}\n")?;
         let mut line = Vec::new();
-        BufReader::new(file)
+        let mut reader = BufReader::new(file);
+        reader
+            .by_ref()
             .take(MAX_REQUEST as u64)
             .read_until(b'\n', &mut line)?;
-        if line.len() >= MAX_REQUEST || !line.ends_with(b"\n") {
-            return Err(crate::Error::integrity(
-                "hardened service response exceeds size limit",
-            ));
-        }
-        let reply = serde_json::from_slice::<Response>(&line)
-            .map_err(|_| crate::Error::integrity("malformed hardened service status response"))?;
+        let reply = decode_response(&line)?;
+        let mut file = reader.into_inner();
+        file.write_all(RESPONSE_ACK)?;
+        file.flush()?;
         if !reply.ok || !reply.service_running {
             return Err(crate::Error::isolation_unavailable(
                 "hardened service status was rejected",
@@ -984,9 +1032,40 @@ enum PrepareRead {
     Invalid(String),
 }
 
+#[cfg(any(windows, test))]
+fn accumulate_prepare_frame(
+    buffer: &mut Vec<u8>,
+    fragment: &[u8],
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    if buffer.len().saturating_add(fragment.len()) > MAX_PREPARE_FRAME + 4 {
+        return Err("preparation frame exceeds its bound".into());
+    }
+    buffer.extend_from_slice(fragment);
+    if buffer.len() < 4 {
+        return Ok(None);
+    }
+    let length = u32::from_le_bytes(buffer[..4].try_into().expect("four-byte length")) as usize;
+    if length == 0 || length > MAX_PREPARE_FRAME {
+        return Err("preparation frame size is invalid".into());
+    }
+    let expected = length + 4;
+    if buffer.len() < expected {
+        return Ok(None);
+    }
+    if buffer.len() != expected {
+        return Err("preparation frame contains a duplicate or trailing suffix".into());
+    }
+    let payload = buffer[4..].to_vec();
+    buffer.clear();
+    Ok(Some(payload))
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn read_prepare_request(pipe: windows_sys::Win32::Foundation::HANDLE) -> PrepareRead {
+fn read_prepare_request(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    buffer: &mut Vec<u8>,
+) -> PrepareRead {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Storage::FileSystem::ReadFile;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
@@ -1007,45 +1086,34 @@ fn read_prepare_request(pipe: windows_sys::Win32::Foundation::HANDLE) -> Prepare
             unsafe { GetLastError() }
         ));
     }
-    if available < 4 {
+    if available == 0 {
         return PrepareRead::Pending;
     }
-    let mut header = [0u8; 4];
+    let capacity = MAX_PREPARE_FRAME + 4 - buffer.len();
+    if capacity == 0 {
+        return PrepareRead::Invalid("launcher preparation frame exceeded its bound".into());
+    }
+    let mut fragment = vec![0u8; (available as usize).min(4096).min(capacity)];
     let mut read = 0u32;
     if unsafe {
         ReadFile(
             pipe,
-            header.as_mut_ptr().cast(),
-            header.len() as u32,
+            fragment.as_mut_ptr().cast(),
+            fragment.len() as u32,
             &mut read,
             std::ptr::null_mut(),
         )
     } == 0
-        || read != header.len() as u32
+        || read == 0
     {
-        return PrepareRead::Invalid("launcher preparation frame header is incomplete".into());
+        return PrepareRead::Invalid("cannot read launcher preparation frame fragment".into());
     }
-    let length = u32::from_le_bytes(header) as usize;
-    if length == 0 || length > MAX_PREPARE_FRAME {
-        return PrepareRead::Invalid("launcher preparation frame size is invalid".into());
-    }
-    if (available as usize) < 4 + length {
-        return PrepareRead::Invalid("launcher preparation frame was truncated".into());
-    }
-    let mut payload = vec![0u8; length];
-    if unsafe {
-        ReadFile(
-            pipe,
-            payload.as_mut_ptr().cast(),
-            length as u32,
-            &mut read,
-            std::ptr::null_mut(),
-        )
-    } == 0
-        || read as usize != length
-    {
-        return PrepareRead::Invalid("launcher preparation frame payload is incomplete".into());
-    }
+    fragment.truncate(read as usize);
+    let payload = match accumulate_prepare_frame(buffer, &fragment) {
+        Ok(None) => return PrepareRead::Pending,
+        Ok(Some(payload)) => payload,
+        Err(detail) => return PrepareRead::Invalid(detail),
+    };
     match decode_prepare_request(&payload) {
         Ok(request) => PrepareRead::Request(request),
         Err(error) => PrepareRead::Invalid(error.message),
@@ -1320,8 +1388,9 @@ impl PreparationClient {
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut ack_buffer = Vec::new();
         loop {
-            match read_prepare_ack(self.ack.as_raw_handle() as HANDLE)? {
+            match read_prepare_ack(self.ack.as_raw_handle() as HANDLE, &mut ack_buffer)? {
                 None if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
@@ -1355,6 +1424,7 @@ fn is_launch_id(value: &str) -> bool {
 #[allow(unsafe_code)]
 fn read_prepare_ack(
     pipe: windows_sys::Win32::Foundation::HANDLE,
+    buffer: &mut Vec<u8>,
 ) -> crate::Result<Option<PrepareAck>> {
     use windows_sys::Win32::Storage::FileSystem::ReadFile;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
@@ -1374,53 +1444,38 @@ fn read_prepare_ack(
             "SYSTEM service closed the WFP acknowledgement pipe",
         ));
     }
-    if available < 4 {
+    if available == 0 {
         return Ok(None);
     }
-    let mut header = [0u8; 4];
+    let capacity = MAX_PREPARE_FRAME + 4 - buffer.len();
+    if capacity == 0 {
+        return Err(crate::Error::integrity(
+            "WFP acknowledgement frame exceeded its bound",
+        ));
+    }
+    let mut fragment = vec![0u8; (available as usize).min(4096).min(capacity)];
     let mut read = 0u32;
     if unsafe {
         ReadFile(
             pipe,
-            header.as_mut_ptr().cast(),
-            4,
+            fragment.as_mut_ptr().cast(),
+            fragment.len() as u32,
             &mut read,
             std::ptr::null_mut(),
         )
     } == 0
-        || read != 4
+        || read == 0
     {
         return Err(crate::Error::integrity(
-            "WFP acknowledgement header was incomplete",
+            "cannot read WFP acknowledgement frame fragment",
         ));
     }
-    let length = u32::from_le_bytes(header) as usize;
-    if length == 0 || length > MAX_PREPARE_FRAME {
-        return Err(crate::Error::integrity(
-            "WFP acknowledgement size is invalid",
-        ));
-    }
-    if (available as usize) < length + 4 {
-        return Err(crate::Error::integrity(
-            "WFP acknowledgement frame was truncated",
-        ));
-    }
-    let mut payload = vec![0u8; length];
-    if unsafe {
-        ReadFile(
-            pipe,
-            payload.as_mut_ptr().cast(),
-            length as u32,
-            &mut read,
-            std::ptr::null_mut(),
-        )
-    } == 0
-        || read as usize != length
-    {
-        return Err(crate::Error::integrity(
-            "WFP acknowledgement payload was incomplete",
-        ));
-    }
+    fragment.truncate(read as usize);
+    let payload =
+        match accumulate_prepare_frame(buffer, &fragment).map_err(crate::Error::integrity)? {
+            None => return Ok(None),
+            Some(payload) => payload,
+        };
     serde_json::from_slice(&payload)
         .map(Some)
         .map_err(|_| crate::Error::integrity("WFP acknowledgement frame is malformed"))
@@ -1685,6 +1740,21 @@ fn write_pipe_response(
 }
 
 #[cfg(windows)]
+fn write_pipe_response_and_wait_ack(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    reply: &Response,
+) -> crate::Result<()> {
+    write_pipe_response(pipe, reply)?;
+    let ack = read_pipe_request(pipe)?;
+    if !valid_response_ack(&ack) {
+        return Err(crate::Error::integrity(
+            "authenticated service response acknowledgement was malformed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn service_loop_windows() -> crate::Result<()> {
     use crate::ipc::winsec::{self, PipeSecurity};
@@ -1693,8 +1763,8 @@ fn service_loop_windows() -> crate::Result<()> {
     use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED,
-        INVALID_HANDLE_VALUE,
+        GetLastError, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+        ERROR_PIPE_NOT_CONNECTED, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
@@ -1760,21 +1830,62 @@ fn service_loop_windows() -> crate::Result<()> {
         if SERVICE_STOP_REQUESTED.load(Ordering::SeqCst) {
             break Ok(());
         }
-        // SAFETY: raw is a connected server pipe handle; NULL requests sync IO.
-        let mut connected = unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) } != 0;
-        while !connected && unsafe { GetLastError() } == ERROR_PIPE_LISTENING {
-            if SERVICE_STOP_REQUESTED.load(Ordering::SeqCst) {
-                break;
+        // In PIPE_NOWAIT mode the first successful call only makes this
+        // instance available; it does not prove a client connected. Only the
+        // ERROR_PIPE_CONNECTED result is evidence of a completed connection.
+        let connected = {
+            let mut first_connect = true;
+            loop {
+                if SERVICE_STOP_REQUESTED.load(Ordering::SeqCst) {
+                    break false;
+                }
+                // SAFETY: raw is the owned server pipe handle; NULL requests
+                // synchronous nonblocking connect behavior.
+                let connected_call = unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) } != 0;
+                let code = unsafe { GetLastError() };
+                let decision = classify_pipe_connect(
+                    first_connect,
+                    connected_call,
+                    code,
+                    ERROR_PIPE_CONNECTED,
+                    ERROR_PIPE_LISTENING,
+                    ERROR_NO_DATA,
+                );
+                first_connect = false;
+                match decision {
+                    PipeConnectDecision::Connected => break true,
+                    PipeConnectDecision::InitialAvailability | PipeConnectDecision::Listening => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    PipeConnectDecision::PreviousClientClosed => {
+                        // A previous client closed before this accept completed.
+                        // Reset only this completed/stale client state, never the
+                        // initial availability transition above.
+                        // SAFETY: raw is our owned instance and ERROR_NO_DATA says
+                        // its previous client has closed.
+                        if unsafe { DisconnectNamedPipe(raw) } == 0 {
+                            let reset = unsafe { GetLastError() };
+                            if reset != ERROR_PIPE_NOT_CONNECTED {
+                                return Err(crate::Error::isolation_unavailable(format!(
+                                "cannot reset stale hardened service pipe (Win32 error {reset})"
+                            )));
+                            }
+                        }
+                        first_connect = true;
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    PipeConnectDecision::Unexpected => {
+                        return Err(crate::Error::isolation_unavailable(format!(
+                            "ConnectNamedPipe returned an unrecognized state (Win32 error {code})"
+                        )));
+                    }
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            connected = unsafe { ConnectNamedPipe(raw, std::ptr::null_mut()) } != 0;
-        }
-        connected |= unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+        };
         if !connected {
-            if SERVICE_STOP_REQUESTED.load(Ordering::SeqCst) {
-                break Ok(());
-            }
-            continue;
+            break Ok(());
         }
         macro_rules! disconnect_and_continue {
             () => {{
@@ -1813,7 +1924,7 @@ fn service_loop_windows() -> crate::Result<()> {
         let line = match read_pipe_request(raw) {
             Ok(line) => line,
             Err(_) => {
-                let _ = write_pipe_response(
+                let _ = write_pipe_response_and_wait_ack(
                     raw,
                     &response(false, "malformed or timed-out service request"),
                 );
@@ -1823,7 +1934,7 @@ fn service_loop_windows() -> crate::Result<()> {
         let request = match decode_request(&line) {
             Ok(request) => request,
             Err(_) => {
-                let _ = write_pipe_response(
+                let _ = write_pipe_response_and_wait_ack(
                     raw,
                     &response(false, "malformed or timed-out service request"),
                 );
@@ -1875,7 +1986,7 @@ fn service_loop_windows() -> crate::Result<()> {
             },
             _ => response(false, "unknown or malformed operation"),
         };
-        let _ = write_pipe_response(raw, &reply);
+        let _ = write_pipe_response_and_wait_ack(raw, &reply);
         // Do not call FlushFileBuffers: it could wait on a peer that keeps its
         // client handle open. WriteFile completed the bounded response, and
         // disconnecting resets this same listener instance for the next peer.
@@ -2728,6 +2839,7 @@ fn run_snapshot_as_sandbox(
         let mut watchdog = Some(write_end);
         let mut disconnected_at = None;
         let preparation_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut preparation_buffer = Vec::new();
         loop {
             let waited = unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 100) };
             if waited == 0 {
@@ -2779,7 +2891,10 @@ fn run_snapshot_as_sandbox(
                 }
             }
             if network_guard.is_none() {
-                match read_prepare_request(request_read.as_raw_handle() as HANDLE) {
+                match read_prepare_request(
+                    request_read.as_raw_handle() as HANDLE,
+                    &mut preparation_buffer,
+                ) {
                     PrepareRead::Pending => {}
                     PrepareRead::Invalid(detail) => {
                         watchdog.take();
@@ -2923,7 +3038,10 @@ fn run_snapshot_as_sandbox(
                     ));
                 }
             } else {
-                let read = read_prepare_request(request_read.as_raw_handle() as HANDLE);
+                let read = read_prepare_request(
+                    request_read.as_raw_handle() as HANDLE,
+                    &mut preparation_buffer,
+                );
                 if is_duplicate_prepare(true, &read) {
                     watchdog.take();
                     if let Err(termination) =
@@ -2998,6 +3116,34 @@ fn run_snapshot_as_sandbox(
         }
         return launch_result;
     }
+    // The durable marker covers the entire grant/filter cleanup interval. A
+    // failed revoke or WFP close must therefore remain visible to STATUS,
+    // direct LAUNCH requests, and uninstall after this process returns.
+    if let Some(mut grants) = package_grants.take() {
+        if let Err(error) = grants.release() {
+            LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+            if let Some(marker) = active_marker.as_mut() {
+                marker.retain();
+            }
+            return Err(crate::Error::isolation_unavailable(format!(
+                "job tree exited but package ACL revocation failed: {}",
+                error.message
+            )));
+        }
+    }
+    if let Some(mut guard) = network_guard.take() {
+        if let Err(error) = guard.close() {
+            LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+            if let Some(marker) = active_marker.as_mut() {
+                marker.retain();
+            }
+            // Keep the live dynamic session owned while the service remains
+            // running; process shutdown will close it, while the marker blocks
+            // any later job or uninstall attempt.
+            std::mem::forget(guard);
+            return Err(error);
+        }
+    }
     // SAFETY: the launcher process was observed signaled or forced termination
     // was confirmed before unloading the sandbox account profile.
     if unsafe { UnloadUserProfile(token_raw, profile.profile) } == 0 {
@@ -3025,16 +3171,6 @@ fn run_snapshot_as_sandbox(
     {
         diagnostic_stage.marker_cleared = true;
     }
-    if let Some(mut grants) = package_grants.take() {
-        if let Err(error) = grants.release() {
-            LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
-            return Err(crate::Error::isolation_unavailable(format!(
-                "job tree exited but package ACL revocation failed: {}",
-                error.message
-            )));
-        }
-    }
-    drop(network_guard);
     #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
     {
         diagnostic_stage.package_grants_revoked = package_grants.is_none();
@@ -3874,6 +4010,90 @@ mod tests {
         assert!(!response.ok);
         assert!(decode_response(b"{\"ok\":true}").is_err());
         assert!(decode_response(&vec![b'x'; MAX_REQUEST]).is_err());
+    }
+
+    #[test]
+    fn response_ack_is_exact_and_pipe_connect_needs_error_connected_proof() {
+        const ERROR_PIPE_CONNECTED_TEST: u32 = 535;
+        const ERROR_PIPE_LISTENING_TEST: u32 = 536;
+        const ERROR_NO_DATA_TEST: u32 = 232;
+        assert!(valid_response_ack(RESPONSE_ACK));
+        assert!(!valid_response_ack(b"F2C-RESPONSE-READ"));
+        assert!(!valid_response_ack(b"F2C-RESPONSE-READ\nextra"));
+
+        assert_eq!(
+            classify_pipe_connect(
+                true,
+                true,
+                0,
+                ERROR_PIPE_CONNECTED_TEST,
+                ERROR_PIPE_LISTENING_TEST,
+                ERROR_NO_DATA_TEST,
+            ),
+            PipeConnectDecision::InitialAvailability,
+            "initial nonzero availability is not an authenticated connection"
+        );
+        assert_eq!(
+            classify_pipe_connect(
+                false,
+                false,
+                ERROR_PIPE_CONNECTED_TEST,
+                ERROR_PIPE_CONNECTED_TEST,
+                ERROR_PIPE_LISTENING_TEST,
+                ERROR_NO_DATA_TEST,
+            ),
+            PipeConnectDecision::Connected
+        );
+        assert_eq!(
+            classify_pipe_connect(
+                false,
+                false,
+                ERROR_PIPE_LISTENING_TEST,
+                ERROR_PIPE_CONNECTED_TEST,
+                ERROR_PIPE_LISTENING_TEST,
+                ERROR_NO_DATA_TEST,
+            ),
+            PipeConnectDecision::Listening
+        );
+        assert_eq!(
+            classify_pipe_connect(
+                false,
+                false,
+                ERROR_NO_DATA_TEST,
+                ERROR_PIPE_CONNECTED_TEST,
+                ERROR_PIPE_LISTENING_TEST,
+                ERROR_NO_DATA_TEST,
+            ),
+            PipeConnectDecision::PreviousClientClosed
+        );
+    }
+
+    #[test]
+    fn preparation_frame_accumulates_fragmented_length_and_payload() {
+        let payload = b"fragmented preparation payload";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(payload);
+        let mut buffered = Vec::new();
+
+        assert_eq!(
+            accumulate_prepare_frame(&mut buffered, &frame[..2]).unwrap(),
+            None,
+            "a split length prefix remains pending"
+        );
+        assert_eq!(
+            accumulate_prepare_frame(&mut buffered, &frame[2..7]).unwrap(),
+            None,
+            "a complete prefix with partial payload remains pending"
+        );
+        assert_eq!(
+            accumulate_prepare_frame(&mut buffered, &frame[7..]).unwrap(),
+            Some(payload.to_vec())
+        );
+        assert!(buffered.is_empty());
+
+        let mut invalid = Vec::new();
+        assert!(accumulate_prepare_frame(&mut invalid, &u32::MAX.to_le_bytes()).is_err());
     }
 
     #[cfg(windows)]

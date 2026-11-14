@@ -141,6 +141,24 @@ impl PackageGuard {
         }
         Ok(())
     }
+
+    /// Close the dynamic session and surface failure to the caller so it can
+    /// retain the active-launch refusal marker until filter cleanup is known.
+    pub(crate) fn close(&mut self) -> crate::Result<()> {
+        if self.engine.is_null() {
+            return Ok(());
+        }
+        let status = unsafe {
+            windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineClose0(
+                self.engine,
+            )
+        };
+        if status != 0 {
+            return Err(wfp_error("FwpmEngineClose0", status));
+        }
+        self.engine = std::ptr::null_mut();
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -159,14 +177,7 @@ fn required_block_layers() -> [windows_sys::core::GUID; 6] {
 #[cfg(windows)]
 impl Drop for PackageGuard {
     fn drop(&mut self) {
-        if !self.engine.is_null() {
-            unsafe {
-                windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineClose0(
-                    self.engine,
-                );
-            }
-            self.engine = std::ptr::null_mut();
-        }
+        let _ = self.close();
     }
 }
 

@@ -117,12 +117,17 @@ pub(crate) fn find_head_end(head: &[u8]) -> Option<usize> {
 }
 
 pub(crate) fn content_length(head: &[u8]) -> Option<usize> {
-    String::from_utf8_lossy(head).lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse().ok())
-            .flatten()
-    })
+    for line in String::from_utf8_lossy(head).lines() {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                // Preserve the Linux proxy's original first-match behavior:
+                // a malformed first Content-Length rejects body parsing, even
+                // if a later duplicate happens to be parseable.
+                return value.trim().parse().ok();
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -167,6 +172,18 @@ mod tests {
         assert_eq!(
             content_length(b"POST http://example.test/ HTTP/1.1\r\ncontent-length: 7\r\n\r\n"),
             Some(7)
+        );
+        assert_eq!(
+            content_length(
+                b"POST http://example.test/ HTTP/1.1\r\ncontent-length: bad\r\ncontent-length: 7\r\n\r\n"
+            ),
+            None
+        );
+        assert_eq!(
+            content_length(
+                b"POST http://example.test/ HTTP/1.1\r\ncontent-length: 5\r\ncontent-length: 7\r\n\r\n"
+            ),
+            Some(5)
         );
 
         let watch = Watch::default();

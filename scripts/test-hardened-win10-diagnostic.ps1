@@ -35,7 +35,9 @@ function Wait-ServicePipe {
             $reader=[IO.StreamReader]::new($pipe,[Text.Encoding]::ASCII,$false,1024,$true)
             $writer.AutoFlush=$true
             $writer.WriteLine('{"op":"STATUS"}')
-            $reply=$reader.ReadLine() | ConvertFrom-Json
+            $responseLine=$reader.ReadLine()
+            $writer.Write("F2C-RESPONSE-READ`n")
+            $reply=$responseLine | ConvertFrom-Json
             if ($reply.service_running -and $reply.containment_confirmed) { return }
         } catch {
         } finally {
