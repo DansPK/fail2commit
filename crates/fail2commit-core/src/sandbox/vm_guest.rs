@@ -208,6 +208,15 @@ fn guest_outcome_path(identity: &str) -> PathBuf {
 #[cfg(target_os = "linux")]
 const GUEST_ROOT: &str = "/mnt/fail2commit-vm";
 
+/// Root-only capability baked into the prepared initramfs (LV-02). Only the
+/// prepared guest's root init can open it; it hands the open fd to the launcher
+/// so dispatch is bound to the prepared guest, not just a readable cmdline id.
+#[cfg(target_os = "linux")]
+const GUEST_CAPABILITY: &str = "/mnt/fail2commit-vm/.vm-capability";
+/// The inherited descriptor init passes the capability file on.
+#[cfg(target_os = "linux")]
+const CAPABILITY_FD: std::os::fd::RawFd = 3;
+
 /// Read-only system shares the guest mounts at their host paths. The job's
 /// program may be a staged input or one of these system tools; nothing else.
 #[cfg(target_os = "linux")]
@@ -240,9 +249,11 @@ fn guest_outcome_path(identity: &str) -> PathBuf {
         .join("outcome.json")
 }
 
-/// Bind guest dispatch to this kernel boot: the host passes the fresh job id
-/// on the command line and the outer boundary must be KVM. A launcher started
-/// outside the prepared VM (or for another run) is refused.
+/// Bind guest dispatch to the prepared KVM guest (LV-02). The fresh cmdline job
+/// id is correlation, not authentication: the trust boundary is the supported
+/// KVM hypervisor signal plus a root-only prepared-guest capability that only
+/// the prepared init can hand over. A launcher started outside the prepared VM
+/// — even with a syntactically valid control tree — is refused.
 #[cfg(target_os = "linux")]
 fn verify_linux_vm_context(identity: &str) -> crate::Result<()> {
     let cmdline = std::fs::read("/proc/cmdline")
@@ -260,11 +271,85 @@ fn verify_linux_vm_context(identity: &str) -> crate::Result<()> {
             "VM guest dispatch is not bound to this kernel boot identity",
         ));
     }
-    let hypervisor = std::fs::read_to_string("/sys/hypervisor/type")
-        .map_err(|error| crate::Error::integrity(format!("verify KVM guest context: {error}")))?;
-    if hypervisor.trim() != "kvm" {
+    // Supported KVM guest signal: the hypervisor CPUID signature. The old
+    // /sys/hypervisor/type path is the Xen ABI and is not populated by KVM.
+    if !kvm_hypervisor_present() {
         return Err(crate::Error::integrity(
             "VM guest dispatch requires the KVM outer boundary",
+        ));
+    }
+    verify_prepared_capability(Path::new(GUEST_CAPABILITY), CAPABILITY_FD)
+}
+
+/// KVM advertises the vendor string "KVMKVMKVM\0\0\0" in the hypervisor CPUID
+/// leaf 0x40000000 (EBX/ECX/EDX). This is the supported KVM guest detection.
+#[cfg(target_os = "linux")]
+fn kvm_signature_is_kvm(ebx: u32, ecx: u32, edx: u32) -> bool {
+    let mut sig = [0u8; 12];
+    sig[0..4].copy_from_slice(&ebx.to_le_bytes());
+    sig[4..8].copy_from_slice(&ecx.to_le_bytes());
+    sig[8..12].copy_from_slice(&edx.to_le_bytes());
+    &sig == b"KVMKVMKVM\0\0\0"
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[allow(unsafe_code)]
+fn kvm_hypervisor_present() -> bool {
+    // SAFETY: __cpuid_count is a read-only, serializing CPU instruction that is
+    // always available on x86_64; it has no memory or privilege side effects.
+    let leaf = unsafe { std::arch::x86_64::__cpuid_count(0x4000_0000, 0) };
+    kvm_signature_is_kvm(leaf.ebx, leaf.ecx, leaf.edx)
+}
+
+/// The VM backend is x86_64-only; any other architecture cannot be the prepared
+/// KVM guest, so dispatch is refused.
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+fn kvm_hypervisor_present() -> bool {
+    false
+}
+
+/// Verify the inherited capability fd refers to the root-only prepared file.
+/// Only the prepared guest's root init can open that 0400 file, so a matching
+/// fd proves the launcher was dispatched by the prepared guest. Outside the
+/// guest the file is absent; an untrusted job cannot open it or forge the fd.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn verify_prepared_capability(cap_path: &Path, fd: std::os::fd::RawFd) -> crate::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(cap_path).map_err(|_| {
+        crate::Error::integrity("prepared guest capability is missing (outside the prepared VM)")
+    })?;
+    if !md.is_file() || md.file_type().is_symlink() || md.uid() != 0 || md.mode() & 0o022 != 0 {
+        return Err(crate::Error::integrity(
+            "prepared guest capability is not a root-owned, non-writable regular file",
+        ));
+    }
+    // SAFETY: stat is a correctly sized writable buffer; fstat on an arbitrary
+    // fd only reads kernel state and returns EBADF for a closed descriptor.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(crate::Error::integrity(
+            "prepared guest capability fd was not inherited from init",
+        ));
+    }
+    if (st.st_dev, st.st_ino) != (md.dev(), md.ino()) {
+        return Err(crate::Error::integrity(
+            "prepared guest capability fd does not match the prepared file",
+        ));
+    }
+    // The token is 64 lowercase hex bytes; read it bounded without closing the
+    // borrowed descriptor.
+    let mut buf = [0u8; 65];
+    // SAFETY: buf is a valid writable buffer of the given length; fd is the
+    // live inherited capability descriptor. read does not take ownership.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n != 64
+        || !buf[..64]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(crate::Error::integrity(
+            "prepared guest capability token is malformed",
         ));
     }
     Ok(())
@@ -375,5 +460,61 @@ mod linux_tests {
         assert!(mounts.contains(&PathBuf::from("/usr")));
         assert!(!mounts.contains(&PathBuf::from("/mnt/fail2commit-vm/control")));
         assert!(!mounts.contains(&PathBuf::from("/mnt/fail2commit-vm/results")));
+    }
+
+    #[test]
+    fn kvm_signature_detection_matches_only_kvm() {
+        let kvm = b"KVMKVMKVM\0\0\0";
+        let ebx = u32::from_le_bytes(kvm[0..4].try_into().unwrap());
+        let ecx = u32::from_le_bytes(kvm[4..8].try_into().unwrap());
+        let edx = u32::from_le_bytes(kvm[8..12].try_into().unwrap());
+        assert!(kvm_signature_is_kvm(ebx, ecx, edx));
+        assert!(!kvm_signature_is_kvm(0, 0, 0));
+        // The VMware hypervisor signature (this dev VM) is not KVM.
+        let vmw = b"VMwareVMware";
+        let ebx = u32::from_le_bytes(vmw[0..4].try_into().unwrap());
+        let ecx = u32::from_le_bytes(vmw[4..8].try_into().unwrap());
+        let edx = u32::from_le_bytes(vmw[8..12].try_into().unwrap());
+        assert!(!kvm_signature_is_kvm(ebx, ecx, edx));
+    }
+
+    #[test]
+    fn capability_refuses_outside_the_prepared_guest() {
+        let dir = tempfile::tempdir().unwrap();
+        // A missing capability file means we are outside the prepared guest.
+        let missing = dir.path().join("absent");
+        assert!(verify_prepared_capability(&missing, 3).is_err());
+        // A present file that is not root-owned is refused (unit tests run
+        // unprivileged; the root-owned success path is a boot gate).
+        let cap = dir.path().join("cap");
+        std::fs::write(&cap, "a".repeat(64)).unwrap();
+        let f = std::fs::File::open(&cap).unwrap();
+        use std::os::fd::AsRawFd;
+        assert!(verify_prepared_capability(&cap, f.as_raw_fd()).is_err());
+        // A closed descriptor is refused.
+        let closed = {
+            let tmp = std::fs::File::open(&cap).unwrap();
+            tmp.as_raw_fd()
+        };
+        assert!(verify_prepared_capability(&cap, closed).is_err());
+    }
+
+    #[test]
+    fn dispatch_outside_the_prepared_guest_is_refused() {
+        // A syntactically valid control tree path, but this host is not the
+        // prepared KVM guest: dispatch refuses at the context check before the
+        // control file is ever read.
+        let id = "0123456789abcdef0123456789abcdef";
+        let path = PathBuf::from("/mnt/fail2commit-vm/control")
+            .join(id)
+            .join("job.json");
+        let err = launch(&path).expect_err("outside-guest dispatch must refuse");
+        assert!(
+            err.message.contains("boot identity")
+                || err.message.contains("KVM")
+                || err.message.contains("capability"),
+            "{}",
+            err.message
+        );
     }
 }

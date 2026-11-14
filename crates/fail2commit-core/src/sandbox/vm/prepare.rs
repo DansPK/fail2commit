@@ -242,6 +242,17 @@ fn prepare_inner(state_path: &Path, lib_dir: &Path) -> crate::Result<String> {
         add_file(&mut cpio, lib, lib)?;
     }
     copy_etc(&mut cpio)?;
+    // LV-02: a root-only capability baked into the image. Only the prepared
+    // guest's root init can open it and hand the fd to the launcher, binding
+    // dispatch to the prepared guest rather than a readable cmdline id.
+    let mut cap_bytes = [0u8; 32];
+    getrandom::fill(&mut cap_bytes)
+        .map_err(|e| Error::isolation_unavailable(format!("create VM guest capability: {e}")))?;
+    cpio.file(
+        &format!("{GUEST_ROOT}/.vm-capability"),
+        0o100400,
+        hex::encode(cap_bytes).as_bytes(),
+    );
     for module in &modules {
         let guest = module.guest_path();
         cpio.file(&guest, 0o100000 | 0o644, &fs::read(&module.host)?);
@@ -999,6 +1010,11 @@ fn render_init(
     s.push_str("$BB mount -t 9p -o trans=virtio,version=9p2000.L,ro,msize=524288 f2cctl $R/control/$id || $BB poweroff -f\n");
     s.push_str("$BB mount -t 9p -o trans=virtio,version=9p2000.L,msize=524288 f2cres $R/results/$id || $BB poweroff -f\n");
     s.push_str("export HOME=/tmp\n");
+    // LV-02: hand the launcher the root-only prepared capability on fd 3. The
+    // launcher verifies the fd refers to this file, proving it was dispatched
+    // by the prepared guest's init rather than started elsewhere.
+    s.push_str("[ -f $R/.vm-capability ] || $BB poweroff -f\n");
+    s.push_str("exec 3<$R/.vm-capability\n");
     s.push_str(&format!(
         "{setpriv} --reuid=$uid --regid=$gid --clear-groups $R/bin/fail2commit sandbox launch $R/control/$id/job.json --vm-guest\n"
     ));
@@ -1292,6 +1308,9 @@ kernel/net/9p/9pnet_virtio.ko.xz: kernel/net/9p/9pnet.ko.zst kernel/drivers/virt
         let d = dir.path();
         let root = d.join("mnt");
         let log = d.join("log");
+        // LV-02: the prepared capability the init hands to the launcher on fd 3.
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".vm-capability"), "ab".repeat(32)).unwrap();
         let busybox = fixture_script(
             d,
             "busybox",
