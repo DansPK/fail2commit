@@ -220,7 +220,7 @@ struct QuarantineFile {
 /// after the group's exact identity is proven gone.
 struct Contained {
     record: QuarantineRecord,
-    _pins: Vec<PinnedShare>,
+    _pins: Vec<File>,
     _control: tempfile::TempDir,
     _result: tempfile::TempDir,
     _child: Option<Child>,
@@ -521,12 +521,14 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
         ));
     }
     // LV-05: pin each share anchor with an O_PATH descriptor and map it via a
-    // fixed child slot /proc/self/fd/N, so a pathname swap after this point
+    // child slot /proc/self/fd/N, so a pathname swap after this point
     // cannot redirect a share. The pins stay open until the group is dead.
     // R2-03: the parent descriptors stay close-on-exec; only this QEMU spawn
     // installs the slot allowlist.
+    // R3-02: slots start above the highest source fd, so child-side dup2
+    // ordering can never clobber an un-copied source.
     let pins = pin_shares(&mut shares, &revalidated.identities)?;
-    let inherit: Vec<(RawFd, RawFd)> = pins.iter().map(|p| (p.file.as_raw_fd(), p.slot)).collect();
+    let inherit = assign_slots(&mut shares, &pins)?;
 
     let args = render_qemu_args(
         &host.state,
@@ -557,7 +559,7 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     // group death cannot be confirmed. Never drops guards, never spawns past
     // a refusal, and persists the exact identity for cross-process recovery.
     let quarantined = |reason: String,
-                       pins: Vec<PinnedShare>,
+                       pins: Vec<File>,
                        control: tempfile::TempDir,
                        result: tempfile::TempDir,
                        child: Option<Child>| {
@@ -1041,36 +1043,24 @@ impl ValidatedPaths {
     }
 }
 
-/// A pinned share anchor: the parent descriptor (kept close-on-exec, R2-03)
-/// and the fixed child-side slot number QEMU will see.
-struct PinnedShare {
-    file: File,
-    slot: RawFd,
-}
-
-/// First fixed child-side descriptor slot for share pins. 0/1/2 are stdio and
-/// QEMU's own low descriptors; high fixed slots avoid collision with anything
-/// QEMU opens after exec (the kernel allocates lowest-free, so it never takes
-/// 64+ while lower numbers are available).
-const PIN_SLOT_BASE: RawFd = 64;
-
-/// Pin each share's mount anchor with an O_PATH descriptor and assign it a
-/// fixed child-side slot so QEMU maps `/proc/self/fd/<slot>` (LV-05).
+/// Pin each share's mount anchor with an O_PATH descriptor (LV-05).
 ///
 /// `O_PATH` alone does NOT block pathname replacement: `rename(2)` leaves open
 /// descriptors untouched, so the pinned inode and a later pathname can diverge.
-/// The fd-backed slot resolves to the pinned inode no matter what happens to
-/// the pathname afterwards. R2-03: the parent descriptor stays FD_CLOEXEC —
-/// unrelated children never inherit it — and only the QEMU spawn installs the
-/// slot allowlist via `add_slot_inheritance`. Job anchors are checked against
-/// the re-walked identity; control/result are fresh per-run dirs and system
-/// shares are root-owned. Pins stay open until the process group is dead.
+/// `assign_slots` then gives each pin a child-side slot so QEMU maps
+/// `/proc/self/fd/<slot>`, which resolves to the pinned inode no matter what
+/// happens to the pathname afterwards. R2-03: the parent descriptor stays
+/// FD_CLOEXEC — unrelated children never inherit it — and only the QEMU spawn
+/// installs the slot allowlist via `add_slot_inheritance`. Job anchors are
+/// checked against the re-walked identity; control/result are fresh per-run
+/// dirs and system shares are root-owned. Pins stay open until the process
+/// group is dead.
 fn pin_shares(
     shares: &mut [Share],
     identities: &[(PathBuf, (u64, u64))],
-) -> crate::Result<Vec<PinnedShare>> {
+) -> crate::Result<Vec<File>> {
     let mut held = Vec::new();
-    for (index, share) in shares.iter_mut().enumerate() {
+    for share in shares.iter_mut() {
         let path = &share.host;
         let md = fs::symlink_metadata(path)?;
         if !md.is_dir() {
@@ -1104,11 +1094,37 @@ fn pin_shares(
                 "VM share pin must stay close-on-exec in the parent",
             ));
         }
-        let slot = PIN_SLOT_BASE + index as RawFd;
-        share.fd = Some(slot);
-        held.push(PinnedShare { file, slot });
+        held.push(file);
     }
     Ok(held)
+}
+
+/// R3-02: give every pin a child-side slot proven disjoint from all sources.
+/// Slots start one above the highest source descriptor, so the child's
+/// forward `dup2(src, slot)` sequence can never overwrite a source that has
+/// not been copied yet (with fixed slots at 64, sources at 60-66 did exactly
+/// that). Returns the (source, slot) allowlist pairs; the parent descriptors
+/// stay close-on-exec and only the QEMU spawn installs them.
+fn assign_slots(shares: &mut [Share], pins: &[File]) -> crate::Result<Vec<(RawFd, RawFd)>> {
+    let max_src = pins
+        .iter()
+        .map(|f| f.as_raw_fd())
+        .max()
+        .unwrap_or(2)
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::integrity("VM share slot base cannot be represented"))?;
+    if shares.len() > pins.len() {
+        return Err(crate::Error::internal("VM share slot/pin mismatch"));
+    }
+    let mut pairs = Vec::with_capacity(pins.len());
+    for (index, (share, pin)) in shares.iter_mut().zip(pins.iter()).enumerate() {
+        let slot = max_src
+            .checked_add(index as RawFd)
+            .ok_or_else(|| crate::Error::integrity("VM share slot cannot be represented"))?;
+        share.fd = Some(slot);
+        pairs.push((pin.as_raw_fd(), slot));
+    }
+    Ok(pairs)
 }
 
 /// Register the QEMU-only descriptor allowlist on the command: in the forked
@@ -1765,11 +1781,12 @@ mod tests {
         }];
         let identities = vec![(anchor.clone(), identity(&anchor).unwrap())];
         let pins = pin_shares(&mut shares, &identities).unwrap();
+        let pairs = assign_slots(&mut shares, &pins).unwrap();
         let slot = shares[0].fd.expect("share must be slot-backed");
-        assert_eq!(slot, pins[0].slot);
+        assert_eq!(slot, pairs[0].1);
         // R2-03: the parent descriptor stays close-on-exec.
         // SAFETY: F_GETFD reads descriptor flags of a live fd we own.
-        let flags = unsafe { libc::fcntl(pins[0].file.as_raw_fd(), libc::F_GETFD) };
+        let flags = unsafe { libc::fcntl(pins[0].as_raw_fd(), libc::F_GETFD) };
         assert!(
             flags >= 0 && flags & libc::FD_CLOEXEC != 0,
             "parent pin must stay close-on-exec"
@@ -1785,9 +1802,9 @@ mod tests {
         // The bare pathname now resolves to the attacker tree...
         assert_eq!(fs::read(anchor.join("marker")).unwrap(), b"attacker");
         // ...but the pinned descriptor still resolves to the original inode.
-        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", pins[0].file.as_raw_fd()));
+        let fd_path = PathBuf::from(format!("/proc/self/fd/{}", pins[0].as_raw_fd()));
         assert_eq!(fs::read(fd_path.join("marker")).unwrap(), b"original");
-        assert_eq!(identity_of(&pins[0].file).unwrap(), identities[0].1);
+        assert_eq!(identity_of(&pins[0]).unwrap(), identities[0].1);
     }
 
     #[test]
@@ -1807,7 +1824,9 @@ mod tests {
         }];
         let identities = vec![(anchor.clone(), identity(&anchor).unwrap())];
         let pins = pin_shares(&mut shares, &identities).unwrap();
+        let pairs = assign_slots(&mut shares, &pins).unwrap();
         let slot = shares[0].fd.unwrap();
+        assert_eq!(slot, pairs[0].1);
         // Swap the pathname before the child execs, like the attacker case.
         fs::rename(&anchor, dir.path().join("hidden")).unwrap();
         fs::create_dir(&anchor).unwrap();
@@ -1817,7 +1836,7 @@ mod tests {
         cmd.arg("-c")
             .arg(format!("cat /proc/self/fd/{slot}/marker"))
             .stdout(std::process::Stdio::piped());
-        add_slot_inheritance(&mut cmd, vec![(pins[0].file.as_raw_fd(), slot)]);
+        add_slot_inheritance(&mut cmd, pairs);
         let out = cmd.output().unwrap();
         assert_eq!(out.stdout, b"original");
 
@@ -1835,6 +1854,73 @@ mod tests {
             !text.contains("stage") && !text.contains("hidden"),
             "unrelated child must not inherit share roots: {text}"
         );
+    }
+
+    #[test]
+    fn slot_allocation_avoids_source_overlap_under_fd_pressure() {
+        // R3-02: force pinned sources into high fd numbers (exactly where
+        // the old fixed 64+ slots lived) with dummy descriptors, prove the
+        // computed slots are disjoint from every source, and verify an
+        // exec'd child maps EVERY share to its own pinned inode — including
+        // one whose pathname was swapped before exec.
+        let dir = tempfile::tempdir().unwrap();
+        let mut dummies: Vec<File> = Vec::new();
+        for _ in 0..70 {
+            dummies.push(File::open("/dev/null").unwrap());
+        }
+        let make = |name: &str, marker: &[u8]| -> PathBuf {
+            let p = dir.path().join(name);
+            fs::create_dir(&p).unwrap();
+            fs::write(p.join("marker"), marker).unwrap();
+            p
+        };
+        let a = make("a", b"marker-a");
+        let b = make("b", b"marker-b");
+        let mut shares = vec![
+            Share {
+                host: a.clone(),
+                tag: "t0".into(),
+                read_only: true,
+                fd: None,
+            },
+            Share {
+                host: b.clone(),
+                tag: "t1".into(),
+                read_only: true,
+                fd: None,
+            },
+        ];
+        let pins = pin_shares(&mut shares, &[]).unwrap();
+        let sources: Vec<RawFd> = pins.iter().map(|f| f.as_raw_fd()).collect();
+        let pairs = assign_slots(&mut shares, &pins).unwrap();
+        let max_src = sources.iter().copied().max().unwrap();
+        for (src, slot) in &pairs {
+            assert!(
+                *slot > max_src,
+                "slot {slot} must sit above every source {sources:?}"
+            );
+            assert!(!sources.contains(slot), "slot {slot} reuses a source fd");
+            assert_ne!(src, slot);
+        }
+
+        // Swap the first share's pathname; the child must still see a's and
+        // b's pinned inodes on their respective slots.
+        fs::rename(&a, dir.path().join("a-hidden")).unwrap();
+        fs::create_dir(&a).unwrap();
+        fs::write(a.join("marker"), b"attacker").unwrap();
+        let (s0, s1) = (pairs[0].1, pairs[1].1);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "cat /proc/self/fd/{s0}/marker; echo ---; cat /proc/self/fd/{s1}/marker"
+            ))
+            .stdout(std::process::Stdio::piped());
+        add_slot_inheritance(&mut cmd, pairs);
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let parts: Vec<&str> = text.split("---").collect();
+        assert_eq!(parts[0].trim(), "marker-a", "share 0 mapping wrong: {text}");
+        assert_eq!(parts[1].trim(), "marker-b", "share 1 mapping wrong: {text}");
     }
 
     #[test]
