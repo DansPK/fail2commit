@@ -179,31 +179,54 @@ fn query_feature_state(system_dir: &Path) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("query Windows Sandbox feature state: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "feature query stdout pipe is missing".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "feature query stderr pipe is missing".to_owned())?;
+    // Drain both pipes while the query runs. Waiting before reading can block
+    // forever when CIM emits enough diagnostics to fill either pipe.
+    let stdout_reader = thread::spawn(move || read_capped(stdout, MAX_CONTROL_OUTPUT));
+    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_CONTROL_OUTPUT));
     let status = match wait_child(&mut child, CONTROL_GRACE) {
         Ok(status) => status,
         Err(WaitError::TimedOut) => {
-            let _ = terminate_process_tree(&mut child, system_dir);
+            terminate_process_tree(&mut child, system_dir).map_err(|error| {
+                format!("feature query timed out and process-tree cleanup is uncertain: {error}")
+            })?;
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err("Windows Sandbox feature query timed out".into());
         }
         Err(WaitError::Failed(error)) => {
-            let _ = terminate_process_tree(&mut child, system_dir);
+            terminate_process_tree(&mut child, system_dir).map_err(|cleanup| {
+                format!("feature query failed ({error}) and process-tree cleanup is uncertain: {cleanup}")
+            })?;
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(format!("Windows Sandbox feature query failed: {error}"));
         }
     };
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("collect Windows Sandbox feature result: {error}"))?;
+    let (stdout, stdout_overflow) = stdout_reader
+        .join()
+        .map_err(|_| "feature query stdout reader failed".to_owned())??;
+    let (stderr, stderr_overflow) = stderr_reader
+        .join()
+        .map_err(|_| "feature query stderr reader failed".to_owned())??;
     if !status.success() {
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        let diagnostic = String::from_utf8_lossy(&stderr);
         return Err(format!(
             "Windows Sandbox feature state could not be queried (permission/OS query failure): {}",
             bounded_text(&diagnostic, MAX_CONTROL_OUTPUT)
         ));
     }
-    if output.stdout.len() > MAX_CONTROL_OUTPUT {
+    if stdout_overflow || stderr_overflow {
         return Err("Windows Sandbox feature query returned oversized output".into());
     }
-    let state = String::from_utf8(output.stdout)
+    let state = String::from_utf8(stdout)
         .map_err(|_| "Windows Sandbox feature query returned non-UTF-8 output".to_owned())?;
     Ok(state.trim().to_owned())
 }
@@ -248,6 +271,15 @@ struct HostMappings {
 }
 
 fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
+    // The launcher process can exit before its disposable guest has stopped.
+    // Until an instance-specific lifecycle proof is available, refuse before
+    // creating or exposing mapped job state to WSB.
+    let _ = (host, job);
+    return Err(crate::Error::isolation_unavailable(
+        "Windows Sandbox instance lifecycle cannot be confirmed on this host",
+    ));
+    #[allow(unreachable_code)]
+    {
     let host_stage = appcontainer::stage_root()?;
     let validated = ValidatedPaths::new(job, &host_stage)?;
     let mappings = HostMappings::new(&host_stage, &validated)?;
@@ -321,6 +353,12 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     }
     let _mount_pins = revalidated.pin_vm_mounts(&host_stage)?;
 
+    let duration = timeout_deadline(job.limits.timeout).ok_or_else(|| {
+        crate::Error::isolation_unavailable("job timeout plus VM boot grace cannot be represented")
+    })?;
+    let deadline = Instant::now().checked_add(duration).ok_or_else(|| {
+        crate::Error::isolation_unavailable("job deadline cannot be represented")
+    })?;
     let mut child = Command::new(&host.sandbox_exe)
         .arg(&config_path)
         .stdin(Stdio::null())
@@ -330,10 +368,7 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
         .map_err(|error| {
             crate::Error::isolation_unavailable(format!("start Windows Sandbox: {error}"))
         })?;
-    let deadline = timeout_deadline(job.limits.timeout).ok_or_else(|| {
-        crate::Error::isolation_unavailable("job timeout plus VM boot grace cannot be represented")
-    })?;
-    let exit = match wait_child(&mut child, deadline) {
+    let exit = match wait_child_until(&mut child, deadline) {
         Ok(status) => status,
         Err(WaitError::TimedOut) => {
             terminate_process_tree(&mut child, &host.system_dir)?;
@@ -359,6 +394,7 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     let outcome_path = result_dir.path().join("outcome.json");
     let outcome = read_expected_outcome(&outcome_path)?;
     Ok(outcome)
+    }
 }
 
 impl HostMappings {
@@ -656,6 +692,10 @@ fn wait_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, WaitEr
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| WaitError::Failed("timeout cannot be represented".into()))?;
+    wait_child_until(child, deadline)
+}
+
+fn wait_child_until(child: &mut Child, deadline: Instant) -> Result<ExitStatus, WaitError> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -664,6 +704,23 @@ fn wait_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, WaitEr
             Err(error) => return Err(WaitError::Failed(error.to_string())),
         }
     }
+}
+
+fn read_capped(mut reader: impl Read, cap: usize) -> Result<(Vec<u8>, bool), String> {
+    let mut kept = Vec::with_capacity(cap.min(4096));
+    let mut overflow = false;
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        let remaining = cap.saturating_sub(kept.len());
+        let take = remaining.min(count);
+        kept.extend_from_slice(&buffer[..take]);
+        overflow |= take != count;
+    }
+    Ok((kept, overflow))
 }
 
 fn terminate_process_tree(child: &mut Child, system_dir: &Path) -> crate::Result<()> {
@@ -794,6 +851,27 @@ fn strip_windows_device_prefix(path: &Path) -> PathBuf {
 
 fn timeout_deadline(timeout: Duration) -> Option<Duration> {
     timeout.checked_add(BOOT_GRACE)
+}
+
+#[cfg(test)]
+mod lifecycle_gate_tests {
+    use super::*;
+
+    #[test]
+    fn deadlines_are_rejected_before_a_vm_can_be_spawned() {
+        assert!(timeout_deadline(Duration::MAX).is_none());
+        assert!(Instant::now().checked_add(Duration::MAX).is_none());
+    }
+
+    #[test]
+    fn feature_query_output_is_drained_and_capped() {
+        let (bytes, overflow) = read_capped(&b"enabled"[..], 16).unwrap();
+        assert_eq!(bytes, b"enabled");
+        assert!(!overflow);
+        let (bytes, overflow) = read_capped(&b"0123456789"[..], 4).unwrap();
+        assert_eq!(bytes, b"0123");
+        assert!(overflow);
+    }
 }
 
 #[cfg(test)]
