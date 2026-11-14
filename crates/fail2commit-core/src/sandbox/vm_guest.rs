@@ -14,6 +14,14 @@ const MAX_GUEST_JOB: u64 = 1024 * 1024;
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
+#[cfg(windows)]
+pub(crate) fn launch(_jobfile: &Path) -> crate::Result<()> {
+    Err(crate::Error::isolation_unavailable(
+        "Windows VM guest dispatch is disabled until trusted Windows Sandbox context verification is implemented",
+    ))
+}
+
+#[cfg(not(windows))]
 pub(crate) fn launch(jobfile: &Path) -> crate::Result<()> {
     let identity = guest_identity(jobfile)?;
     #[cfg(windows)]
@@ -69,6 +77,18 @@ pub(crate) fn launch(jobfile: &Path) -> crate::Result<()> {
     temp.persist_noclobber(&outcome_path)
         .map_err(|e| crate::Error::isolation_unavailable(format!("publish VM outcome: {e}")))?;
     Ok(())
+}
+
+#[cfg(all(windows, test))]
+mod windows_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn direct_guest_dispatch_refuses_before_reading_control_or_running_inner_backend() {
+        let error = launch(Path::new(r"C:\f2c\control\0123456789abcdef0123456789abcdef\job.json"))
+            .expect_err("Windows VM guest dispatch must remain disabled without trusted context proof");
+        assert!(error.message.contains("trusted Windows Sandbox context verification"));
+    }
 }
 
 fn guest_identity(jobfile: &Path) -> crate::Result<String> {

@@ -12,7 +12,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     GetLastError, LocalFree, SetHandleInformation, ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED,
@@ -63,13 +63,14 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
-    GetProcessMitigationPolicy, InitializeProcThreadAttributeList, OpenProcessToken,
+    GetProcessMitigationPolicy, InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken,
     ProcessExtensionPointDisablePolicy, ProcessFontDisablePolicy, ProcessImageLoadPolicy,
     ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
     LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_QUOTA, PROCESS_TERMINATE,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 use windows_sys::Win32::System::IO::{
@@ -671,6 +672,86 @@ impl StagedObject {
 pub(super) struct Job {
     handle: OwnedHandle,
     port: OwnedHandle,
+}
+
+/// Owns a short-lived command and every descendant that stays in its process
+/// tree. Closing the job terminates all members. Used for trusted host probes
+/// whose captured pipes must not be kept open by an orphaned descendant.
+pub(crate) struct VmControlTree {
+    handle: OwnedHandle,
+}
+
+impl VmControlTree {
+    #[allow(unsafe_code)]
+    pub(crate) fn assign(pid: u32) -> crate::Result<Self> {
+        // SAFETY: creates a fresh unnamed job object; the returned handle is
+        // validated and immediately transferred to OwnedHandle.
+        let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw_job.is_null() {
+            return Err(unavailable("create VM control job object"));
+        }
+        let handle = owned(raw_job);
+        // SAFETY: all-zero is valid and the structure size matches the class.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if !set_info(raw(&handle), JobObjectExtendedLimitInformation, &limits) {
+            return Err(unavailable("configure VM control job object"));
+        }
+        // SAFETY: OpenProcess requests only the rights needed for assignment
+        // and identity verification on the just-spawned child PID.
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
+        if process.is_null() {
+            return Err(unavailable("open VM control process"));
+        }
+        let process = owned(process);
+        // SAFETY: the job and process handles are live and owned here.
+        if unsafe { AssignProcessToJobObject(raw(&handle), raw(&process)) } == 0 {
+            return Err(unavailable("assign VM control process to owned job"));
+        }
+        let mut inside = 0;
+        // SAFETY: both handles are live, and `inside` is a valid out pointer.
+        if unsafe { IsProcessInJob(raw(&process), raw(&handle), &mut inside) } == 0 || inside == 0 {
+            return Err(unavailable("verify VM control process ownership"));
+        }
+        Ok(Self { handle })
+    }
+
+    pub(crate) fn active_processes(&self) -> crate::Result<u32> {
+        let info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
+            query_info(raw(&self.handle), JobObjectBasicAccountingInformation)
+                .ok_or_else(|| unavailable("query VM control process tree"))?;
+        Ok(info.ActiveProcesses)
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn terminate(&self) -> crate::Result<()> {
+        // SAFETY: live job handle owned by self; this terminates only members
+        // assigned to this query's private job object.
+        if unsafe { TerminateJobObject(raw(&self.handle), 1) } == 0 {
+            return Err(unavailable("terminate VM control process tree"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wait_empty(&self, deadline: Instant) -> crate::Result<()> {
+        loop {
+            if self.active_processes()? == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(crate::Error::isolation_unavailable(
+                    "VM control process tree did not stop before cleanup deadline",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 #[allow(unsafe_code)]
