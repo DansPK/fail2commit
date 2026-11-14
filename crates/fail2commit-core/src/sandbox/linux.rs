@@ -788,6 +788,12 @@ fn execute_controlled(
     let mut tripped = false;
     let waited = loop {
         match child.try_wait() {
+            // A proxy/watchdog event is authoritative even if the child exits
+            // after receiving the refusal response but before this poll.
+            Ok(Some(st)) if ctl.watch.tripped() => {
+                tripped = true;
+                break Ok(st);
+            }
             Ok(Some(st)) => break Ok(st),
             Ok(None) if watchdog_closed.is_some_and(|closed| closed.load(Ordering::SeqCst)) => {
                 tripped = true;

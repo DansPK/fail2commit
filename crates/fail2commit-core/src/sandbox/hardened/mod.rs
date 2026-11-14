@@ -169,6 +169,18 @@ pub fn run_linux_watchdog_probe(watchdog: Option<u64>) -> crate::Result<()> {
     }
 }
 
+/// Fixed hidden Linux egress-effect payload invoked only by the root service's
+/// authenticated PROBE operation. It accepts an expected uid and a mode, never
+/// a caller command, path, URL, or environment override.
+#[cfg(target_os = "linux")]
+pub fn run_linux_egress_probe_child(
+    expected_uid: u32,
+    bait_trip: bool,
+    platform_only: bool,
+) -> crate::Result<()> {
+    service::run_linux_egress_probe_child(expected_uid, bait_trip, platform_only)
+}
+
 pub fn launch_with_control(
     jobfile: &std::path::Path,
     watchdog: Option<u64>,
@@ -382,7 +394,8 @@ struct HardenedBackend;
 impl SandboxBackend for HardenedBackend {
     fn probe(&self) -> ProbeReport {
         #[cfg(target_os = "linux")]
-        let (service, peer_auth, platform_controls, detail) = service::probe_linux();
+        let (service, peer_auth, platform_controls, network_controls, detail) =
+            service::probe_linux();
         #[cfg(windows)]
         let (service, peer_auth, effect_probe, detail) = service::probe_windows();
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -407,7 +420,7 @@ impl SandboxBackend for HardenedBackend {
         #[cfg(not(any(target_os = "linux", windows)))]
         let platform_verified = false;
         #[cfg(target_os = "linux")]
-        let available = service && peer_auth && platform_controls;
+        let available = service && peer_auth && platform_controls && network_controls;
         #[cfg(not(target_os = "linux"))]
         let available = false;
         let mut controls = vec![
@@ -418,7 +431,7 @@ impl SandboxBackend for HardenedBackend {
             ("wfp_lpac_traffic_effects".into(), effect_probe),
         ];
         #[cfg(target_os = "linux")]
-        controls.push(("service_egress_effects".into(), false));
+        controls.push(("service_egress_effects".into(), network_controls));
         #[cfg(target_os = "linux")]
         let report_detail = format!(
             "{detail}; hardened Linux launcher controls are {}; Internet egress remains disabled until its service effect probes pass",

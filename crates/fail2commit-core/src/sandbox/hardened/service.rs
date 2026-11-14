@@ -169,10 +169,10 @@ pub(super) fn run_linux(
     }
     let status = linux_service_request(
         &Request {
-            op: "STATUS".into(),
+            op: "PROBE".into(),
             job_dir: None,
         },
-        std::time::Duration::from_secs(45),
+        std::time::Duration::from_secs(240),
     )?;
     if !status.ok || !status.service_running {
         return Err(crate::Error::isolation_unavailable(status.detail));
@@ -762,13 +762,13 @@ fn ensure_linux_private_dir(path: &Path, mode: u32) -> crate::Result<()> {
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-pub(super) fn probe_linux() -> (bool, bool, bool, String) {
+pub(super) fn probe_linux() -> (bool, bool, bool, bool, String) {
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     let result = (|| -> crate::Result<Response> {
         let mut stream = UnixStream::connect("/run/fail2commit-hardened/sock")?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(45)))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(240)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
         let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -787,7 +787,7 @@ pub(super) fn probe_linux() -> (bool, bool, bool, String) {
                 "service peer is not verified as root",
             ));
         }
-        stream.write_all(b"{\"op\":\"STATUS\"}\n")?;
+        stream.write_all(b"{\"op\":\"PROBE\"}\n")?;
         let mut line = String::new();
         BufReader::new(stream)
             .take(MAX_REQUEST as u64)
@@ -802,8 +802,14 @@ pub(super) fn probe_linux() -> (bool, bool, bool, String) {
         Ok(r)
     })();
     match result {
-        Ok(r) => (true, true, r.probe_available, r.detail),
-        Err(e) => (false, false, false, e.message),
+        Ok(r) => (
+            r.service_running,
+            true,
+            r.probe_available,
+            r.network_probe_available,
+            r.detail,
+        ),
+        Err(e) => (false, false, false, false, e.message),
     }
 }
 
@@ -999,21 +1005,21 @@ fn serve_one(
         linux_response(false, false, error.message)
     } else {
         match req.op.as_str() {
-            "STATUS" if req.job_dir.is_none() => {
-                let state = super::lifecycle::installed_state();
-                match state.and_then(|state| linux_watchdog_probe_cached(&state, sandbox)) {
-                    Ok(()) => linux_status_response(
-                        true,
-                        "Linux service launcher and watchdog effect probe passed",
-                    ),
-                    Err(error) => linux_status_response(false, error.message),
+            "PROBE" if req.job_dir.is_none() => {
+                match linux_mandatory_probe_cached(uid, sandbox, stream) {
+                    Ok((platform, network, detail)) => {
+                        linux_status_response(platform, network, detail)
+                    }
+                    Err(error) => linux_status_response(false, false, error.message),
                 }
             }
             "LAUNCH" => match req.job_dir.as_deref() {
-                Some(job_dir) => match run_linux_service_job(job_dir, uid, sandbox, stream) {
-                    Ok(detail) => linux_response(true, true, detail),
-                    Err(error) => linux_response(false, false, error.message),
-                },
+                Some(job_dir) => {
+                    match run_linux_service_job(job_dir, uid, sandbox, stream, false) {
+                        Ok(detail) => linux_response(true, true, detail),
+                        Err(error) => linux_response(false, false, error.message),
+                    }
+                }
                 None => linux_response(false, false, "job_dir is required"),
             },
             _ => linux_response(false, false, "unknown or malformed operation"),
@@ -1045,16 +1051,568 @@ fn bounded_linux_detail(detail: String) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_status_response(probe_available: bool, detail: impl Into<String>) -> Response {
+fn linux_status_response(
+    probe_available: bool,
+    network_probe_available: bool,
+    detail: impl Into<String>,
+) -> Response {
     Response {
-        ok: true,
+        ok: probe_available && network_probe_available,
         service_running: true,
         probe_available,
         effect_probe_passed: false,
-        network_probe_available: false,
+        network_probe_available,
         containment_confirmed: true,
         detail: bounded_linux_detail(detail.into()),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mandatory_probe_cached(
+    peer_uid: u32,
+    sandbox_uid: u32,
+    client: &std::os::unix::net::UnixStream,
+) -> crate::Result<(bool, bool, String)> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static LAST_PASS: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+    let cache = LAST_PASS.get_or_init(|| Mutex::new(None));
+    {
+        let last = cache
+            .lock()
+            .map_err(|_| crate::Error::internal("Linux mandatory probe cache is poisoned"))?;
+        if let Some((at, detail)) = last.as_ref() {
+            if at.elapsed() < Duration::from_secs(30) {
+                return Ok((true, true, detail.clone()));
+            }
+        }
+    }
+    let result = linux_mandatory_probe(peer_uid, sandbox_uid, client)?;
+    if result.0 && result.1 {
+        let mut last = cache
+            .lock()
+            .map_err(|_| crate::Error::internal("Linux mandatory probe cache is poisoned"))?;
+        *last = Some((Instant::now(), result.2.clone()));
+    }
+    Ok(result)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mandatory_probe(
+    peer_uid: u32,
+    sandbox_uid: u32,
+    client: &std::os::unix::net::UnixStream,
+) -> crate::Result<(bool, bool, String)> {
+    let state = super::lifecycle::installed_state()?;
+    if state.installer_uid != peer_uid || state.sandbox_uid != Some(sandbox_uid) {
+        return Err(crate::Error::integrity(
+            "Linux probe identity differs from the authenticated install",
+        ));
+    }
+    if peer_uid == 0 || peer_uid == sandbox_uid {
+        return Err(crate::Error::rejected(
+            "Linux probe requires the recorded installer peer",
+        ));
+    }
+    let executable = trusted_linux_executable(&state.executable)?;
+    let _ = linux_sandbox_identity(&state.account, sandbox_uid)?;
+    trusted_linux_tool(&["/usr/bin/setpriv", "/bin/setpriv"])?;
+    trusted_linux_tool(&["/usr/bin/systemd-run"])?;
+    super::linux_acl::verify_required_tools()?;
+    linux_watchdog_probe_cached(&state, sandbox_uid)?;
+
+    let platform_outcome = run_linux_probe_job(
+        &executable,
+        peer_uid,
+        sandbox_uid,
+        client,
+        crate::isolation::NetworkMode::None,
+        false,
+        true,
+    )?;
+    if !linux_probe_outcome_passed(&platform_outcome, b"F2C-LINUX-PLATFORM-PROBE-PASS\n") {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux account, system-scope, ACL, read-only or writable-stage effect probe failed",
+        ));
+    }
+
+    let egress_outcome = match run_linux_probe_job(
+        &executable,
+        peer_uid,
+        sandbox_uid,
+        client,
+        crate::isolation::NetworkMode::Internet,
+        false,
+        false,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Ok((
+                true,
+                false,
+                format!(
+                    "Linux platform probe passed; shared egress effect probe failed: {}",
+                    error.message
+                ),
+            ));
+        }
+    };
+    if !linux_effect_probe_outcome_passed(&egress_outcome) {
+        return Ok((
+            true,
+            false,
+            "Linux platform probe passed; public-allow or restricted-route proxy effects failed"
+                .into(),
+        ));
+    }
+
+    let bait_outcome = match run_linux_probe_job(
+        &executable,
+        peer_uid,
+        sandbox_uid,
+        client,
+        crate::isolation::NetworkMode::Internet,
+        true,
+        false,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Ok((
+                true,
+                false,
+                format!(
+                    "Linux proxy route probe passed; bait-trip probe failed: {}",
+                    error.message
+                ),
+            ));
+        }
+    };
+    if !linux_bait_probe_outcome_passed(&bait_outcome) {
+        return Ok((
+            true,
+            false,
+            "Linux proxy route probe passed; bait trip did not kill the job with a bait event"
+                .into(),
+        ));
+    }
+    Ok((
+        true,
+        true,
+        "Linux account, system-scope limits, ACL stage, Bubblewrap, watchdog, shared public-only egress, direct-route refusal and bait-trip probes passed".into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_probe_job(
+    executable: &Path,
+    peer_uid: u32,
+    sandbox_uid: u32,
+    client: &std::os::unix::net::UnixStream,
+    network: crate::isolation::NetworkMode,
+    bait: bool,
+    platform_only: bool,
+) -> crate::Result<crate::isolation::JobOutcome> {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::PathBuf;
+
+    let acl_dir = super::lifecycle::linux_acl_journal_dir();
+    let probe_root = super::linux_acl::probe_stage_dir(&acl_dir)?;
+    let temp = tempfile::Builder::new()
+        .prefix("probe-")
+        .tempdir_in(probe_root)?;
+    let root = temp.path().canonicalize()?;
+    let work = root.join("work");
+    let read_only = root.join("readonly");
+    std::fs::create_dir(&work)?;
+    std::fs::create_dir(&read_only)?;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o700))?;
+    let read_only_file = read_only.join("probe.txt");
+    let mut fixture = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(&read_only_file)?;
+    fixture.write_all(b"f2c-hardened-readonly-probe\n")?;
+    fixture.sync_all()?;
+    drop(fixture);
+    std::fs::set_permissions(&read_only_file, std::fs::Permissions::from_mode(0o400))?;
+
+    let mut args = vec![
+        "sandbox".into(),
+        "hardened-egress-probe".into(),
+        "--expected-uid".into(),
+        sandbox_uid.to_string().into(),
+    ];
+    if bait {
+        args.push("--bait-trip".into());
+    }
+    if platform_only {
+        args.push("--platform-only".into());
+    }
+    let job = crate::isolation::JobSpec {
+        program: PathBuf::from(executable),
+        args,
+        cwd: work.clone(),
+        env: Vec::new(),
+        read_only: vec![read_only.clone()],
+        work_dir: work.clone(),
+        exports: Vec::new(),
+        export_to: None,
+        limits: crate::isolation::JobLimits {
+            timeout: std::time::Duration::from_secs(if bait { 15 } else { 60 }),
+            memory_bytes: Some(256 * 1024 * 1024),
+            max_processes: Some(32),
+            max_output_bytes: 32 * 1024,
+            disk_bytes: Some(2 * 1024 * 1024),
+        },
+        network,
+        bait,
+    };
+    let encoded = super::protocol::encode_hardened_job(&job, &root)?;
+    let jobfile = root.join("job.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&jobfile)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    drop(file);
+
+    fn chown_to_peer(path: &Path, uid: u32) -> crate::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| crate::Error::integrity("probe stage path contains NUL"))?;
+        // SAFETY: path is a canonical service-created fixture path and uid is
+        // the authenticated installer identity recorded at installation.
+        if unsafe { libc::chown(path_c.as_ptr(), uid, u32::MAX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    chown_to_peer(&root, peer_uid)?;
+    chown_to_peer(&work, peer_uid)?;
+    chown_to_peer(&read_only, peer_uid)?;
+    chown_to_peer(&read_only_file, peer_uid)?;
+    chown_to_peer(&jobfile, peer_uid)?;
+    let root_metadata = std::fs::symlink_metadata(&root)?;
+    if !root_metadata.is_dir()
+        || root_metadata.file_type().is_symlink()
+        || root_metadata.uid() != peer_uid
+        || root_metadata.mode() & 0o077 != 0
+    {
+        return Err(crate::Error::integrity(
+            "Linux fixed probe stage did not acquire the expected peer-owned identity",
+        ));
+    }
+    let job_dir = root
+        .to_str()
+        .ok_or_else(|| crate::Error::integrity("Linux probe stage path is not UTF-8"))?;
+    run_linux_service_job(
+        job_dir,
+        peer_uid,
+        sandbox_uid,
+        client,
+        network == crate::isolation::NetworkMode::Internet,
+    )?;
+    let output = open_linux_regular(
+        &root.join("outcome.json"),
+        peer_uid,
+        super::protocol::MAX_OUTCOME_BYTES,
+    )?;
+    let mut bytes = Vec::new();
+    output
+        .take((super::protocol::MAX_OUTCOME_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    super::protocol::decode_outcome(&bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_probe_outcome_passed(outcome: &crate::isolation::JobOutcome, marker: &[u8]) -> bool {
+    outcome.status == crate::isolation::JobStatus::Exited(0)
+        && outcome.stdout == marker
+        && outcome.exported.is_empty()
+        && !outcome.truncated
+}
+
+#[cfg(target_os = "linux")]
+fn linux_effect_probe_outcome_passed(outcome: &crate::isolation::JobOutcome) -> bool {
+    linux_probe_outcome_passed(outcome, b"F2C-LINUX-EFFECT-PROBE-PASS\n")
+        && outcome
+            .report
+            .events
+            .iter()
+            .any(|event| event.kind == crate::isolation::ActivityKind::NetAllowed)
+        && outcome
+            .report
+            .events
+            .iter()
+            .any(|event| event.kind == crate::isolation::ActivityKind::NetRefused)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bait_probe_outcome_passed(outcome: &crate::isolation::JobOutcome) -> bool {
+    outcome.status == crate::isolation::JobStatus::Killed
+        && outcome.report.bait_touched()
+        && outcome.exported.is_empty()
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn run_linux_egress_probe_child(
+    expected_uid: u32,
+    bait_trip: bool,
+    platform_only: bool,
+) -> crate::Result<()> {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+    use std::time::Duration;
+
+    // SAFETY: geteuid/getuid have no preconditions and report the real IDs.
+    if expected_uid == 0 || unsafe { libc::geteuid() } != expected_uid {
+        return Err(crate::Error::rejected(
+            "Linux effect probe is not running as the installed sandbox account",
+        ));
+    }
+    if unsafe { libc::getuid() } != expected_uid {
+        return Err(crate::Error::rejected(
+            "Linux effect probe real uid differs from its effective uid",
+        ));
+    }
+    if bait_trip {
+        let proxy = validated_probe_proxy()?;
+        let token = std::env::var("AWS_SECRET_ACCESS_KEY")
+            .map_err(|_| crate::Error::integrity("probe bait value is unavailable"))?;
+        if token.len() < 32 {
+            return Err(crate::Error::integrity("probe bait value is malformed"));
+        }
+        let mut stream = TcpStream::connect_timeout(&proxy, Duration::from_secs(3))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        write!(
+            stream,
+            "GET http://bait-trip.invalid/ HTTP/1.1\r\nHost: bait-trip.invalid\r\nX-F2C-Probe: {token}\r\nConnection: close\r\n\r\n"
+        )?;
+        let mut response = Vec::new();
+        stream.take(1024).read_to_end(&mut response)?;
+        if !response.starts_with(b"HTTP/1.1 403") && !response.starts_with(b"HTTP/1.0 403") {
+            return Err(crate::Error::isolation_unavailable(
+                "shared egress proxy did not refuse the probe bait request",
+            ));
+        }
+        return Ok(());
+    }
+
+    let work = std::env::current_dir()?;
+    let read_only_file = work
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("Linux probe work path has no parent"))?
+        .join("readonly")
+        .join("probe.txt");
+    if std::fs::read(&read_only_file)? != b"f2c-hardened-readonly-probe\n" {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux service probe cannot read its peer-owned read-only fixture",
+        ));
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .open(&read_only_file)
+    {
+        Ok(_) => {
+            return Err(crate::Error::isolation_unavailable(
+                "Linux service probe unexpectedly gained write access to its read-only fixture",
+            ));
+        }
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS)
+            ) => {}
+        Err(_) => {
+            return Err(crate::Error::isolation_unavailable(
+                "Linux read-only fixture write failed for an unverified reason",
+            ));
+        }
+    }
+    let writable_probe = work.join("writable-probe.txt");
+    std::fs::write(&writable_probe, b"f2c-hardened-writable-probe\n")?;
+    if std::fs::read(&writable_probe)? != b"f2c-hardened-writable-probe\n" {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux service probe could not read back its writable stage fixture",
+        ));
+    }
+    if platform_only {
+        std::io::stdout().write_all(b"F2C-LINUX-PLATFORM-PROBE-PASS\n")?;
+        return Ok(());
+    }
+    let proxy = validated_probe_proxy()?;
+
+    let direct_tcp = [
+        "1.1.1.1:80",
+        "10.0.0.1:80",
+        "169.254.169.254:80",
+        "1.1.1.1:53",
+        "127.0.0.1:1",
+        "[::1]:1",
+        "[fd00:ec2::254]:80",
+        "[fd00:ec2::254]:53",
+        "[2606:4700:4700::1111]:80",
+        "[2606:4700:4700::1111]:53",
+    ];
+    for endpoint in direct_tcp {
+        let address = endpoint
+            .to_socket_addrs()
+            .map_err(|_| {
+                crate::Error::integrity("fixed Linux direct-route probe address is invalid")
+            })?
+            .next()
+            .ok_or_else(|| crate::Error::integrity("fixed Linux probe address resolved empty"))?;
+        if TcpStream::connect_timeout(&address, Duration::from_millis(750)).is_ok() {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "direct sandbox TCP route unexpectedly reached {endpoint}"
+            )));
+        }
+    }
+
+    for (bind, destination) in [
+        ("0.0.0.0:0", "1.1.1.1:53"),
+        ("0.0.0.0:0", "169.254.169.254:53"),
+        ("0.0.0.0:0", "127.0.0.1:53"),
+        ("[::]:0", "[2606:4700:4700::1111]:53"),
+        ("[::]:0", "[fd00:ec2::254]:53"),
+    ] {
+        let socket = UdpSocket::bind(bind).map_err(|_| {
+            crate::Error::isolation_unavailable("cannot create the fixed UDP probe socket")
+        })?;
+        let destination = destination
+            .to_socket_addrs()
+            .map_err(|_| crate::Error::integrity("fixed UDP probe address is invalid"))?
+            .next()
+            .ok_or_else(|| crate::Error::integrity("fixed UDP probe address resolved empty"))?;
+        if socket
+            .send_to(
+                b"\0\0\x01\0\0\x01\0\0\0\0\0\0\x01a\0\0\x01\0\x01",
+                destination,
+            )
+            .is_ok()
+        {
+            return Err(crate::Error::isolation_unavailable(
+                "direct sandbox DNS/UDP send unexpectedly succeeded",
+            ));
+        }
+    }
+
+    // The seccomp filter must deny listening specifically with EPERM. A
+    // generic bind failure would not prove the syscall control.
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        match TcpListener::bind(address) {
+            Ok(listener) => {
+                drop(listener);
+                return Err(crate::Error::isolation_unavailable(
+                    "sandbox unexpectedly opened a listening TCP socket",
+                ));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {}
+            Err(_) => {
+                return Err(crate::Error::isolation_unavailable(
+                    "sandbox listen control did not fail with seccomp EPERM",
+                ));
+            }
+        }
+    }
+
+    let public = proxy_http_request(
+        proxy,
+        b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+    )?;
+    let status = public
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    if !(status.starts_with(b"HTTP/1.1 200") || status.starts_with(b"HTTP/1.0 200"))
+        || !public
+            .windows(b"Example Domain".len())
+            .any(|w| w == b"Example Domain")
+    {
+        return Err(crate::Error::isolation_unavailable(
+            "shared egress proxy did not return the fixed public probe page",
+        ));
+    }
+
+    for target in [
+        "169.254.169.254:80",
+        "127.0.0.1:1",
+        "[::1]:1",
+        "[fd00:ec2::254]:80",
+    ] {
+        let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+        let refused = proxy_http_request(proxy, request.as_bytes())?;
+        if !(refused.starts_with(b"HTTP/1.1 403") || refused.starts_with(b"HTTP/1.0 403")) {
+            return Err(crate::Error::isolation_unavailable(
+                "shared egress proxy allowed a private, metadata or loopback destination",
+            ));
+        }
+    }
+    std::io::stdout().write_all(b"F2C-LINUX-EFFECT-PROBE-PASS\n")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validated_probe_proxy() -> crate::Result<std::net::SocketAddr> {
+    use std::net::SocketAddr;
+    let value = std::env::var("HTTP_PROXY")
+        .map_err(|_| crate::Error::integrity("Linux effect probe proxy is unavailable"))?;
+    let port = value
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| crate::Error::integrity("Linux effect probe proxy endpoint is invalid"))?;
+    for key in [
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if std::env::var(key).ok().as_deref() != Some(value.as_str()) {
+            return Err(crate::Error::integrity(
+                "Linux effect probe proxy environment is incomplete",
+            ));
+        }
+    }
+    for key in ["NO_PROXY", "no_proxy"] {
+        if !std::env::var(key).unwrap_or_default().is_empty() {
+            return Err(crate::Error::integrity(
+                "Linux effect probe bypass list is not empty",
+            ));
+        }
+    }
+    Ok(SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+#[cfg(target_os = "linux")]
+fn proxy_http_request(proxy: std::net::SocketAddr, request: &[u8]) -> crate::Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    const MAX_RESPONSE: usize = 64 * 1024;
+    let mut stream = TcpStream::connect_timeout(&proxy, Duration::from_secs(5))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(request)?;
+    let mut response = Vec::new();
+    stream
+        .take((MAX_RESPONSE + 1) as u64)
+        .read_to_end(&mut response)?;
+    if response.len() > MAX_RESPONSE {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux effect probe response exceeded its bound",
+        ));
+    }
+    Ok(response)
 }
 
 #[cfg(target_os = "linux")]
@@ -1062,10 +1620,6 @@ fn linux_watchdog_probe(
     state: &super::lifecycle::InstallState,
     sandbox_uid: u32,
 ) -> crate::Result<()> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
     if state.sandbox_uid != Some(sandbox_uid) || state.installer_uid == 0 {
         return Err(crate::Error::integrity(
             "hardened Linux watchdog probe install identity is invalid",
@@ -1078,8 +1632,58 @@ fn linux_watchdog_probe(
     let mut random = [0u8; 16];
     getrandom::fill(&mut random)
         .map_err(|_| crate::Error::internal("cannot generate Linux probe scope identity"))?;
-    let unit = format!("f2c-hardened-probe-{}.scope", hex::encode(random));
+    // run_hardened requires this system-scope identity and validates its exact
+    // cgroup limits before launching Bubblewrap.
+    let unit = format!("f2c-hardened-job-{}.scope", hex::encode(random));
     random.fill(0);
+    let marker = super::linux_acl::mark_probe_scope(
+        &super::lifecycle::linux_acl_journal_dir(),
+        sandbox_uid,
+        &unit,
+    )?;
+    let result = linux_watchdog_probe_in_scope(&unit, executable, setpriv, systemd_run, uid, gid);
+    match result {
+        Ok(()) => super::linux_acl::clear_probe_scope_marker(&marker, &unit),
+        Err(error) => {
+            // Reconcile before returning when possible. If systemd cannot
+            // prove the exact scope dead, the prewritten marker remains and
+            // every later request fails in ACL recovery until it is stopped.
+            match stop_and_confirm_linux_scope(&unit) {
+                Ok(()) => {
+                    if let Err(cleanup) =
+                        super::linux_acl::clear_probe_scope_marker(&marker, &unit)
+                    {
+                        Err(crate::Error::isolation_unavailable(format!(
+                            "watchdog probe failed: {}; scope cleanup is verified but its refusal marker remains: {}",
+                            error.message, cleanup.message
+                        )))
+                    } else {
+                        Err(error)
+                    }
+                }
+                Err(cleanup) => Err(crate::Error::isolation_unavailable(format!(
+                    "watchdog probe failed: {}; scope death is unconfirmed and refusal marker {} is retained: {}",
+                    error.message,
+                    marker.display(),
+                    cleanup.message
+                ))),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_watchdog_probe_in_scope(
+    unit: &str,
+    executable: std::path::PathBuf,
+    setpriv: std::path::PathBuf,
+    systemd_run: std::path::PathBuf,
+    uid: u32,
+    gid: u32,
+) -> crate::Result<()> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
     let mut command = Command::new(systemd_run);
     command
         .args([
@@ -1090,7 +1694,7 @@ fn linux_watchdog_probe(
             "--collect",
             "--expand-environment=no",
             "--unit",
-            &unit,
+            unit,
             "--property",
             "TasksMax=8",
             "--property",
@@ -1116,68 +1720,70 @@ fn linux_watchdog_probe(
     let mut child = command.spawn().map_err(|error| {
         crate::Error::isolation_unavailable(format!("cannot start Linux watchdog probe: {error}"))
     })?;
-    let watchdog = child.stdin.take().ok_or_else(|| {
-        crate::Error::isolation_unavailable("Linux watchdog probe channel is unavailable")
-    })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| crate::Error::internal("Linux watchdog probe stdout is unavailable"))?;
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    let output_thread = std::thread::spawn(move || -> std::io::Result<(Vec<u8>, Vec<u8>)> {
-        let mut reader = BufReader::new(stdout);
-        let mut ready = Vec::new();
-        reader.by_ref().take(128).read_until(b'\n', &mut ready)?;
-        let _ = ready_tx.send(ready.clone());
-        let mut rest = Vec::new();
-        reader.take(8193).read_to_end(&mut rest)?;
-        Ok((ready, rest))
-    });
-    let ready = match ready_rx.recv_timeout(Duration::from_secs(30)) {
-        Ok(ready) if ready == b"F2C-WATCHDOG-READY\n" => ready,
-        _ => {
-            drop(watchdog);
-            let _ = terminate_linux_scope(&unit);
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = output_thread.join();
-            return Err(crate::Error::isolation_unavailable(
-                "Linux watchdog probe did not complete platform controls before its deadline",
-            ));
-        }
-    };
-    let _ = ready;
-    // The launcher writes READY only after the sandbox self-test and cgroup
-    // readback succeeded; EOF now tests the actual watchdog cancellation path.
+    let watchdog = child.stdin.take();
+    let stdout = child.stdout.take();
+    if watchdog.is_none() || stdout.is_none() {
+        stop_linux_probe_child(unit, &mut child, watchdog, None)?;
+        return Err(crate::Error::isolation_unavailable(
+            "Linux watchdog probe control channel is unavailable",
+        ));
+    }
+    let watchdog = watchdog.unwrap();
+    let stdout = stdout.unwrap();
+    let (output_thread, ready_rx) = linux_probe_output_thread(stdout);
+    let ready = ready_rx.recv_timeout(Duration::from_secs(30));
+    if !matches!(ready, Ok(bytes) if bytes == b"F2C-WATCHDOG-READY\n") {
+        stop_linux_probe_child(unit, &mut child, Some(watchdog), Some(output_thread))?;
+        return Err(crate::Error::isolation_unavailable(
+            "Linux watchdog probe did not complete platform controls before its deadline",
+        ));
+    }
+    // READY is written only after account, Bubblewrap and scope limit checks;
+    // closing this pipe now exercises the actual launcher watchdog.
     drop(watchdog);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) => {
+                if !linux_scope_inactive(unit, Duration::from_secs(5))? {
+                    stop_linux_probe_child(unit, &mut child, None, Some(output_thread))?;
+                    return Err(crate::Error::isolation_unavailable(format!(
+                        "Linux watchdog probe launcher exited with {status} before its scope stopped"
+                    )));
+                }
                 let _ = output_thread.join();
                 return Err(crate::Error::isolation_unavailable(format!(
                     "Linux watchdog probe launcher exited with {status}"
                 )));
             }
-            break;
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                stop_linux_probe_child(unit, &mut child, None, Some(output_thread))?;
+                return Err(crate::Error::isolation_unavailable(
+                    "Linux watchdog probe did not stop within its service deadline",
+                ));
+            }
+            Err(error) => {
+                stop_linux_probe_child(unit, &mut child, None, Some(output_thread))?;
+                return Err(crate::Error::isolation_unavailable(format!(
+                    "cannot observe Linux watchdog probe launcher exit: {error}"
+                )));
+            }
         }
-        if Instant::now() >= deadline {
-            let _ = terminate_linux_scope(&unit);
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = output_thread.join();
-            return Err(crate::Error::isolation_unavailable(
-                "Linux watchdog probe did not stop within its service deadline",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !linux_scope_inactive(unit, Duration::from_secs(5))? {
+        stop_linux_probe_child(unit, &mut child, None, Some(output_thread))?;
+        return Err(crate::Error::isolation_unavailable(
+            "Linux watchdog probe scope did not stop cleanly",
+        ));
     }
     let (_ready, bytes) = output_thread
         .join()
         .map_err(|_| crate::Error::internal("Linux watchdog probe reader panicked"))??;
-    if bytes.len() > 8192 || !linux_scope_inactive(&unit, Duration::from_secs(5))? {
-        return Err(crate::Error::isolation_unavailable(
-            "Linux watchdog probe scope did not stop cleanly",
+    if bytes.len() > 8192 {
+        return Err(crate::Error::integrity(
+            "Linux watchdog probe output exceeded its bound",
         ));
     }
     let result: serde_json::Value = serde_json::from_slice(&bytes)
@@ -1190,6 +1796,67 @@ fn linux_watchdog_probe(
         return Err(crate::Error::isolation_unavailable(
             "Linux watchdog effect probe did not confirm process-tree cancellation",
         ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_probe_output_thread(
+    stdout: std::process::ChildStdout,
+) -> (
+    std::thread::JoinHandle<std::io::Result<(Vec<u8>, Vec<u8>)>>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    use std::io::Read;
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let output_thread = std::thread::spawn(move || -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        let mut reader = BufReader::new(stdout);
+        let mut ready = Vec::new();
+        reader.by_ref().take(128).read_until(b'\n', &mut ready)?;
+        let _ = ready_tx.send(ready.clone());
+        let mut rest = Vec::new();
+        reader.take(8193).read_to_end(&mut rest)?;
+        Ok((ready, rest))
+    });
+    (output_thread, ready_rx)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_and_confirm_linux_scope(unit: &str) -> crate::Result<()> {
+    stop_and_confirm_linux_scope_with(unit, terminate_linux_scope, linux_scope_inactive)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_and_confirm_linux_scope_with(
+    unit: &str,
+    terminate: impl FnOnce(&str) -> crate::Result<()>,
+    readback: impl FnOnce(&str, std::time::Duration) -> crate::Result<bool>,
+) -> crate::Result<()> {
+    let kill = terminate(unit);
+    if !readback(unit, std::time::Duration::from_secs(5))? {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux watchdog probe scope remained active after bounded kill/readback",
+        ));
+    }
+    kill
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_probe_child(
+    unit: &str,
+    child: &mut std::process::Child,
+    watchdog: Option<std::process::ChildStdin>,
+    output_thread: Option<std::thread::JoinHandle<std::io::Result<(Vec<u8>, Vec<u8>)>>>,
+) -> crate::Result<()> {
+    drop(watchdog);
+    let scope_result = stop_and_confirm_linux_scope(unit);
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    scope_result?;
+    if let Some(output_thread) = output_thread {
+        let _ = output_thread.join();
     }
     Ok(())
 }
@@ -1225,6 +1892,7 @@ fn run_linux_service_job(
     peer_uid: u32,
     sandbox_uid: u32,
     client: &std::os::unix::net::UnixStream,
+    allow_internet_probe: bool,
 ) -> crate::Result<String> {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -1318,9 +1986,9 @@ fn run_linux_service_job(
             "Linux hardened diagnostic jobs are unavailable",
         ));
     }
-    if job.network == crate::isolation::NetworkMode::Internet {
+    if job.network == crate::isolation::NetworkMode::Internet && !allow_internet_probe {
         return Err(crate::Error::isolation_unavailable(
-            "Linux Internet execution remains disabled until the authenticated service egress effect probe passes",
+            "Linux Internet execution is reserved for the authenticated fixed egress probe",
         ));
     }
 
@@ -1367,8 +2035,14 @@ fn run_linux_service_job(
         (output.clone(), "rwx"),
     ];
     let journal_dir = super::lifecycle::linux_acl_journal_dir();
-    let mut grants =
-        super::linux_acl::GrantGuard::apply(&job, peer_uid, &extra, &journal_dir, Some(&unit))?;
+    let mut grants = super::linux_acl::GrantGuard::apply(
+        &job,
+        peer_uid,
+        sandbox_uid,
+        &extra,
+        &journal_dir,
+        Some(&unit),
+    )?;
     let setpriv = trusted_linux_tool(&["/usr/bin/setpriv", "/bin/setpriv"])?;
     let systemd_run = trusted_linux_tool(&["/usr/bin/systemd-run"])?;
     let tasks = job.limits.max_processes.unwrap_or(256).clamp(1, 32768);
@@ -6119,5 +6793,90 @@ mod tests {
         std::os::unix::fs::symlink(&canonical, &link).unwrap();
         assert!(validate_job_dir(&link, uid).is_err());
         std::fs::remove_file(link).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_mandatory_probe_requires_real_effect_events_and_trip_outcome() {
+        use crate::isolation::{ActivityKind, ActivityReport, JobOutcome, JobStatus};
+
+        let passing_routes = JobOutcome {
+            status: JobStatus::Exited(0),
+            stdout: b"F2C-LINUX-EFFECT-PROBE-PASS\n".to_vec(),
+            stderr: Vec::new(),
+            truncated: false,
+            exported: Vec::new(),
+            report: ActivityReport {
+                events: vec![
+                    crate::isolation::Activity {
+                        kind: ActivityKind::NetAllowed,
+                        detail: "public destination".into(),
+                    },
+                    crate::isolation::Activity {
+                        kind: ActivityKind::NetRefused,
+                        detail: "restricted destination".into(),
+                    },
+                ],
+                truncated: false,
+            },
+        };
+        assert!(linux_effect_probe_outcome_passed(&passing_routes));
+
+        let mut missing_refusal = passing_routes.clone();
+        missing_refusal
+            .report
+            .events
+            .retain(|event| event.kind != ActivityKind::NetRefused);
+        assert!(!linux_effect_probe_outcome_passed(&missing_refusal));
+
+        let bait_killed = JobOutcome {
+            status: JobStatus::Killed,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            truncated: false,
+            exported: Vec::new(),
+            report: ActivityReport {
+                events: vec![crate::isolation::Activity {
+                    kind: ActivityKind::Bait,
+                    detail: "bait token detected".into(),
+                }],
+                truncated: false,
+            },
+        };
+        assert!(linux_bait_probe_outcome_passed(&bait_killed));
+
+        let mut bait_exit = bait_killed.clone();
+        bait_exit.status = JobStatus::Exited(0);
+        assert!(!linux_bait_probe_outcome_passed(&bait_exit));
+        let mut bait_exported = bait_killed;
+        bait_exported
+            .exported
+            .push(std::path::PathBuf::from("/tmp/leak"));
+        assert!(!linux_bait_probe_outcome_passed(&bait_exported));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watchdog_probe_cleanup_requires_successful_kill_and_inactive_readback() {
+        let unit = "f2c-hardened-job-0123456789abcdef0123456789abcdef.scope";
+        assert!(stop_and_confirm_linux_scope_with(
+            unit,
+            |_| Err(crate::Error::isolation_unavailable("injected kill failure")),
+            |_, timeout| {
+                assert_eq!(timeout, std::time::Duration::from_secs(5));
+                Ok(false)
+            },
+        )
+        .is_err());
+        assert!(stop_and_confirm_linux_scope_with(unit, |_| Ok(()), |_, _| Ok(false),).is_err());
+        assert!(stop_and_confirm_linux_scope_with(
+            unit,
+            |_| Ok(()),
+            |_, _| Err(crate::Error::isolation_unavailable(
+                "injected readback failure"
+            )),
+        )
+        .is_err());
+        assert!(stop_and_confirm_linux_scope_with(unit, |_| Ok(()), |_, _| Ok(true)).is_ok());
     }
 }

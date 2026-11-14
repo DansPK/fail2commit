@@ -47,6 +47,16 @@ pub enum Action {
         #[arg(long)]
         watchdog: Option<u64>,
     },
+    /// Linux service-only fixed egress effect self-test.
+    #[command(hide = true)]
+    HardenedEgressProbe {
+        #[arg(long)]
+        expected_uid: u32,
+        #[arg(long)]
+        bait_trip: bool,
+        #[arg(long)]
+        platform_only: bool,
+    },
 }
 
 pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
@@ -62,7 +72,8 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
         Action::Serve
         | Action::Launch { .. }
         | Action::EgressProbe
-        | Action::HardenedProbe { .. } => {
+        | Action::HardenedProbe { .. }
+        | Action::HardenedEgressProbe { .. } => {
             return Err(fail2commit_core::Error::rejected(
                 "private sandbox entry point was not routed",
             ));
