@@ -69,3 +69,7 @@ Windows native GUI and current-source Windows npm/pip runtime gates remain pendi
 ## Manager integration verification
 
 Integrated source `f928a451758a8fac774ac80989bf000f1cabe5e9` after Sol r4 source acceptance. Manager tree `4a5bd93` passed `cargo fmt --all -- --check` (exit 0) and `cargo check --tests -p fail2commit -p fail2commit-core --locked` (exit 0, 1m 09s). These are host formatting/compile checks only; Windows native GUI and current-source Windows sandbox package gates remain pending.
+
+## Reusable disposable Debian build setup
+
+Progress worker confirmed guest `debian-f2c`, stored credential reference `debian-f2c`, user `dev` (uid 1000); no root authentication was used or verified. Task-local `RUSTUP_HOME=/home/dev/.cache/fr013-progress-r2-4383611/rustup`, `CARGO_HOME=/home/dev/.cache/fr013-progress-r2-4383611/cargo`; prepend `$CARGO_HOME/bin` to command PATH for Rust 1.100.0. Tested source was `/home/dev/.cache/fr013-progress-r2-4383611/source-40c512e`, target `/home/dev/.cache/fr013-progress-r2-4383611/target`, binary `target/debug/fail2commit`. This existing binary is progress source `40c512e`, not current hardened code. Subsequent workers must use a separate source directory and record their own tested SHA.
