@@ -18,7 +18,7 @@ unavailable and fall back; a QEMU-on-Windows stack is out of scope for a Could.
 
 `sandbox.backend = "vm"` → `VmBackend` (SPEC-018 §1 `select_backend`):
 
-- probe unavailable because the feature or hardware virtualization is absent →
+- probe proves the feature or hardware virtualization is absent →
   **fall back to the platform default backend**, as FR-029 states; `status`
   records the fallback and its reason.
 - probe unavailable for any other reason, or a VM failure at run time →
@@ -52,8 +52,17 @@ host: wait outcome.json + VM process exit → revoke nothing (VM is disposable)
   `JobStatus::TimedOut`, no export.
 
 ## 3. Windows: Windows Sandbox (WSB)
+**Current implementation status (2026-11-14): Windows VM selection is unavailable.** The active
+preflight checks firmware virtualization only: proven absence may use the documented
+platform fallback; otherwise it returns `IsolationUnavailable` because WSB instance
+lifecycle correlation and trusted guest-context verification are not implemented.
+It returns before feature queries, install-path checks, mappings, or VM launch, so
+unknown feature state and permission errors never trigger fallback. The design below
+is a target only and does not describe an available Windows backend; activation
+requires bounded feature probing plus lifecycle/context proof and VM validation.
 
-### 3.1 Launch
+
+### 3.1 Planned launch (inactive)
 
 - Generate a `.wsb` configuration:
   - `MappedFolder` per `read_only` tree → `C:\f2c\cache\sandbox-stage\<job-id>\input-<n>`, `ReadOnly=true`;
@@ -82,13 +91,15 @@ export is disabled; only the original host work directory is exported after an
 identity-bound valid outcome and confirmed VM exit. Resolved mount/file
 identities must be validated, not just path spelling.
 
-### 3.2 Probe (cached, cheap after first call)
+### 3.2 Current probe gate (unavailable)
 
-`WindowsSandbox.exe` present; optional feature
-`Containers-DisposableClientVM` enabled (package state registry read);
-virtualization enabled in firmware. Any missing → unavailable with the reason
-named → §1 fallback. No VM is started by the probe.
-
+No external feature query is active. With firmware virtualization present, probe
+returns unavailable for the unimplemented WSB instance lifecycle and guest-context
+gates, before inspecting feature state or touching job mappings. Unknown support and
+permission errors are not evidence of feature absence and therefore do not fall back.
+Only proven firmware virtualization absence takes the documented fallback. Enabling
+the design in 3.1 requires a bounded, trusted feature probe and proven lifecycle and
+guest-context binding, followed by VM-backed validation.
 ### 3.3 Limits of the mechanism (recorded)
 
 - WSB needs an interactive desktop session (LESSONS: batch/guest-ops logon
@@ -225,7 +236,9 @@ Linux: `/dev/kvm`), in the VM gate, not on the host. Unit tests run anywhere.
 
 ## 9. Known limits (for the catalogue table and the owner)
 
-- Windows Home: no WSB → fallback to the default backend (FRD behaviour).
+- Windows editions without WSB can fall back only after a trusted probe proves
+  the feature is absent; current Windows preflight deliberately performs no
+  feature query and reports the lifecycle/context implementation gap instead.
 - The WSB window is visible during jobs; no hidden automation API exists.
 - Linux guests need `qemu-system-x86_64` installed (documented optional
   dependency) and a prepared initramfs (one root command).

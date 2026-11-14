@@ -1,6 +1,6 @@
 //! Windows Sandbox transport and lifecycle for the VM backend.
 
-use super::super::windows::{self as appcontainer, AppContainer, ValidatedPaths};
+use super::super::windows::{self as appcontainer, ValidatedPaths};
 use super::PlatformFallback;
 use crate::isolation::{
     ActivityReport, JobOutcome, JobSpec, JobStatus, ProbeReport, SandboxBackend,
@@ -9,23 +9,17 @@ use crate::sandbox::hardened::protocol::{self, MAX_OUTCOME_BYTES};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::System::StationsAndDesktops::{
-    GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
-};
-use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{IsProcessorFeaturePresent, PF_VIRT_FIRMWARE_ENABLED};
 
 const BOOT_GRACE: Duration = Duration::from_secs(45);
 const CONTROL_GRACE: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
-const MAX_CONTROL_OUTPUT: usize = 16 * 1024;
 const MAX_GUEST_ID: usize = 32;
 const XML_HEADER: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>";
 
@@ -42,6 +36,12 @@ struct ReadyHost {
 enum Selection {
     Ready(ReadyHost),
     Failed(String),
+}
+
+fn lifecycle_unsupported() -> ProbeFailure {
+    ProbeFailure::Failed(
+        "Windows Sandbox has no documented instance-specific lifecycle proof; VM execution is disabled".into(),
+    )
 }
 
 pub(super) fn selected() -> Box<dyn SandboxBackend> {
@@ -105,140 +105,26 @@ fn unavailable(detail: String) -> ProbeReport {
 }
 
 fn preflight() -> Result<ReadyHost, ProbeFailure> {
-    let system_dir = trusted_system_dir().map_err(ProbeFailure::Failed)?;
-    let feature_state = query_feature_state(&system_dir).map_err(ProbeFailure::Failed)?;
-    match feature_disposition(&feature_state) {
-        Some(true) => {}
-        Some(false) => {
-            return Err(ProbeFailure::Absent(
-                "Windows Sandbox optional feature is disabled".into(),
-            ));
-        }
-        None => {
-            return Err(ProbeFailure::Failed(format!(
-                "Windows Sandbox feature state is not definitive: {feature_state}"
-            )));
-        }
-    }
-    if !firmware_virtualization_enabled() {
+    preflight_for_hardware(firmware_virtualization_enabled())
+}
+
+fn preflight_for_hardware(firmware_virtualization: bool) -> Result<ReadyHost, ProbeFailure> {
+    if !firmware_virtualization {
         return Err(ProbeFailure::Absent(
             "firmware virtualization is not enabled".into(),
         ));
     }
-    let sandbox_exe = system_dir.join("WindowsSandbox.exe");
-    let meta = fs::metadata(&sandbox_exe).map_err(|error| {
-        ProbeFailure::Failed(format!(
-            "Windows Sandbox feature is enabled but its trusted executable is unavailable: {error}"
-        ))
-    })?;
-    if !meta.is_file() {
-        return Err(ProbeFailure::Failed(
-            "WindowsSandbox.exe is not a regular system file".into(),
-        ));
-    }
-    if !interactive_desktop_available() {
-        return Err(ProbeFailure::Failed(
-            "Windows Sandbox requires an interactive desktop session".into(),
-        ));
-    }
-    let inner = AppContainer.probe();
-    if !inner.available {
-        return Err(ProbeFailure::Failed(format!(
-            "inner AppContainer controls failed: {}",
-            inner.detail
-        )));
-    }
-    Ok(ReadyHost {
-        system_dir,
-        sandbox_exe,
-    })
+    // WSB instance shutdown correlation and trusted guest-context verification
+    // are implementation gaps. Keep selection unavailable before probing
+    // feature state with a subprocess, checking install paths, or staging any
+    // mapping. Unknown feature/permission state is therefore never fallback.
+    Err(lifecycle_unsupported())
 }
 
 #[allow(unsafe_code)]
 fn firmware_virtualization_enabled() -> bool {
     // SAFETY: IsProcessorFeaturePresent takes a documented processor feature ID.
     unsafe { IsProcessorFeaturePresent(PF_VIRT_FIRMWARE_ENABLED) != 0 }
-}
-
-fn query_feature_state(system_dir: &Path) -> Result<String, String> {
-    let powershell = system_dir.join("WindowsPowerShell\\v1.0\\powershell.exe");
-    if !powershell.is_file() {
-        return Err("trusted Windows PowerShell executable is missing".into());
-    }
-    let script = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; try { $f=Get-CimInstance -Namespace 'root/cimv2' -ClassName Win32_OptionalFeature -Filter 'Name=\"Containers-DisposableClientVM\"'; if ($null -eq $f) { [Console]::Out.Write('Absent') } else { [Console]::Out.Write($f.InstallState) } } catch { [Console]::Error.Write($_.Exception.Message); exit 3 }";
-    let mut child = Command::new(powershell)
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("query Windows Sandbox feature state: {error}"))?;
-    let status = match wait_child(&mut child, CONTROL_GRACE) {
-        Ok(status) => status,
-        Err(WaitError::TimedOut) => {
-            let _ = terminate_process_tree(&mut child, system_dir);
-            return Err("Windows Sandbox feature query timed out".into());
-        }
-        Err(WaitError::Failed(error)) => {
-            let _ = terminate_process_tree(&mut child, system_dir);
-            return Err(format!("Windows Sandbox feature query failed: {error}"));
-        }
-    };
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("collect Windows Sandbox feature result: {error}"))?;
-    if !status.success() {
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Windows Sandbox feature state could not be queried (permission/OS query failure): {}",
-            bounded_text(&diagnostic, MAX_CONTROL_OUTPUT)
-        ));
-    }
-    if output.stdout.len() > MAX_CONTROL_OUTPUT {
-        return Err("Windows Sandbox feature query returned oversized output".into());
-    }
-    let state = String::from_utf8(output.stdout)
-        .map_err(|_| "Windows Sandbox feature query returned non-UTF-8 output".to_owned())?;
-    Ok(state.trim().to_owned())
-}
-
-#[allow(unsafe_code)]
-fn trusted_system_dir() -> Result<PathBuf, String> {
-    let mut buffer = vec![0u16; 32_768];
-    // SAFETY: writable buffer is valid and its length fits in u32.
-    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if len == 0 || len >= buffer.len() {
-        return Err("GetSystemDirectoryW failed".into());
-    }
-    Ok(PathBuf::from(OsString::from_wide(&buffer[..len])))
-}
-
-#[allow(unsafe_code)]
-fn interactive_desktop_available() -> bool {
-    // SAFETY: a valid process window station handle is returned by the OS.
-    let station = unsafe { GetProcessWindowStation() };
-    if station.is_null() {
-        return false;
-    }
-    let mut flags = USEROBJECTFLAGS::default();
-    let mut needed = 0u32;
-    // SAFETY: flags is a correctly sized writable USEROBJECTFLAGS output buffer.
-    let ok = unsafe {
-        GetUserObjectInformationW(
-            station,
-            UOI_FLAGS,
-            (&mut flags as *mut USEROBJECTFLAGS).cast(),
-            std::mem::size_of::<USEROBJECTFLAGS>() as u32,
-            &mut needed,
-        )
-    };
-    ok != 0 && (flags.dwFlags & 1) != 0 // WSF_VISIBLE
 }
 
 struct HostMappings {
@@ -321,6 +207,12 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     }
     let _mount_pins = revalidated.pin_vm_mounts(&host_stage)?;
 
+    let duration = timeout_deadline(job.limits.timeout).ok_or_else(|| {
+        crate::Error::isolation_unavailable("job timeout plus VM boot grace cannot be represented")
+    })?;
+    let deadline = Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| crate::Error::isolation_unavailable("job deadline cannot be represented"))?;
     let mut child = Command::new(&host.sandbox_exe)
         .arg(&config_path)
         .stdin(Stdio::null())
@@ -330,10 +222,7 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
         .map_err(|error| {
             crate::Error::isolation_unavailable(format!("start Windows Sandbox: {error}"))
         })?;
-    let deadline = timeout_deadline(job.limits.timeout).ok_or_else(|| {
-        crate::Error::isolation_unavailable("job timeout plus VM boot grace cannot be represented")
-    })?;
-    let exit = match wait_child(&mut child, deadline) {
+    let exit = match wait_child_until(&mut child, deadline) {
         Ok(status) => status,
         Err(WaitError::TimedOut) => {
             terminate_process_tree(&mut child, &host.system_dir)?;
@@ -656,6 +545,10 @@ fn wait_child(child: &mut Child, timeout: Duration) -> Result<ExitStatus, WaitEr
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| WaitError::Failed("timeout cannot be represented".into()))?;
+    wait_child_until(child, deadline)
+}
+
+fn wait_child_until(child: &mut Child, deadline: Instant) -> Result<ExitStatus, WaitError> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
@@ -756,10 +649,6 @@ fn valid_job_id(id: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-fn bounded_text(text: &str, cap: usize) -> String {
-    text.chars().take(cap).collect()
-}
-
 fn path_under(child: &Path, parent: &Path) -> bool {
     let mut child = child.components();
     let mut parent = parent.components();
@@ -794,6 +683,49 @@ fn strip_windows_device_prefix(path: &Path) -> PathBuf {
 
 fn timeout_deadline(timeout: Duration) -> Option<Duration> {
     timeout.checked_add(BOOT_GRACE)
+}
+
+#[cfg(test)]
+mod lifecycle_gate_tests {
+    use super::*;
+
+    #[test]
+    fn deadlines_are_rejected_before_a_vm_can_be_spawned() {
+        assert!(timeout_deadline(Duration::MAX).is_none());
+        assert!(Instant::now().checked_add(Duration::MAX).is_none());
+    }
+
+    #[test]
+    fn unsupported_lifecycle_is_selected_unavailable_without_fallback() {
+        let reason = match lifecycle_unsupported() {
+            ProbeFailure::Failed(reason) => reason,
+            ProbeFailure::Absent(reason) => {
+                panic!("lifecycle gap misclassified as absence: {reason}")
+            }
+        };
+        let probe = WindowsSandbox {
+            selection: Selection::Failed(reason),
+        }
+        .probe();
+        assert!(!probe.available);
+        assert!(probe.detail.contains("instance-specific lifecycle proof"));
+        assert!(!probe
+            .controls
+            .iter()
+            .any(|(name, _)| name == "vm_fallback_to_platform"));
+    }
+
+    #[test]
+    fn active_preflight_never_launches_a_feature_query_for_unknown_support() {
+        let error = match preflight_for_hardware(true) {
+            Ok(_) => panic!("unsupported WSB lifecycle must remain unavailable"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ProbeFailure::Failed(_)));
+
+        let hardware_absence = preflight_for_hardware(false);
+        assert!(matches!(hardware_absence, Err(ProbeFailure::Absent(_))));
+    }
 }
 
 #[cfg(test)]
@@ -876,6 +808,20 @@ mod tests {
             timeout_deadline(Duration::from_secs(10)),
             Some(Duration::from_secs(55))
         );
+    }
+
+    #[test]
+    fn unsupported_preflight_blocks_probe_and_run_before_vm_launch() {
+        let reason = match preflight_for_hardware(true) {
+            Err(ProbeFailure::Failed(reason)) => reason,
+            _ => panic!("unsupported WSB lifecycle must fail closed"),
+        };
+        let backend = WindowsSandbox {
+            selection: Selection::Failed(reason),
+        };
+        assert!(!backend.probe().available);
+        let error = backend.run(&job()).unwrap_err();
+        assert!(error.to_string().contains("Windows Sandbox unavailable"));
     }
 
     #[test]
@@ -962,22 +908,5 @@ mod tests {
             .to_string_lossy()
             .contains(&input.to_string_lossy().to_string()));
         assert!(guest.args[0].to_string_lossy().contains(&id));
-    }
-
-    #[test]
-    fn known_absence_is_distinct_from_unknown_state() {
-        assert_eq!(feature_disposition("Disabled"), Some(false));
-        assert_eq!(feature_disposition("Enabled"), Some(true));
-        assert_eq!(feature_disposition("EnablePending"), None);
-    }
-}
-
-fn feature_disposition(state: &str) -> Option<bool> {
-    match state {
-        "Enabled" | "1" => Some(true),
-        // WMI InstallState: disabled or absent. Neither provides the optional
-        // Windows Sandbox feature required by this backend.
-        "Disabled" | "DisabledWithPayloadRemoved" | "Absent" | "2" | "3" => Some(false),
-        _ => None,
     }
 }
