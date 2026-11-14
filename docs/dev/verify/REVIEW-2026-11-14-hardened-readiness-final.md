@@ -1,0 +1,17 @@
+# FR-027 hardened readiness gate review (2026-11-14)
+
+**Pinned implementation:** `155e823240ddfad0cd29c0f0db92f9658a5644f4`, direct child of `c5cf44a4f8998b039e1efb24158b560b37622eb5`; prior review `f5cb5f18b9c50cf0652fdde07d2aca0a57f66ac6`. **Verdict:** LG-01 is source-fixed. This narrow patch is acceptable for **fail-closed source integration**; it establishes no installed Linux or Windows runtime acceptance and does not resolve the external FirewallAPI writer race.
+
+## LG-01 disposition and consistency
+
+`ReadinessFacts::complete()` now requires service, authenticated peer, launcher watchdog, platform controls, network effects and the external-writer condition (`crates/fail2commit-core/src/sandbox/hardened/mod.rs:32-55`). Windows readiness sets launcher/watchdog, platform and external-writer facts false even if the WFP/LPAC traffic-effect bit is true (`:82-98`). Both `hardened::status()` and `HardenedBackend::probe()` construct this same Windows readiness and use `complete()` for availability (`:139-163,552-604`). Status still exposes `effect_probe_passed` separately, while its `controls` object exposes the unresolved facts (`:143-162`). The backend detail also names the unresolved launcher/platform and FirewallAPI writer requirement (`:99-104,589-604`). Thus a passing traffic-effect diagnostic cannot produce the earlier false “hardened mode available” result.
+
+Linux status and backend probing both use `linux_readiness(service, peer, platform, network)` (`:65-80,115-138,545-562`). Its launcher fact follows the platform probe, the external-writer fact is inapplicable/true, and `complete()` still requires all four real Linux inputs. A partial service response leaves `probe_available`/backend `available` false. `fail2commit hardened status` returns an isolation-unavailable error when the bit is false and includes the detail (`crates/fail2commit/src/cmd/hardened.rs:42-61`). The service probe functions do not call `hardened::status()`; status first calls the lifecycle state reader, then the service probe, so this patch adds no recursive readiness path. The backend `ProbeReport.controls` vector does not list the external-writer fact separately, but its availability and detail use the complete fact set; the richer status controls expose it.
+
+The focused tests construct complete/partial Linux facts and passing/failed Windows diagnostic facts (`hardened/mod.rs:650-690`). They test the production predicate but do not run a service, launcher, WFP engine or systemd scope. I found no concrete residual defect in the requested readiness delta.
+
+## Evidence and pending gates
+
+The implementation worker reported seven selection tests passing, direct rustfmt on the edited module and diff check exit `0`; workspace-wide fmt debt in the hardened CLI is being normalized by the manager. I did not rerun a cold build or broad suite. I confirmed a clean checkout before `git switch -c DansPK/f2c-014-review-hardened-readiness-final 155e823240ddfad0cd29c0f0db92f9658a5644f4` (exit `0`); `git rev-parse`, targeted diff/source reads, `rg`, and `git diff --check c5cf44a... 155e823...` exited `0` without diagnostics.
+
+The root-installed Linux account/ACL/scope/bwrap/seccomp/network/bait effects and Windows installed launcher/LPAC/WFP/cleanup effects remain pending. The arbitrary external administrative FirewallAPI writer race is still unaccepted, so Windows full readiness remains false. No production edit, host privilege, VM change, push or publish action occurred in this review.
