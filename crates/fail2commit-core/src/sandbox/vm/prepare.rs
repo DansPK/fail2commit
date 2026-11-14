@@ -1433,6 +1433,22 @@ exit 0
         }
     }
 
+    /// Exec'ing a just-written script can transiently hit ETXTBSY when a
+    /// parallel test forks while this writer still holds the file; the forked
+    /// child inherits the write fd until it execs. Retry briefly. Production
+    /// keeps the single bounded spawn error (fail closed), never a retry.
+    fn spawn_txtbsy_retry<T>(
+        e: std::io::Error,
+        attempts_left: u32,
+        retry: impl FnOnce(u32) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        if e.raw_os_error() == Some(libc::ETXTBSY) && attempts_left > 0 {
+            std::thread::sleep(Duration::from_millis(25));
+            return retry(attempts_left - 1);
+        }
+        Err(e)
+    }
+
     fn run_init_full(
         f: &InitFixture,
         cmdline: &str,
@@ -1440,19 +1456,35 @@ exit 0
         poweroff: &str,
         kmod_fail: bool,
     ) -> std::process::Output {
-        let out = Command::new("/bin/sh")
-            .arg(&f.init)
-            .env("F2C_INIT_LOG", &f.log)
-            .env("F2C_INIT_ROOT", &f.root)
-            .env("F2C_INIT_CMDLINE", cmdline)
-            .env("F2C_INIT_FAIL_TAGS", fail_tags)
-            .env("F2C_INIT_POWEROFF", poweroff)
-            .env("F2C_INIT_KMOD_FAIL", if kmod_fail { "1" } else { "" })
-            // Own process group: the fake `poweroff -f` kills this group to
-            // emulate a halt that never returns, without touching the test.
-            .process_group(0)
-            .output()
-            .unwrap();
+        fn attempt(
+            f: &InitFixture,
+            cmdline: &str,
+            fail_tags: &str,
+            poweroff: &str,
+            kmod_fail: bool,
+            left: u32,
+        ) -> std::io::Result<std::process::Output> {
+            let cmd = Command::new("/bin/sh")
+                .arg(&f.init)
+                .env("F2C_INIT_LOG", &f.log)
+                .env("F2C_INIT_ROOT", &f.root)
+                .env("F2C_INIT_CMDLINE", cmdline)
+                .env("F2C_INIT_FAIL_TAGS", fail_tags)
+                .env("F2C_INIT_POWEROFF", poweroff)
+                .env("F2C_INIT_KMOD_FAIL", if kmod_fail { "1" } else { "" })
+                // Own process group: the fake `poweroff -f` kills this group to
+                // emulate a halt that never returns, without touching the test.
+                .process_group(0)
+                .output();
+            match cmd {
+                Ok(out) => Ok(out),
+                Err(e) => spawn_txtbsy_retry(e, left, |l| {
+                    attempt(f, cmdline, fail_tags, poweroff, kmod_fail, l)
+                }),
+            }
+        }
+        let out = attempt(f, cmdline, fail_tags, poweroff, kmod_fail, 10)
+            .expect("init fixture must spawn");
         // A poweroff-terminated run is expected, not a crash. Only a shell
         // parse error is a fixture bug.
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1682,6 +1714,22 @@ exit 0
 
     // ---- Bounded query fixtures (LV-06) ----
 
+    fn query_retry(exe: &Path, grace: Duration) -> crate::Result<String> {
+        // Same freshly-written-script ETXTBSY window as the init fixture.
+        let mut last = None;
+        for _ in 0..10 {
+            let result = run_bounded_with_grace(exe, &[], grace);
+            match result {
+                Err(e) if e.message.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    last = Some(e);
+                }
+                other => return other,
+            }
+        }
+        Err(last.expect("looped on Text file busy"))
+    }
+
     #[test]
     fn bounded_query_drains_pipe_pressure_concurrently() {
         // >64KB pipe buffer: waiting for exit before draining would deadlock.
@@ -1691,7 +1739,7 @@ exit 0
             "q",
             "#!/bin/sh\nn=0\nwhile [ $n -lt 200 ]; do printf '%01024d' 0; n=$((n+1)); done\n",
         );
-        let out = run_bounded_with_grace(&script, &[], Duration::from_secs(10)).unwrap();
+        let out = query_retry(&script, Duration::from_secs(10)).unwrap();
         assert_eq!(out.len(), 200 * 1024);
     }
 
@@ -1706,7 +1754,7 @@ exit 0
             "#!/bin/sh\necho leader-output\n(sleep 30) &\nexit 0\n",
         );
         let start = Instant::now();
-        let out = run_bounded_with_grace(&script, &[], Duration::from_secs(5)).unwrap();
+        let out = query_retry(&script, Duration::from_secs(5)).unwrap();
         assert!(out.contains("leader-output"));
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -1723,7 +1771,7 @@ exit 0
             "q",
             &format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", pidfile.display()),
         );
-        let err = run_bounded_with_grace(&script, &[], Duration::from_secs(1)).unwrap_err();
+        let err = query_retry(&script, Duration::from_secs(1)).unwrap_err();
         assert!(err.message.contains("timed out"), "{}", err.message);
         let pid: i32 = fs::read_to_string(&pidfile)
             .unwrap()
@@ -1742,7 +1790,7 @@ exit 0
             "q",
             "#!/bin/sh\nn=0\nwhile [ $n -lt 1100 ]; do printf '%01024d' 0; n=$((n+1)); done\n",
         );
-        let err = run_bounded_with_grace(&script, &[], Duration::from_secs(10)).unwrap_err();
+        let err = query_retry(&script, Duration::from_secs(10)).unwrap_err();
         assert!(err.message.contains("oversized"), "{}", err.message);
     }
 

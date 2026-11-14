@@ -1209,9 +1209,18 @@ mod tests {
 
         // Control: a representable timeout spawns (sentinel appears), the fake
         // QEMU exits cleanly, and the missing outcome is reported after the
-        // process group is confirmed dead.
+        // process group is confirmed dead. Spawning the just-written script can
+        // transiently hit ETXTBSY when a parallel test forks; retry in tests
+        // only (production keeps the bounded single spawn error).
         j.limits.timeout = Duration::from_secs(2);
-        let err2 = run_job(&host, &j).expect_err("no outcome was written");
+        let err2 = loop {
+            match run_job(&host, &j) {
+                Err(e) if e.message.contains("Text file busy") => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                other => break other.expect_err("no outcome was written"),
+            }
+        };
         assert!(sentinel.exists(), "control case must spawn QEMU");
         assert!(err2.message.contains("outcome"), "{}", err2.message);
     }
