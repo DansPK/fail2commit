@@ -17,6 +17,7 @@ use crate::isolation::{
 };
 use crate::sandbox::hardened::protocol::{self, MAX_VM_OUTCOME_BYTES};
 use crate::sandbox::Bubblewrap;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -24,7 +25,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BOOT_GRACE: Duration = Duration::from_secs(45);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -185,10 +187,235 @@ struct HostMappings {
     entries: Vec<(PathBuf, PathBuf)>,
 }
 
+/// How long to keep trying to contain a QEMU process group after the run
+/// ends or its deadline fires. Bounded; expiry means containment Unconfirmed.
+const CLEANUP_GRACE: Duration = Duration::from_secs(5);
+/// Durable quarantine record (R2-01) under the sandbox stage root.
+const CONTAINMENT_FILE: &str = "f2c-vm-containment.json";
+const MAX_CONTAINMENT_BYTES: u64 = 64 * 1024;
+
+/// Durable refusal/recovery record for a micro-VM whose process group could
+/// not be confirmed dead. `pgid` + `bound_ticks` give the exact identity used
+/// to decide "still live" (pid reuse cannot resurrect or fake liveness).
+#[derive(Serialize, Deserialize)]
+struct QuarantineRecord {
+    reason: String,
+    pgid: u32,
+    bound_ticks: u64,
+    control_dir: Option<String>,
+    result_dir: Option<String>,
+    created_unix: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct QuarantineFile {
+    version: u32,
+    records: Vec<QuarantineRecord>,
+}
+
+/// The retained containment owner for one unconfirmed VM: every mapped guard
+/// (share pins, control dir, result dir) plus the unreaped child stays held
+/// here for the process lifetime, so a live QEMU can never observe released
+/// or recycled exchanges (R2-01). Recovery later drops these entries only
+/// after the group's exact identity is proven gone.
+struct Contained {
+    record: QuarantineRecord,
+    _pins: Vec<PinnedShare>,
+    _control: tempfile::TempDir,
+    _result: tempfile::TempDir,
+    _child: Option<Child>,
+}
+
+/// Process-lifetime registry of retained containment owners. A mutex poison
+/// only means a quarantining path panicked; the inner Vec is still valid.
+static CONTAINED: Mutex<Vec<Contained>> = Mutex::new(Vec::new());
+
+fn contained_registry() -> std::sync::MutexGuard<'static, Vec<Contained>> {
+    CONTAINED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Persist the durable quarantine record. Written 0600 with create+rename so
+/// the next process can find exactly which group and directories to check.
+fn persist_quarantine(stage_root: &Path, record: &QuarantineRecord) -> crate::Result<()> {
+    let path = stage_root.join(CONTAINMENT_FILE);
+    let mut file = if path.exists() {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .and_then(|f| {
+                let mut b = Vec::new();
+                let mut limited = f.take(MAX_CONTAINMENT_BYTES + 1);
+                limited.read_to_end(&mut b)?;
+                Ok::<Vec<u8>, std::io::Error>(b)
+            })
+            .and_then(|b| {
+                serde_json::from_slice::<QuarantineFile>(&b).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })
+            })
+            .map_err(|e| {
+                crate::Error::integrity(format!(
+                    "VM containment record is unreadable or corrupt ({e}); resolve the contained process group and remove {}",
+                    path.display()
+                ))
+            })?
+    } else {
+        QuarantineFile {
+            version: 1,
+            records: Vec::new(),
+        }
+    };
+    if file.records.len() >= 8 {
+        file.records.remove(0);
+    }
+    file.records.push(QuarantineRecord {
+        reason: record.reason.clone(),
+        pgid: record.pgid,
+        bound_ticks: record.bound_ticks,
+        control_dir: record.control_dir.clone(),
+        result_dir: record.result_dir.clone(),
+        created_unix: record.created_unix,
+    });
+    let json = serde_json::to_vec_pretty(&file)
+        .map_err(|e| crate::Error::internal(format!("serialize containment record: {e}")))?;
+    let tmp = stage_root.join(format!("{CONTAINMENT_FILE}.tmp"));
+    write_new_file_force(&tmp, &json)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Like `write_new_file` but replaces a stale tmp left by an earlier crash.
+fn write_new_file_force(path: &Path, bytes: &[u8]) -> crate::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| {
+            crate::Error::isolation_unavailable(format!("create VM containment tmp: {e}"))
+        })?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Hand the mapped guards to the retained containment owner and produce the
+/// fail-closed error (R2-01). Persistence failure does not release the guards.
+fn retain_containment(stage_root: &Path, guards: Contained) -> crate::Error {
+    let record = QuarantineRecord {
+        reason: guards.record.reason.clone(),
+        pgid: guards.record.pgid,
+        bound_ticks: guards.record.bound_ticks,
+        control_dir: guards.record.control_dir.clone(),
+        result_dir: guards.record.result_dir.clone(),
+        created_unix: guards.record.created_unix,
+    };
+    let persist = persist_quarantine(stage_root, &record);
+    contained_registry().push(guards);
+    match persist {
+        Ok(()) => crate::Error::isolation_unavailable(format!(
+            "micro-VM containment unconfirmed; mapped state is quarantined in memory and {} for recovery",
+            stage_root.join(CONTAINMENT_FILE).display()
+        )),
+        Err(e) => crate::Error::isolation_unavailable(format!(
+            "micro-VM containment unconfirmed and the durable quarantine record failed to persist ({e}); mapped state stays quarantined in memory"
+        )),
+    }
+}
+
+/// Refuse or recover before touching a new VM (R2-01): while any contained
+/// group from a prior attempt is still live, every new VM run stays refused;
+/// once the exact identities are proven gone, retained guards drop, the
+/// quarantined per-run directories delete, and the durable record clears.
+fn recover_or_refuse(stage_root: &Path) -> crate::Result<()> {
+    let mut retained: Vec<Contained> = Vec::new();
+    {
+        let mut reg = contained_registry();
+        std::mem::swap(&mut *reg, &mut retained);
+    }
+    let mut live_in_process = 0usize;
+    for guard in retained.into_iter() {
+        if prepare::group_members(guard.record.pgid as i32, guard.record.bound_ticks).is_empty() {
+            // Confirmed gone: dropping the guards releases pins and deletes
+            // the per-run control/result directories through their owners.
+            continue;
+        }
+        live_in_process += 1;
+        // Still live: re-retain (never drop while contained).
+        contained_registry().push(guard);
+    }
+    if live_in_process > 0 {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "a previous micro-VM's process group is still contained ({live_in_process}); VM jobs stay refused until containment recovers"
+        )));
+    }
+    // Cross-process recovery from the durable record.
+    let path = stage_root.join(CONTAINMENT_FILE);
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .and_then(|f| {
+            let mut b = Vec::new();
+            let mut limited = f.take(MAX_CONTAINMENT_BYTES + 1);
+            limited.read_to_end(&mut b)?;
+            Ok::<Vec<u8>, std::io::Error>(b)
+        })
+        .map_err(|e| {
+            crate::Error::integrity(format!(
+                "read VM containment record {}: {e}",
+                path.display()
+            ))
+        })?;
+    let file: QuarantineFile = serde_json::from_slice(&bytes).map_err(|e| {
+        crate::Error::integrity(format!(
+            "VM containment record is corrupt ({e}); resolve the contained process group and remove {}",
+            path.display()
+        ))
+    })?;
+    let mut all_dead = true;
+    for record in &file.records {
+        if !prepare::group_members(record.pgid as i32, record.bound_ticks).is_empty() {
+            all_dead = false;
+        }
+    }
+    if !all_dead {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "a previously contained micro-VM process group is still live; VM jobs stay refused until it exits (see {})",
+            path.display()
+        )));
+    }
+    for record in &file.records {
+        for dir in [record.control_dir.as_deref(), record.result_dir.as_deref()] {
+            let Some(dir) = dir else { continue };
+            let p = Path::new(dir);
+            // Only remove per-run temp directories, never a symlink target.
+            let Ok(md) = fs::symlink_metadata(p) else {
+                continue;
+            };
+            if md.is_dir() && !md.file_type().is_symlink() {
+                let _ = fs::remove_dir_all(p);
+            }
+        }
+    }
+    fs::remove_file(&path)?;
+    Ok(())
+}
+
 fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     let stage_root = crate::paths::TrustedPaths::resolve()?
         .cache_dir
         .join("sandbox-stage");
+    // R2-01: refuse while any previous run's group remains contained; recover
+    // the quarantine once its exact identity is proven gone.
+    recover_or_refuse(&stage_root)?;
     let validated = ValidatedPaths::new(job, &stage_root)?;
     if validated.read_only.len() > host.state.max_inputs {
         return Err(crate::Error::isolation_unavailable(format!(
@@ -315,39 +542,107 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     let mut child = cmd
         .spawn()
         .map_err(|e| crate::Error::isolation_unavailable(format!("start QEMU: {e}")))?;
-    // The guards (pins plus control/result dirs) must outlive every post-spawn
-    // path until the process group is confirmed dead (R2-01); they are handed
-    // to the containment registry if that confirmation fails.
-    let _pins = pins;
+    let pgid = child.id() as i32;
+    // R2-01: hand every mapped guard to the retained containment owner if
+    // group death cannot be confirmed. Never drops guards, never spawns past
+    // a refusal, and persists the exact identity for cross-process recovery.
+    let quarantined = |reason: String,
+                       pins: Vec<PinnedShare>,
+                       control: tempfile::TempDir,
+                       result: tempfile::TempDir,
+                       child: Option<Child>| {
+        let record = QuarantineRecord {
+            reason,
+            pgid: pgid as u32,
+            bound_ticks: prepare::group_bound_ticks_now(),
+            control_dir: Some(control.path().to_string_lossy().into_owned()),
+            result_dir: Some(result.path().to_string_lossy().into_owned()),
+            created_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        retain_containment(
+            &stage_root,
+            Contained {
+                record,
+                _pins: pins,
+                _control: control,
+                _result: result,
+                _child: child,
+            },
+        )
+    };
     // Every post-spawn path confirms the whole process group is dead before
     // the control/result guards and mount pins are released.
     let exit = match wait_child(&mut child, deadline) {
         Ok(status) => status,
         Err(WaitError::TimedOut) => {
-            prepare::stop_process_group(&mut child)?;
-            let outcome_path = result_dir.path().join("outcome.json");
-            return match read_expected_outcome(&outcome_path, &job_id) {
-                Ok(_) => Err(crate::Error::isolation_unavailable(
-                    "the micro-VM wrote an outcome but did not shut down before its deadline",
-                )),
-                Err(_) => Ok(timeout_outcome()),
-            };
+            let cleanup =
+                prepare::contain_group(Some(&mut child), pgid, Instant::now() + CLEANUP_GRACE);
+            match cleanup {
+                prepare::Containment::Confirmed => {
+                    let outcome_path = result_dir.path().join("outcome.json");
+                    return match read_expected_outcome(&outcome_path, &job_id) {
+                        Ok(_) => Err(crate::Error::isolation_unavailable(
+                            "the micro-VM wrote an outcome but did not shut down before its deadline",
+                        )),
+                        Err(_) => Ok(timeout_outcome()),
+                    };
+                }
+                prepare::Containment::Unconfirmed { live } => {
+                    return Err(quarantined(
+                        format!(
+                            "the micro-VM outlived its deadline and its group survived (live pids {live:?})"
+                        ),
+                        pins,
+                        control_dir,
+                        result_dir,
+                        Some(child),
+                    ));
+                }
+            }
         }
         Err(WaitError::Failed(error)) => {
-            prepare::stop_process_group(&mut child)?;
-            return Err(crate::Error::isolation_unavailable(format!(
-                "wait for QEMU: {error}"
-            )));
+            match prepare::contain_group(Some(&mut child), pgid, Instant::now() + CLEANUP_GRACE) {
+                prepare::Containment::Confirmed => {
+                    return Err(crate::Error::isolation_unavailable(format!(
+                        "wait for QEMU: {error}"
+                    )));
+                }
+                prepare::Containment::Unconfirmed { live } => {
+                    return Err(quarantined(
+                        format!(
+                            "the QEMU wait failed ({error}) and the group survived (live pids {live:?})"
+                        ),
+                        pins,
+                        control_dir,
+                        result_dir,
+                        Some(child),
+                    ));
+                }
+            }
         }
     };
+    // The leader was reaped by wait_child; containment now uses exact-pid
+    // kills only, because a group id may be reused after the leader is gone.
+    match prepare::contain_group(None, pgid, Instant::now() + CLEANUP_GRACE) {
+        prepare::Containment::Confirmed => {}
+        prepare::Containment::Unconfirmed { live } => {
+            return Err(quarantined(
+                format!("the exited micro-VM left group members alive (live pids {live:?})"),
+                pins,
+                control_dir,
+                result_dir,
+                None,
+            ));
+        }
+    }
     if !exit.success() {
-        prepare::stop_process_group(&mut child)?;
         return Err(crate::Error::isolation_unavailable(format!(
             "QEMU exited unsuccessfully: {exit}"
         )));
     }
-    // Clean exit: still confirm no descendant survives before releasing state.
-    prepare::stop_process_group(&mut child)?;
     read_expected_outcome(&result_dir.path().join("outcome.json"), &job_id)
 }
 
@@ -1166,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_process_group_confirms_descendant_death() {
+    fn contain_group_confirms_descendant_death() {
         // A group leader that backgrounds a long-lived descendant: the cleanup
         // must kill and confirm the whole group, not just reap the leader.
         let dir = tempfile::tempdir().unwrap();
@@ -1195,14 +1490,27 @@ mod tests {
             0,
             "descendant must be alive"
         );
-        prepare::stop_process_group(&mut child).unwrap();
-        // SAFETY: zero-signal probes of the group and the descendant.
-        assert_eq!(
-            unsafe { libc::kill(-(child.id() as i32), 0) },
-            -1,
-            "group gone"
+        let pgid = child.id() as i32;
+        let containment = prepare::contain_group(
+            Some(&mut child),
+            pgid,
+            Instant::now() + Duration::from_secs(10),
         );
-        assert_eq!(unsafe { libc::kill(desc_pid, 0) }, -1, "descendant gone");
+        assert!(
+            matches!(containment, prepare::Containment::Confirmed),
+            "{containment:?}"
+        );
+        let until = Instant::now() + Duration::from_secs(2);
+        // SAFETY: a zero signal only probes existence of the descendant.
+        while unsafe { libc::kill(desc_pid, 0) } == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: final zero-signal probe of the descendant.
+        assert_eq!(
+            unsafe { libc::kill(desc_pid, 0) },
+            -1,
+            "descendant reaped and gone"
+        );
     }
 
     /// Restores FAIL2COMMIT_HOME even if a sentinel assertion panics.
@@ -1218,12 +1526,49 @@ mod tests {
         }
     }
 
+    /// Serializes tests that relocate FAIL2COMMIT_HOME and drive run_job.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A minimal fake QEMU: records its sentinel marker and exits cleanly.
+    fn plain_fake_qemu(home: &Path, tag: &str) -> (PathBuf, PathBuf) {
+        let sentinel = home.join(format!("sentinel-{tag}"));
+        let qemu = home.join(format!("fake-qemu-{tag}"));
+        fs::write(
+            &qemu,
+            format!(
+                "#!/bin/sh\necho spawned > '{}'\nexit 0\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&qemu, fs::Permissions::from_mode(0o755)).unwrap();
+        (qemu, sentinel)
+    }
+
+    fn run_job_retry_txtbsy(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
+        // The just-written-script fork race can surface ETXTBSY in tests;
+        // production keeps the single bounded spawn failure.
+        let mut attempts = 0;
+        loop {
+            let result = run_job(host, job);
+            let busy = result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.message.contains("Text file busy"));
+            if busy && attempts < 10 {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            return result;
+        }
+    }
+
     #[test]
     fn overflow_timeout_never_spawns_qemu() {
         // LV-03 spawn sentinel: a fake QEMU records a marker when launched. An
         // unrepresentable timeout must refuse before any spawn (marker absent);
         // a representable timeout spawns and then reports the missing outcome.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("FAIL2COMMIT_HOME");
@@ -1237,17 +1582,7 @@ mod tests {
         fs::create_dir_all(&work).unwrap();
         fs::create_dir_all(&input).unwrap();
         fs::write(input.join("tool"), b"#!/bin/sh\n").unwrap();
-        let sentinel = home.path().join("sentinel");
-        let qemu = home.path().join("fake-qemu");
-        fs::write(
-            &qemu,
-            format!(
-                "#!/bin/sh\necho spawned > '{}'\nexit 0\n",
-                sentinel.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&qemu, fs::Permissions::from_mode(0o755)).unwrap();
+        let (qemu, sentinel) = plain_fake_qemu(home.path(), "sentinel");
 
         let mut st = state();
         st.qemu = qemu.to_string_lossy().into_owned();
@@ -1267,20 +1602,128 @@ mod tests {
 
         // Control: a representable timeout spawns (sentinel appears), the fake
         // QEMU exits cleanly, and the missing outcome is reported after the
-        // process group is confirmed dead. Spawning the just-written script can
-        // transiently hit ETXTBSY when a parallel test forks; retry in tests
-        // only (production keeps the bounded single spawn error).
+        // process group is confirmed dead.
         j.limits.timeout = Duration::from_secs(2);
-        let err2 = loop {
-            match run_job(&host, &j) {
-                Err(e) if e.message.contains("Text file busy") => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                other => break other.expect_err("no outcome was written"),
-            }
-        };
+        let err2 = run_job_retry_txtbsy(&host, &j).expect_err("no outcome was written");
         assert!(sentinel.exists(), "control case must spawn QEMU");
         assert!(err2.message.contains("outcome"), "{}", err2.message);
+    }
+
+    #[test]
+    fn unconfirmed_containment_retains_guards_and_recovers() {
+        // R2-01 production resource-guard path. A fake QEMU leaves a group
+        // member that containment provably cannot confirm dead: the member
+        // (Z) stays in QEMU's process group; its parent (H) moves itself out
+        // of that group and never reaps. SIGKILL to Z therefore leaves an
+        // unreaped zombie member forever, so contain_group expires
+        // Unconfirmed and run_job must retain every mapped guard, persist a
+        // durable quarantine, refuse later VM runs while the identity is
+        // live, and recover only after it is gone.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("FAIL2COMMIT_HOME");
+        std::env::set_var("FAIL2COMMIT_HOME", home.path());
+        let _restore = HomeEnvGuard { prev };
+
+        let stage_root = home.path().join("cache").join("sandbox-stage");
+        let stage = stage_root.join("job-contain");
+        let work = stage.join("work");
+        let input = stage.join("input-0");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("tool"), b"#!/bin/sh\n").unwrap();
+        let zfile = home.path().join("z.pid");
+        let moved = home.path().join("h.moved");
+        let hfile = home.path().join("h.pid");
+        let qemu = home.path().join("fake-qemu-contain");
+        fs::write(
+            &qemu,
+            format!(
+                "#!/bin/sh\necho spawned > '@SENTINEL@'\nperl -e 'my $z=fork; exit 1 unless defined $z; if($z==0){{ sleep 60; exit }} open(F,\">\",\"{zfile}\") or exit 1; print F \"$z\\n\"; close F; syscall(109,0,0); open(G,\">\",\"{moved}\") or exit 1; close G; sleep 600;' &\nhp=$!\necho $hp > '{hfile}'\ni=0; while [ ! -s '{moved}' ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.05; done\nexit 0\n",
+                zfile = zfile.display(),
+                moved = moved.display(),
+                hfile = hfile.display(),
+            )
+            .replace("@SENTINEL@", &home.join("sentinel-contain").display().to_string()),
+        )
+        .unwrap();
+        fs::set_permissions(&qemu, fs::Permissions::from_mode(0o755)).unwrap();
+        let sentinel = home.join("sentinel-contain");
+
+        let mut st = state();
+        st.qemu = qemu.to_string_lossy().into_owned();
+        st.system_shares = vec![];
+        let host = ReadyHost { state: st };
+        let mut j = job();
+        j.program = input.join("tool");
+        j.cwd = work.clone();
+        j.work_dir = work.clone();
+        j.read_only = vec![input.clone()];
+        j.limits.timeout = Duration::from_secs(2);
+
+        let err = run_job_retry_txtbsy(&host, &j)
+            .err()
+            .expect("unkillable group member must fail containment");
+        assert!(
+            err.message.contains("containment unconfirmed"),
+            "{}",
+            err.message
+        );
+        assert!(sentinel.exists());
+
+        // Durable refusal/recovery state exists and the retained guards are
+        // still on disk: containment failure must not delete mapped exchanges.
+        let qpath = stage_root.join(CONTAINMENT_FILE);
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&qpath).unwrap()).unwrap();
+        let records = doc["records"].as_array().unwrap();
+        let rec = records.last().unwrap().clone();
+        let control = rec["control_dir"].as_str().unwrap().to_owned();
+        let result = rec["result_dir"].as_str().unwrap().to_owned();
+        assert!(Path::new(&control).is_dir(), "control guard released");
+        assert!(Path::new(&result).is_dir(), "result guard released");
+
+        // While the contained identity is live, later runs refuse before any
+        // spawn (production guard at the run_job entry, R2-01).
+        let (qemu2, sentinel2) = plain_fake_qemu(home.path(), "refused");
+        let mut st2 = state();
+        st2.qemu = qemu2.to_string_lossy().into_owned();
+        st2.system_shares = vec![];
+        let host2 = ReadyHost { state: st2 };
+        let err2 = run_job(&host2, &j).expect_err("contained VM must refuse new runs");
+        assert!(err2.message.contains("contained"), "{}", err2.message);
+        assert!(!sentinel2.exists(), "refusal must not spawn QEMU");
+
+        // Recovery: end H, so the kernel reparents and reaps Z's zombie; the
+        // exact group identity disappears and the next run recovers the
+        // quarantine (drops retained guards, deletes dirs, clears the file).
+        let hpid: i32 = fs::read_to_string(&hfile).unwrap().trim().parse().unwrap();
+        // SAFETY: hpid is the H process this test created and tracks.
+        unsafe { libc::kill(hpid, libc::SIGKILL) };
+        let pgid = rec["pgid"].as_u64().unwrap() as i32;
+        let bound = rec["bound_ticks"].as_u64().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !prepare::group_members(pgid, bound).is_empty() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            prepare::group_members(pgid, bound).is_empty(),
+            "contained identity never recovered"
+        );
+
+        let (qemu3, sentinel3) = plain_fake_qemu(home.path(), "recovered");
+        let mut st3 = state();
+        st3.qemu = qemu3.to_string_lossy().into_owned();
+        st3.system_shares = vec![];
+        let host3 = ReadyHost { state: st3 };
+        let err3 = run_job_retry_txtbsy(&host3, &j).expect_err("recovered run proceeds");
+        assert!(err3.message.contains("outcome"), "{}", err3.message);
+        assert!(sentinel3.exists(), "recovered run must spawn");
+        assert!(!qpath.exists(), "quarantine record must clear");
+        assert!(
+            !Path::new(&control).is_dir() && !Path::new(&result).is_dir(),
+            "recovery must release contained directories"
+        );
     }
 
     #[test]

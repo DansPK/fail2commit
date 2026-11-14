@@ -549,50 +549,158 @@ fn verify_qemu_support(qemu: &Path) -> crate::Result<String> {
     Ok(version)
 }
 
-/// Kill the child's whole process group and confirm the group is gone before
-/// the caller releases mapped state (LV-03). Idempotent: safe after the leader
-/// already exited and was reaped. Bounded by CONTROL_GRACE; kill/wait failures
-/// are surfaced, not ignored. The child must have been spawned as a group
-/// leader (`process_group(0)`) so the group kill reaches every descendant.
-pub(super) fn stop_process_group(child: &mut Child) -> crate::Result<()> {
-    let pid = child.id() as i32;
-    // SAFETY: kill targets this child's own process group with a constant signal.
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    // Reap the leader if it has not been reaped yet (bounded).
-    let deadline = Instant::now().checked_add(CONTROL_GRACE);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            // ECHILD: already reaped; the group probe below decides.
-            Err(_) => break,
-            Ok(None) => {
-                if deadline.is_none_or(|d| Instant::now() >= d) {
-                    child.wait().map_err(|e| {
-                        Error::isolation_unavailable(format!("wait for process group leader: {e}"))
-                    })?;
-                    break;
-                }
-                std::thread::sleep(POLL_INTERVAL);
+/// Outcome of trying to contain an owned process group by the deadline.
+#[derive(Debug)]
+pub(super) enum Containment {
+    /// Every member of the group that was alive at containment start is
+    /// gone; mapped state may be released.
+    Confirmed,
+    /// Members persisted at the deadline; mapped state must NOT be released
+    /// (the caller retains the guards and quarantines for recovery, R2-01).
+    Unconfirmed { live: Vec<i32> },
+}
+
+/// Parse `(pgrp, starttime_ticks, state)` from a /proc/<pid>/stat line. The
+/// comm field can contain spaces and parentheses, so fields after it start
+/// past the last `)`. Field 22 of the whole record is starttime.
+fn parse_stat_pgrp_start(line: &str) -> Option<(i32, u64, u8)> {
+    let close = line.rfind(')')?;
+    let mut it = line[close + 1..].split_whitespace();
+    let state = *it.next()?.as_bytes().first()?;
+    let _ppid: i32 = it.next()?.parse().ok()?;
+    let pgrp: i32 = it.next()?.parse().ok()?;
+    let _sid: i32 = it.next()?.parse().ok()?;
+    // Fields 7 through 21 precede starttime.
+    for _ in 7..=21 {
+        it.next()?;
+    }
+    let start: u64 = it.next()?.parse().ok()?;
+    Some((pgrp, start, state))
+}
+
+/// Boot time in whole seconds (from /proc/stat btime).
+fn boot_time_secs() -> Option<u64> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    for line in stat.lines() {
+        if let Some(rest) = line.strip_prefix("btime ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Approximate starttime-tick ceiling for "processes that could belong to a
+/// group we are containing now". Kernel ticks run at 100 Hz but btime is
+/// whole seconds, so add a 200-tick slack: a genuinely straggling member is
+/// always included, and only a group whose leader pid was reused *within*
+/// roughly two seconds of now is (fail-closed) treated as still live.
+pub(super) fn group_bound_ticks_now() -> u64 {
+    let slack = 200u64;
+    match (
+        boot_time_secs(),
+        SystemTime::now().duration_since(UNIX_EPOCH),
+    ) {
+        (Some(btime), Ok(now)) => now
+            .as_secs()
+            .saturating_sub(btime)
+            .saturating_mul(100)
+            .saturating_add(slack),
+        _ => u64::MAX,
+    }
+}
+
+/// Pids whose process group is `pgid` and whose recorded start is within the
+/// containment bound (so reused pids of an unrelated same-numbered group are
+/// not counted as ours). Bounded number of /proc scans, zombies included
+/// (they still hold their group slot until reaped).
+pub(super) fn group_members(pgid: i32, bound_ticks: u64) -> Vec<i32> {
+    let mut live = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return live;
+    };
+    for entry in entries.flatten().take(65_536) {
+        let Ok(pid): Result<i32, _> = entry.file_name().to_string_lossy().parse() else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some((pgrp, start, _state)) = parse_stat_pgrp_start(&stat) {
+            if pgrp == pgid && start <= bound_ticks {
+                live.push(pid);
             }
         }
     }
-    // Confirm the whole group is gone. A killed descendant can linger as a
-    // zombie until it is reaped, so retry the probe within the grace instead
-    // of failing on the first look.
-    let probe_deadline = Instant::now().checked_add(CONTROL_GRACE);
-    loop {
-        // SAFETY: a zero signal probes existence of the process group only.
-        let gone = unsafe { libc::kill(-pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
-            return Ok(());
+    live
+}
+
+/// Bounded, exact-identity containment of an owned process group (R2-01).
+/// There is no blocking wait anywhere: the leader is reaped with polled
+/// `try_wait`, and surviving members are enumerated from /proc with a
+/// starttime bound (so a recycled group id cannot be signalled or counted)
+/// and killed by exact pid, re-probed until the deadline. `child` is `None`
+/// when the caller already reaped the leader; then a group kill by pgid is
+/// never attempted because the id may be reused.
+pub(super) fn contain_group(
+    mut child: Option<&mut Child>,
+    pgid: i32,
+    deadline: Instant,
+) -> Containment {
+    let bound_ticks = group_bound_ticks_now();
+    if let Some(child) = child.as_deref_mut() {
+        // The leader is unreaped, so its pid (the group id) cannot be reused:
+        // one exact group kill reaches every current member.
+        // SAFETY: kill targets this child's own process group with a signal.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                // ECHILD: already reaped; proceed to the member scan.
+                Err(_) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return Containment::Unconfirmed { live: vec![pgid] };
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
         }
-        if probe_deadline.is_none_or(|d| Instant::now() >= d) {
-            return Err(Error::isolation_unavailable(
-                "the process group did not stop cleanly",
-            ));
+    }
+    // Survivors: killed individually by exact pid (never by -pgid after the
+    // leader was reaped). Their parent reaps them after death; a parent that
+    // never reaps leaves a zombie in the group, which correctly counts as
+    // not-contained until the deadline.
+    let mut killed = std::collections::BTreeSet::new();
+    loop {
+        let members = group_members(pgid, bound_ticks);
+        for pid in members.iter().copied() {
+            if killed.insert(pid) {
+                // SAFETY: pid came from this just-read /proc scan and is
+                // signalled with a constant kill signal; the narrow
+                // scan-to-signal pid-reuse window errs fail-closed because a
+                // wrongly spared member keeps containment Unconfirmed.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        if members.is_empty() {
+            return Containment::Confirmed;
+        }
+        if Instant::now() >= deadline {
+            return Containment::Unconfirmed { live: members };
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Convenience used by the query path: contain the still-unreaped child and
+/// surface any uncertainty as an error.
+pub(super) fn stop_group_result(child: &mut Child) -> crate::Result<()> {
+    let pgid = child.id() as i32;
+    match contain_group(Some(child), pgid, Instant::now() + CONTROL_GRACE) {
+        Containment::Confirmed => Ok(()),
+        Containment::Unconfirmed { live } => Err(Error::isolation_unavailable(format!(
+            "the process group did not stop cleanly (live pids: {live:?})"
+        ))),
     }
 }
 
@@ -648,14 +756,14 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
             Ok(None) => {
-                let cleanup = stop_process_group(&mut child);
+                let cleanup = stop_group_result(&mut child);
                 return Err(Error::isolation_unavailable(format!(
                     "qemu query timed out{}",
                     cleanup_suffix(cleanup)
                 )));
             }
             Err(e) => {
-                let cleanup = stop_process_group(&mut child);
+                let cleanup = stop_group_result(&mut child);
                 return Err(Error::isolation_unavailable(format!(
                     "wait for qemu query: {e}{}",
                     cleanup_suffix(cleanup)
@@ -666,7 +774,7 @@ fn run_bounded_with_grace(exe: &Path, args: &[&str], grace: Duration) -> crate::
     // The leader exited; descendants may still hold stdout. Stop the whole
     // group so the reader gets EOF, then bound reader completion and surface
     // any cleanup uncertainty.
-    let cleanup = stop_process_group(&mut child);
+    let cleanup = stop_group_result(&mut child);
     let received = rx.recv_timeout(grace);
     cleanup?;
     let (out, total) = received.map_err(|_| {
