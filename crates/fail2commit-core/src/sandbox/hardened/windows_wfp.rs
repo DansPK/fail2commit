@@ -482,6 +482,23 @@ struct ExemptionJournal {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExemptionJournalAction {
+    RemoveOwned,
+    ClearUnowned,
+    PreserveAmbiguous,
+}
+
+#[cfg(windows)]
+fn exemption_journal_action(owned: bool, sid_present: bool) -> ExemptionJournalAction {
+    match (owned, sid_present) {
+        (true, _) => ExemptionJournalAction::RemoveOwned,
+        (false, false) => ExemptionJournalAction::ClearUnowned,
+        (false, true) => ExemptionJournalAction::PreserveAmbiguous,
+    }
+}
+
+#[cfg(windows)]
 fn exemption_journal_path() -> crate::Result<std::path::PathBuf> {
     Ok(super::machine_state_path()?
         .parent()
@@ -634,15 +651,19 @@ pub(crate) fn sweep_loopback_exemption() -> crate::Result<()> {
             "loopback exemption journal identity is invalid",
         ));
     }
-    if record.owned {
-        crate::sandbox::windows::ffi::remove_loopback_exemption(&record.package_sid)?;
-    } else if crate::sandbox::windows::ffi::loopback_exempt_sids()?
+    let sid_present = crate::sandbox::windows::ffi::loopback_exempt_sids()?
         .iter()
-        .any(|sid| sid.eq_ignore_ascii_case(&record.package_sid))
-    {
-        return Err(crate::Error::isolation_unavailable(
-            "pending loopback exemption ownership is ambiguous; service remains locked",
-        ));
+        .any(|sid| sid.eq_ignore_ascii_case(&record.package_sid));
+    match exemption_journal_action(record.owned, sid_present) {
+        ExemptionJournalAction::RemoveOwned => {
+            crate::sandbox::windows::ffi::remove_loopback_exemption(&record.package_sid)?;
+        }
+        ExemptionJournalAction::ClearUnowned => {}
+        ExemptionJournalAction::PreserveAmbiguous => {
+            return Err(crate::Error::isolation_unavailable(
+                "pending loopback exemption ownership is ambiguous; service remains locked",
+            ));
+        }
     }
     std::fs::remove_file(&path).map_err(|error| {
         crate::Error::isolation_unavailable(format!(
@@ -710,6 +731,27 @@ fn policy_covers_both_ip_families_for_connect_listen_and_accept() {
     assert_ne!(proxy_loopback_address_host_order(), 0x0100_007f);
     assert_eq!(proxy_loopback_port_host_order(0x1234), 0x1234);
     assert_ne!(proxy_loopback_port_host_order(0x1234), 0x3412);
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn exemption_recovery_never_deletes_an_unowned_sid() {
+    assert_eq!(
+        exemption_journal_action(false, false),
+        ExemptionJournalAction::ClearUnowned
+    );
+    assert_eq!(
+        exemption_journal_action(false, true),
+        ExemptionJournalAction::PreserveAmbiguous
+    );
+    assert_eq!(
+        exemption_journal_action(true, true),
+        ExemptionJournalAction::RemoveOwned
+    );
+    assert_eq!(
+        exemption_journal_action(true, false),
+        ExemptionJournalAction::RemoveOwned
+    );
 }
 
 /// Run only in the disposable elevated Windows guest: this exercises the real
