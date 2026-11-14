@@ -74,9 +74,10 @@ const GUEST_BIN_DIR: &str = "/mnt/fail2commit-vm/bin";
 const GUEST_ROOT: &str = "/mnt/fail2commit-vm";
 const CONTROL_GRACE: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
-/// Minimum bounded window in which a just-SIGKILLed group leader is reaped
-/// even when the caller's deadline has already expired (R3-04). Prevents
-/// retaining an unreaped-but-dead leader that recovery could never clear.
+/// Minimum cleanup window reserved BEFORE the absolute query deadline so a
+/// just-SIGKILLed group leader is reaped inside the bound (R3-04, R4-02).
+/// It never extends the deadline: at the hard deadline containment returns
+/// unconfirmed and the caller retains, instead of granting fresh grace.
 const REAP_FLOOR: Duration = Duration::from_millis(250);
 const MAX_QUERY_OUTPUT: usize = 1024 * 1024;
 const MAX_ETC_BYTES: u64 = 64 * 1024 * 1024;
@@ -133,6 +134,10 @@ fn require_root(command: &str) -> crate::Result<()> {
 }
 
 fn prepare_inner(state_path: &Path, lib_dir: &Path) -> crate::Result<String> {
+    // R4-01: consult the in-process and durable query quarantine before any
+    // new capability query; a live or unproven identity refuses preparation
+    // even when the state file or lib dir is missing (partial install).
+    recover_or_refuse(lib_dir)?;
     let release = kernel_release()?;
     let kernel = PathBuf::from(format!("/boot/vmlinuz-{release}"));
     let kernel = trusted_root_file(&kernel, "kernel")?;
@@ -149,7 +154,7 @@ fn prepare_inner(state_path: &Path, lib_dir: &Path) -> crate::Result<String> {
     // Create the library dir first so an unconfirmed capability query can
     // persist its containment record durably (R3-04).
     fs::create_dir_all(lib_dir)?;
-    let qemu_version = verify_qemu_support(&qemu)?;
+    let qemu_version = verify_qemu_support(&qemu, lib_dir)?;
     let qemu_sha256 = hash_file(&qemu)?;
 
     // System shares: real directories are shared; merged-/usr symlinks are
@@ -358,6 +363,9 @@ fn status_inner(state_path: &Path) -> crate::Result<String> {
 }
 
 fn remove_inner(state_path: &Path, lib_dir: &Path) -> crate::Result<String> {
+    // R4-01: never delete the durable query identity while it is live or
+    // unproven; recovery must clear it before any removal proceeds.
+    recover_or_refuse(lib_dir)?;
     // Only delete the exact root-owned artifacts this feature created; never
     // follow a symlink planted in their place.
     if let Ok(md) = fs::symlink_metadata(lib_dir) {
@@ -530,21 +538,21 @@ fn first_trusted(paths: &[&str], what: &str) -> crate::Result<PathBuf> {
 
 /// Verify QEMU offers the microvm machine and the explicit MMIO devices
 /// (CR-025) without starting a VM. Bounded output and deadline.
-fn verify_qemu_support(qemu: &Path) -> crate::Result<String> {
-    let version = run_bounded(qemu, &["--version"], Some(Path::new(LIB_DIR)))?;
+fn verify_qemu_support(qemu: &Path, quarantine: &Path) -> crate::Result<String> {
+    let version = run_bounded(qemu, &["--version"], Some(quarantine))?;
     let version = version
         .lines()
         .next()
         .unwrap_or("unknown")
         .trim()
         .to_owned();
-    let machines = run_bounded(qemu, &["-M", "help"], Some(Path::new(LIB_DIR)))?;
+    let machines = run_bounded(qemu, &["-M", "help"], Some(quarantine))?;
     if !machines.split_whitespace().any(|w| w == "microvm") {
         return Err(Error::isolation_unavailable(
             "qemu-system-x86_64 does not support the microvm machine",
         ));
     }
-    let devices = run_bounded(qemu, &["-device", "help"], Some(Path::new(LIB_DIR)))?;
+    let devices = run_bounded(qemu, &["-device", "help"], Some(quarantine))?;
     for device in ["virtio-9p-device", "virtio-net-device"] {
         if !devices
             .lines()
@@ -727,22 +735,27 @@ pub(super) fn contain_group(
         // the deadline proves it unkillable (then the caller retains it).
         // SAFETY: kill targets this child's own process group with a signal.
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        // R3-04: a SIGKILLed leader is normally reaped in microseconds;
-        // allow a small bounded floor past a nearly-expired deadline so a
-        // dead leader is never left as an unreaped (and therefore
-        // permanently "live") zombie in the caller's retained guard.
-        let reap_deadline = deadline.max(Instant::now() + REAP_FLOOR);
+        // R4-02: the caller's absolute deadline is the hard bound; the reap
+        // window is reserved before it (run_bounded_with_grace), never added
+        // past it. A leader still unreaped at the deadline stays retained.
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 // ECHILD: already reaped; proceed to the member scan.
                 Err(_) => break,
                 Ok(None) => {
-                    if Instant::now() >= reap_deadline {
-                        return Containment::Unconfirmed {
-                            live: vec![pgid],
-                            uncertain: false,
-                        };
+                    if Instant::now() >= deadline {
+                        // One last non-blocking reap at the hard deadline so
+                        // a leader that died in the final slice is not
+                        // retained as an unreaped zombie (R3-04); no sleep,
+                        // no fresh grace.
+                        if matches!(child.try_wait(), Ok(None)) {
+                            return Containment::Unconfirmed {
+                                live: vec![pgid],
+                                uncertain: false,
+                            };
+                        }
+                        break;
                     }
                     std::thread::sleep(POLL_INTERVAL);
                 }
@@ -871,10 +884,12 @@ fn query_containment_retained(
 /// deadline bounds the leader wait, the output drain, and group cleanup:
 /// stdout is set nonblocking and drained by the owning loop itself in bounded
 /// chunks with a deadline check every iteration, so no detached reader can
-/// be left blocked on a descendant-held pipe. The last quarter of the budget
-/// (minimum 50 ms) is reserved so cleanup still completes inside the
-/// advertised bound even when the leader exits near the deadline. Cleanup
-/// uncertainty is surfaced, and every path is bounded by that one deadline.
+/// be left blocked on a descendant-held pipe. At least the reap floor (capped
+/// at the whole budget) is reserved BEFORE the deadline so cleanup — leader
+/// reap, /proc scans and the final drain — completes inside the advertised
+/// bound even when the leader exits near the deadline; nothing extends the
+/// deadline (R4-02). Cleanup uncertainty is surfaced, and every path is
+/// bounded by that one deadline.
 fn run_bounded_with_grace(
     exe: &Path,
     args: &[&str],
@@ -884,7 +899,10 @@ fn run_bounded_with_grace(
     let deadline = Instant::now()
         .checked_add(grace)
         .ok_or_else(|| Error::isolation_unavailable("qemu query deadline cannot be represented"))?;
-    let reserve = (grace / 4).max(Duration::from_millis(50));
+    // R4-02: reserve the reap window before the absolute deadline, capped at
+    // the whole budget so tiny graces stay representable (containment then
+    // starts immediately with the full budget as its hard bound).
+    let reserve = (grace / 4).max(REAP_FLOOR).min(grace);
     let leader_deadline = deadline.checked_sub(reserve).ok_or_else(|| {
         Error::isolation_unavailable("qemu query cleanup reserve cannot be represented")
     })?;
@@ -2480,7 +2498,7 @@ exit 0
         let elapsed = start.elapsed();
         assert!(out.contains("near-deadline"), "{out}");
         assert!(
-            elapsed < Duration::from_millis(1500),
+            elapsed < Duration::from_secs(1) + REAP_FLOOR,
             "whole query exceeded its bound: {elapsed:?}",
         );
     }
@@ -2513,8 +2531,10 @@ exit 0
         let err = query_retry(&script, Duration::from_millis(400), Some(dir.path())).unwrap_err();
         let elapsed = start.elapsed();
         assert!(err.message.contains("unconfirmed"), "{}", err.message);
+        // R4-02: the hard bound is the 400 ms budget itself; only the
+        // post-deadline durable persist may add overhead (margin: reap floor).
         assert!(
-            elapsed < Duration::from_millis(1200),
+            elapsed < Duration::from_millis(400) + REAP_FLOOR,
             "retained query blew its bound: {elapsed:?}"
         );
         let text = fs::read_to_string(dir.path().join(CONTAINMENT_FILE)).unwrap();
@@ -2540,6 +2560,134 @@ exit 0
         }
         assert!(contained_registry().is_empty());
         assert!(!dir.path().join(CONTAINMENT_FILE).exists());
+    }
+
+    #[test]
+    fn contain_group_expired_deadline_grants_no_fresh_grace() {
+        // R4-02: containment starting at/after the absolute deadline must
+        // return unconfirmed immediately instead of extending the bound by
+        // the reap floor; the still-unreaped leader stays retained.
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        let start = Instant::now();
+        let containment = contain_group(Some(&mut child), pgid, Instant::now());
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(containment, Containment::Unconfirmed { .. }),
+            "{containment:?}"
+        );
+        assert!(
+            elapsed < REAP_FLOOR,
+            "expired deadline granted fresh grace: {elapsed:?}"
+        );
+        // Reap the killed leader so the fixture leaves no zombie behind.
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn prepare_and_remove_entries_gate_on_query_quarantine() {
+        // R4-01: the production entry helpers consult the in-process and
+        // durable query quarantine BEFORE spawning queries or deleting the
+        // library dir — including the fresh-process case (durable record,
+        // empty registry) with no state file (partial install).
+        let _g = super::VM_TEST_LOCK.lock().unwrap();
+        assert!(contained_registry().is_empty(), "clean registry needed");
+        let dir = tempfile::tempdir().unwrap();
+        let lib_dir = dir.path().join("lib");
+        let state_path = dir.path().join("fail2commit-vm.json");
+        fs::create_dir_all(&lib_dir).unwrap();
+
+        // A live group whose leader exits (reaped here) while a background
+        // member survives in the group — an unconfirmed query's survivor.
+        let pidfile = dir.path().join("member.pid");
+        let leader = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("sleep 60 & echo $! > '{}'", pidfile.display()))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id() as i32;
+        assert!(leader.wait_with_output().unwrap().status.success());
+        let member: i32 = fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let bound = group_bound_ticks_now();
+
+        // In-process live guard: both entries refuse and keep everything.
+        let err = retain_containment(
+            Some(&lib_dir),
+            Contained {
+                record: QuarantineRecord {
+                    reason: "qemu query containment unconfirmed (entry fixture)".into(),
+                    pgid: pgid as u32,
+                    bound_ticks: bound,
+                    control_dir: None,
+                    result_dir: None,
+                    created_unix: 1,
+                },
+                _pins: Vec::new(),
+                _control: None,
+                _result: None,
+                _child: None,
+            },
+        );
+        assert!(err.message.contains("unconfirmed"), "{}", err.message);
+        assert_eq!(contained_registry().len(), 1);
+        let err = prepare_inner(&state_path, &lib_dir)
+            .expect_err("live in-process query must refuse prepare");
+        assert!(err.message.contains("still contained"), "{}", err.message);
+        assert!(!state_path.exists(), "refused prepare must not write state");
+        assert!(
+            !lib_dir.join(INITRAMFS_NAME).exists(),
+            "refused prepare must not build an image"
+        );
+        let err = remove_inner(&state_path, &lib_dir)
+            .expect_err("live in-process query must refuse remove");
+        assert!(err.message.contains("still contained"), "{}", err.message);
+        assert!(
+            lib_dir.join(CONTAINMENT_FILE).exists(),
+            "refusal must keep the durable identity"
+        );
+        assert_eq!(contained_registry().len(), 1, "guard must stay retained");
+
+        // Fresh process (restart): the durable record alone, with an empty
+        // registry, must refuse both entries the same way.
+        contained_registry().clear();
+        let err = prepare_inner(&state_path, &lib_dir)
+            .expect_err("live durable query must refuse prepare");
+        assert!(err.message.contains("still live"), "{}", err.message);
+        let err =
+            remove_inner(&state_path, &lib_dir).expect_err("live durable query must refuse remove");
+        assert!(err.message.contains("still live"), "{}", err.message);
+        assert!(
+            lib_dir.join(CONTAINMENT_FILE).exists(),
+            "removal must not erase the live identity"
+        );
+
+        // Proven-dead recovery through the entry itself: kill the survivor,
+        // then remove clears the durable record before the ownership check
+        // refuses the deletion itself (this unit test runs non-root).
+        // SAFETY: member is the background process this fixture created.
+        unsafe { libc::kill(member, libc::SIGKILL) };
+        let until = Instant::now() + Duration::from_secs(8);
+        while !group_proven_gone(pgid, bound) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let err = remove_inner(&state_path, &lib_dir)
+            .expect_err("non-root unit test cannot pass the ownership check");
+        assert!(err.message.contains("root-owned"), "{}", err.message);
+        assert!(
+            !lib_dir.join(CONTAINMENT_FILE).exists(),
+            "entry recovery must clear the proven-dead record"
+        );
+        assert!(contained_registry().is_empty());
     }
 
     #[test]
@@ -2662,6 +2810,9 @@ exit 0
 
     #[test]
     fn state_protection_and_idempotent_remove() {
+        // R4-01: remove now consults the global containment registry, so this
+        // test must not interleave with tests that retain live guards.
+        let _g = super::VM_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("fail2commit-vm.json");
         let lib_dir = dir.path().join("lib");
