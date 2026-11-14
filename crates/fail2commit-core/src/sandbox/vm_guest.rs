@@ -96,9 +96,13 @@ mod windows_dispatch_tests {
 
     #[test]
     fn direct_guest_dispatch_refuses_before_reading_control_or_running_inner_backend() {
-        let error = launch(Path::new(r"C:\f2c\control\0123456789abcdef0123456789abcdef\job.json"))
-            .expect_err("Windows VM guest dispatch must remain disabled without trusted context proof");
-        assert!(error.message.contains("trusted Windows Sandbox context verification"));
+        let error = launch(Path::new(
+            r"C:\f2c\control\0123456789abcdef0123456789abcdef\job.json",
+        ))
+        .expect_err("Windows VM guest dispatch must remain disabled without trusted context proof");
+        assert!(error
+            .message
+            .contains("trusted Windows Sandbox context verification"));
     }
 }
 
