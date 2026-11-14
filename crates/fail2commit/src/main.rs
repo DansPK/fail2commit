@@ -78,6 +78,9 @@ enum Command {
     Sandbox(cmd::sandbox::Args),
     /// Install, inspect or remove hardened system sandbox mode (FR-027).
     Hardened(cmd::hardened::Args),
+    /// Prepare, inspect or remove the Linux QEMU/KVM VM sandbox image (FR-029).
+    #[cfg(target_os = "linux")]
+    Vm(cmd::vm::Args),
     /// npm registry signing keys: `forget <registry-url>` re-trusts a registry (CR-018).
     Signatures(cmd::signatures::Args),
     /// Windows, administrators: guard machine-wide npm and pip (CR-013).
@@ -170,13 +173,16 @@ fn main() -> ExitCode {
             #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
             cmd::sandbox::Action::Launch {
                 jobfile,
+                vm_guest,
                 watchdog,
                 prepare_request,
                 prepare_ack,
                 launch_id,
                 test_diagnostic,
             } => {
-                let result = if *test_diagnostic {
+                let result = if *vm_guest {
+                    cmd::sandbox::launch(jobfile, true, None, None, None, None)
+                } else if *test_diagnostic {
                     cmd::sandbox::launch_test_diagnostic(
                         jobfile,
                         *watchdog,
@@ -187,6 +193,7 @@ fn main() -> ExitCode {
                 } else {
                     cmd::sandbox::launch(
                         jobfile,
+                        false,
                         *watchdog,
                         *prepare_request,
                         *prepare_ack,
@@ -198,6 +205,7 @@ fn main() -> ExitCode {
             #[cfg(not(all(feature = "hardened-test-diagnostics", debug_assertions)))]
             cmd::sandbox::Action::Launch {
                 jobfile,
+                vm_guest,
                 watchdog,
                 prepare_request,
                 prepare_ack,
@@ -206,6 +214,7 @@ fn main() -> ExitCode {
                 return exit(
                     cmd::sandbox::launch(
                         jobfile,
+                        *vm_guest,
                         *watchdog,
                         *prepare_request,
                         *prepare_ack,
@@ -242,6 +251,8 @@ pub fn execute(cli: Cli, id: Option<String>) -> Response {
         Command::Run(a) => cmd::run::run(&ctx, a),
         Command::Sandbox(a) => cmd::sandbox::run(&ctx, a),
         Command::Hardened(a) => cmd::hardened::run(&ctx, a),
+        #[cfg(target_os = "linux")]
+        Command::Vm(a) => cmd::vm::run(&ctx, a),
         Command::Signatures(a) => cmd::signatures::run(&ctx, a),
         Command::MachineShims(a) => cmd::machine::run(&ctx, a),
         Command::Password(a) => cmd::password::run(&ctx, a),

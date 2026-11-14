@@ -139,3 +139,76 @@ Notes:
 - On hosts without bwrap (the unprivileged container, Windows) the Linux sandbox tests print `SKIP (pending evidence)`. A skip is never evidence.
 - The scripts must have LF line endings (`scripts/linux/.gitattributes`).
 - If a WSL call fails with `Wsl/Service/CreateInstance/CreateVm/ERROR_TIMEOUT`, run `wsl -d Ubuntu -- echo ok` once to start the VM, then retry.
+
+## 5. Disposable VM backend (FR-029, SPEC-019)
+
+`sandbox.backend = "vm"` selects a disposable QEMU/KVM micro-VM on Linux hosts
+with KVM. The VM is an outer boundary; the unchanged Bubblewrap backend (§1–3)
+runs inside it, so grants, network policy, bait, limits and the activity report
+are the same code and evidence as default mode. `auto` never selects the VM.
+
+Selection falls back to the platform backend **only** when hardware
+virtualization or the KVM OS feature is proven absent (`/dev/kvm` missing).
+Missing preparation, a permission denial on `/dev/kvm`, a hash mismatch or any
+runtime error stays selected and fails closed (`IsolationUnavailable`).
+
+### 5.1 Lifecycle: `fail2commit vm prepare | status | remove`
+
+- `vm prepare` (root, once) assembles a self-contained initramfs under
+  `/var/lib/fail2commit-vm/` from trusted host binaries (`fail2commit`,
+  `f2c-sandbox-relay`, `bash`, `bwrap`, `setpriv`, `busybox`, and `kmod` when
+  guest modules are needed), their ELF library closure (parsed directly — never
+  `ldd`, which can execute untrusted code), the running distro kernel
+  (`/boot/vmlinuz-$(uname -r)`) and the guest `virtio_mmio`, `virtio_net`, `9p`,
+  `9pnet_virtio` modules. Kernel/initramfs/QEMU SHA-256 hashes are recorded in
+  the root-owned, non-writable `/etc/fail2commit-vm.json`. Re-running is
+  idempotent.
+- `vm status` reports the preparation and verifies the recorded hashes without
+  starting a VM. A kernel update or corruption makes the image stale; the probe
+  then fails closed and names `vm prepare`.
+- `vm remove` (root) deletes only these two artifacts, idempotently, refusing a
+  symlink planted in their place.
+
+Runtime dependencies (optional, not bundled): `qemu-system-x86_64` with the
+`microvm` machine and the `virtio-9p-device`/`virtio-net-device` MMIO devices,
+`busybox`, and `/dev/kvm` access for the invoking user. The host kernel supplies
+the guest kernel; no kernel is bundled.
+
+### 5.2 Launch and guest layout (CR-025, CR-026)
+
+microvm has no PCI bus, so shares and network use explicit virtio-mmio devices
+(`-fsdev local,… -device virtio-9p-device,…`, `-device virtio-net-device`); the
+PCI `-virtfs` shorthand is not used. Preparation verifies QEMU device support
+and the microvm device-count limit (8 transports): system shares plus work,
+control, result and network must fit, leaving the recorded input slots.
+
+The host shares the job's trees over 9p (`security_model=passthrough`) and drops
+the guest launcher to the invoking uid/gid so guest writes match host ownership:
+
+| Guest mount | Host source | Mode |
+|---|---|---|
+| `/usr`, `/lib*`, `/bin`, `/sbin` (real dirs) | same host path | read-only system share |
+| `/mnt/fail2commit-vm/jobs/<id>/work` | the job `work_dir` | read-write (only writable job tree) |
+| `/mnt/fail2commit-vm/jobs/<id>/input-<n>` | each staged read-only input | read-only |
+| `/mnt/fail2commit-vm/control/<id>/job.json` | per-run control dir | read-only request |
+| `/mnt/fail2commit-vm/results/<id>/outcome.json` | per-run result dir | result exchange |
+
+`<id>` is a fresh 32-hex identity passed on the kernel command line
+(`f2c_job_id=`). The job/request/result namespace lives **outside** the inner
+Bubblewrap control mount `/f2c`, so the package's sandbox is granted neither the
+request nor the result tree. Guest init mounts the shares, runs
+`fail2commit sandbox launch … --vm-guest`, then `poweroff -f`; `-no-reboot` makes
+QEMU exit. The guest launcher binds dispatch to the kernel boot identity and the
+KVM hypervisor, validates resolved mount/file identities (not path spelling),
+and writes an identity-bound outcome envelope around the frozen `JobOutcome`.
+The host exports from the original host `work_dir` only after that valid
+identity-bound outcome **and** a clean QEMU exit; the process group is killed at
+`limits.timeout` plus a boot grace. No root/home/secrets tree is shared.
+
+### 5.3 Verification status
+
+Compile and unit/fixture checks run in the Debian dev VM. Boot verification
+(catalogue under `F2C_SANDBOX_BACKEND=vm`, timeout kill, clean-exit export,
+prepare/remove as root) is gated on root + `/dev/kvm` + a prepared image and is
+**pending evidence** until run on a KVM host; `tests/sandbox_vm_linux.rs` skips
+honestly when those prerequisites are absent.

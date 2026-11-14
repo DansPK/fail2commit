@@ -14,6 +14,12 @@ pub(crate) mod egress;
 pub mod hardened;
 pub mod netpolicy;
 pub mod report;
+mod vm;
+pub(crate) mod vm_guest;
+
+/// `fail2commit vm prepare | status | remove` (FR-029, SPEC-019). Linux owns
+/// the QEMU/KVM image lifecycle; other platforms refuse without creating state.
+pub use vm::{prepare as vm_prepare, remove as vm_remove, status as vm_status};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -44,8 +50,12 @@ pub fn platform_backend() -> Box<dyn SandboxBackend> {
 /// Backend selected by trusted sandbox settings. `auto` uses hardened mode
 /// whenever its machine install marker exists; an unhealthy install is kept
 /// selected so `run_job` fails closed rather than dropping to the platform
-/// default. `vm` remains the SPEC-019 fallback until that feature lands.
+/// default. VM selection is explicit and applies only the specified
+/// hardware/feature-absence fallback.
 pub fn select_backend(settings: &crate::settings::Settings) -> Box<dyn SandboxBackend> {
+    if settings.sandbox.backend == crate::settings::BackendChoice::Vm {
+        return vm::selected();
+    }
     hardened::selected(settings).unwrap_or_else(platform_backend)
 }
 
@@ -57,6 +67,12 @@ pub fn run_job(backend: &dyn SandboxBackend, job: &JobSpec) -> crate::Result<Job
         .state_dir
         .join("sandbox-job");
     crate::fsutil::with_lock(&lock, || run_job_locked(backend, job))
+}
+
+/// Private VM-side launcher. It accepts only the guest mount layout and uses
+/// the unchanged platform backend; exports remain owned by the host run_job.
+pub fn vm_guest_launch(jobfile: &Path) -> crate::Result<()> {
+    vm_guest::launch(jobfile)
 }
 
 fn run_job_locked(backend: &dyn SandboxBackend, job: &JobSpec) -> crate::Result<JobOutcome> {

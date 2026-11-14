@@ -326,6 +326,9 @@ pub(super) struct StagedObject {
     path: PathBuf,
     attributes: u32,
     links: u32,
+    volume_serial: u32,
+    file_index_high: u32,
+    file_index_low: u32,
 }
 
 impl StagedObject {
@@ -368,7 +371,59 @@ impl StagedObject {
             path: path.to_path_buf(),
             attributes: info.dwFileAttributes,
             links: info.nNumberOfLinks,
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index_high: info.nFileIndexHigh,
+            file_index_low: info.nFileIndexLow,
         })
+    }
+
+    /// Open a staged object while denying concurrent host writes, deletes and
+    /// renames; the VM backend holds these pins until Windows Sandbox exits.
+    #[allow(unsafe_code)]
+    pub(super) fn open_vm_pin(path: &Path) -> crate::Result<StagedObject> {
+        let path_w = wide(path.as_os_str());
+        // SAFETY: `path_w` is NUL-terminated; the returned handle is owned below.
+        let h = unsafe {
+            CreateFileW(
+                path_w.as_ptr(),
+                READ_CONTROL | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(crate::Error::isolation_unavailable(format!(
+                "pinning staged path {} failed: {}",
+                path.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        let handle = owned(h);
+        // SAFETY: the output is correctly sized and the handle is live.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(raw(&handle), &mut info) } == 0 {
+            return Err(unavailable("GetFileInformationByHandle(VM pin)"));
+        }
+        Ok(StagedObject {
+            handle,
+            path: path.to_path_buf(),
+            attributes: info.dwFileAttributes,
+            links: info.nNumberOfLinks,
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index_high: info.nFileIndexHigh,
+            file_index_low: info.nFileIndexLow,
+        })
+    }
+
+    pub(super) fn identity(&self) -> (u32, u32, u32) {
+        (
+            self.volume_serial,
+            self.file_index_high,
+            self.file_index_low,
+        )
     }
 
     pub(super) fn path(&self) -> &Path {

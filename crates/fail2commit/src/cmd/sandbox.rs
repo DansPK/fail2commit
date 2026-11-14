@@ -26,6 +26,8 @@ pub enum Action {
     #[command(hide = true)]
     Launch {
         jobfile: std::path::PathBuf,
+        #[arg(long, hide = true)]
+        vm_guest: bool,
         #[arg(long)]
         watchdog: Option<u64>,
         #[arg(long)]
@@ -129,11 +131,15 @@ pub fn serve() -> fail2commit_core::Result<()> {
 
 pub fn launch(
     jobfile: &std::path::Path,
+    vm_guest: bool,
     watchdog: Option<u64>,
     prepare_request: Option<u64>,
     prepare_ack: Option<u64>,
     launch_id: Option<&str>,
 ) -> fail2commit_core::Result<()> {
+    if vm_guest {
+        return fail2commit_core::sandbox::vm_guest_launch(jobfile);
+    }
     fail2commit_core::sandbox::hardened::launch_with_control(
         jobfile,
         watchdog,
