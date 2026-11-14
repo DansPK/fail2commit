@@ -4,7 +4,7 @@ pub mod lifecycle;
 pub mod protocol;
 pub mod service;
 #[cfg(any(windows, test))]
-mod windows_proxy;
+pub(super) mod windows_proxy;
 #[cfg(windows)]
 mod windows_wfp;
 

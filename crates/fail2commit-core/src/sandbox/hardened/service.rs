@@ -45,6 +45,7 @@ struct PrepareRequest {
     package_sid: String,
     profile_name: String,
     network: crate::isolation::NetworkMode,
+    proxy_port: Option<u16>,
 }
 
 #[cfg(windows)]
@@ -54,6 +55,7 @@ struct PrepareAck {
     version: u32,
     launch_id: String,
     package_sid: String,
+    proxy_port: Option<u16>,
     ready: bool,
     detail: String,
 }
@@ -88,6 +90,11 @@ pub(super) fn run_windows(
     )?;
     if !status.ok {
         return Err(crate::Error::isolation_unavailable(status.detail));
+    }
+    if job.network == crate::isolation::NetworkMode::Internet && !status.probe_available {
+        return Err(crate::Error::isolation_unavailable(
+            "hardened Internet jobs remain unavailable until the package-scoped WFP route effect probes pass",
+        ));
     }
     let paths = crate::paths::TrustedPaths::resolve()?;
     crate::fsutil::ensure_private_dir(&paths.cache_dir)?;
@@ -1180,12 +1187,18 @@ fn validate_prepare_request(
     launcher_pid: u32,
     launcher_creation_time_100ns: u64,
     sandbox_sid: &str,
+    expected_network: crate::isolation::NetworkMode,
 ) -> crate::Result<()> {
     if request.version != 1
         || request.launch_id != launch_id
         || request.launcher_pid != launcher_pid
         || request.launcher_creation_time_100ns != launcher_creation_time_100ns
-        || request.network != crate::isolation::NetworkMode::None
+        || request.network != expected_network
+        || match (request.network, request.proxy_port) {
+            (crate::isolation::NetworkMode::None, None) => false,
+            (crate::isolation::NetworkMode::Internet, Some(port)) => port == 0,
+            _ => true,
+        }
         || !is_appcontainer_package_sid(&request.package_sid)
         || !request
             .profile_name
@@ -1231,6 +1244,7 @@ fn validate_prepare_ack(
     ack: Option<&PrepareAck>,
     launch_id: &str,
     package_sid: &str,
+    proxy_port: Option<u16>,
 ) -> crate::Result<()> {
     let ack = ack.ok_or_else(|| {
         crate::Error::isolation_unavailable("SYSTEM service did not acknowledge WFP preparation")
@@ -1238,6 +1252,7 @@ fn validate_prepare_ack(
     if ack.version != 1
         || ack.launch_id != launch_id
         || ack.package_sid != package_sid
+        || ack.proxy_port != proxy_port
         || !ack.ready
     {
         return Err(crate::Error::isolation_unavailable(format!(
@@ -1281,6 +1296,7 @@ pub(crate) struct PreparationClient {
 pub(crate) struct PackagePolicyReceipt {
     pub(crate) launch_id: String,
     pub(crate) package_sid: String,
+    pub(crate) proxy_port: Option<u16>,
 }
 
 #[cfg(windows)]
@@ -1313,6 +1329,7 @@ impl PreparationClient {
         package_sid: &str,
         profile_name: &str,
         network: crate::isolation::NetworkMode,
+        proxy_port: Option<u16>,
     ) -> crate::Result<PackagePolicyReceipt> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
@@ -1359,6 +1376,7 @@ impl PreparationClient {
             package_sid: package_sid.to_owned(),
             profile_name: profile_name.to_owned(),
             network,
+            proxy_port,
         };
         let payload = serde_json::to_vec(&request)
             .map_err(|_| crate::Error::internal("cannot encode WFP preparation request"))?;
@@ -1400,10 +1418,11 @@ impl PreparationClient {
                     ));
                 }
                 Some(ack) => {
-                    validate_prepare_ack(Some(&ack), &self.launch_id, package_sid)?;
+                    validate_prepare_ack(Some(&ack), &self.launch_id, package_sid, proxy_port)?;
                     return Ok(PackagePolicyReceipt {
                         launch_id: ack.launch_id,
                         package_sid: ack.package_sid,
+                        proxy_port: ack.proxy_port,
                     });
                 }
             }
@@ -1784,6 +1803,13 @@ fn service_loop_windows() -> crate::Result<()> {
     let sandbox_sid = state.sandbox_sid.clone().ok_or_else(|| {
         crate::Error::integrity("Windows install state has no sandbox account SID")
     })?;
+    if let Err(error) = super::windows_wfp::sweep_loopback_exemption() {
+        LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+        return Err(crate::Error::isolation_unavailable(format!(
+            "loopback exemption recovery failed; service remains locked: {}",
+            error.message
+        )));
+    }
     let state_path = super::machine_state_path()?;
     let jobs = state_path
         .parent()
@@ -2916,6 +2942,7 @@ fn run_snapshot_as_sandbox(
                             pi.dwProcessId,
                             creation_time_100ns,
                             sandbox_sid,
+                            job.network,
                         )
                         .is_err()
                         {
@@ -2925,6 +2952,7 @@ fn run_snapshot_as_sandbox(
                                     version: 1,
                                     launch_id: marker_id.clone(),
                                     package_sid: message.package_sid,
+                                    proxy_port: message.proxy_port,
                                     ready: false,
                                     detail: "launcher identity or job network policy did not match"
                                         .into(),
@@ -2957,6 +2985,7 @@ fn run_snapshot_as_sandbox(
                                         version: 1,
                                         launch_id: marker_id.clone(),
                                         package_sid: message.package_sid,
+                                        proxy_port: message.proxy_port,
                                         ready: false,
                                         detail: bounded_error_detail(&error.message),
                                     },
@@ -2974,7 +3003,10 @@ fn run_snapshot_as_sandbox(
                                 return Err(error);
                             }
                         };
-                        match super::windows_wfp::PackageGuard::install(&message.package_sid) {
+                        match super::windows_wfp::PackageGuard::install(
+                            &message.package_sid,
+                            message.proxy_port,
+                        ) {
                             Ok(guard) => {
                                 write_prepare_ack(
                                     ack_write.as_raw_handle() as HANDLE,
@@ -2982,20 +3014,37 @@ fn run_snapshot_as_sandbox(
                                         version: 1,
                                         launch_id: marker_id.clone(),
                                         package_sid: message.package_sid,
+                                        proxy_port: message.proxy_port,
                                         ready: true,
-                                        detail: "package-scoped deny filters read back".into(),
+                                        detail: "package-scoped deny filters and exact proxy endpoint read back".into(),
                                     },
                                 )?;
                                 network_guard = Some(guard);
                                 package_grants = Some(grants);
                             }
                             Err(error) => {
+                                // PackageGuard::install has already attempted
+                                // rollback. If that failed, the dynamic WFP
+                                // session or loopback exemption may still be
+                                // present, so retain the durable launch marker
+                                // and refuse all future launches until restart
+                                // recovery removes the exact journaled SID.
+                                let rollback_unconfirmed = error
+                                    .message
+                                    .starts_with("WFP rollback failed after setup error:");
+                                if rollback_unconfirmed {
+                                    LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+                                    if let Some(marker) = active_marker.as_mut() {
+                                        marker.retain();
+                                    }
+                                }
                                 let _ = write_prepare_ack(
                                     ack_write.as_raw_handle() as HANDLE,
                                     &PrepareAck {
                                         version: 1,
                                         launch_id: marker_id.clone(),
                                         package_sid: message.package_sid,
+                                        proxy_port: message.proxy_port,
                                         ready: false,
                                         detail: bounded_error_detail(&error.message),
                                     },
@@ -3013,6 +3062,9 @@ fn run_snapshot_as_sandbox(
                                 let mut grants = grants;
                                 if let Err(cleanup) = grants.release() {
                                     LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+                                    if let Some(marker) = active_marker.as_mut() {
+                                        marker.retain();
+                                    }
                                     return Err(crate::Error::isolation_unavailable(format!(
                                         "WFP setup failed and package ACL rollback failed: {}",
                                         cleanup.message
@@ -3338,6 +3390,11 @@ fn launch_windows_request(
     let snapshot_bytes = std::fs::read(&jobfile)?;
     let (job, stage_root, test_diagnostic) =
         super::protocol::decode_hardened_job_for_service(&snapshot_bytes)?;
+    if job.network == crate::isolation::NetworkMode::Internet {
+        return Err(crate::Error::isolation_unavailable(
+            "SYSTEM service has not verified direct-route refusal and proxy-loopback effects; Internet job was not launched",
+        ));
+    }
     let stage_handle = open_windows_object(
         &stage_root,
         true,
@@ -3762,11 +3819,6 @@ pub(super) fn launch_hidden(
             ));
         }
     }
-    if job.network != crate::isolation::NetworkMode::None {
-        return Err(crate::Error::isolation_unavailable(
-            "hardened Internet jobs remain disabled until the shared proxy path is implemented and probed",
-        ));
-    }
     let outcome = crate::sandbox::windows::run_hardened_lpac(&job, &stage_root, &mut preparation)?;
     let encoded = super::protocol::encode_outcome(&outcome)?;
     if encoded.len() > super::protocol::MAX_OUTCOME_BYTES {
@@ -4111,6 +4163,7 @@ mod tests {
             package_sid: derive_package_sid(&profile_name).expect("derive package SID"),
             profile_name,
             network: crate::isolation::NetworkMode::None,
+            proxy_port: None,
         }
     }
 
@@ -4124,6 +4177,7 @@ mod tests {
             412,
             987_654_321,
             "S-1-5-21-1-2-3-1001",
+            crate::isolation::NetworkMode::None,
         )
         .is_ok());
         request.launcher_pid += 1;
@@ -4133,6 +4187,7 @@ mod tests {
             412,
             987_654_321,
             "S-1-5-21-1-2-3-1001",
+            crate::isolation::NetworkMode::None,
         )
         .is_err());
         request = sample_prepare_request();
@@ -4143,6 +4198,7 @@ mod tests {
             412,
             987_654_321,
             "S-1-5-21-1-2-3-1001",
+            crate::isolation::NetworkMode::None,
         )
         .is_err());
         request = sample_prepare_request();
@@ -4153,6 +4209,49 @@ mod tests {
             412,
             987_654_321,
             "S-1-5-21-1-2-3-1001",
+            crate::isolation::NetworkMode::None,
+        )
+        .is_err());
+        request = sample_prepare_request();
+        request.network = crate::isolation::NetworkMode::Internet;
+        request.proxy_port = Some(32123);
+        assert!(validate_prepare_request(
+            &request,
+            &"a".repeat(64),
+            412,
+            987_654_321,
+            "S-1-5-21-1-2-3-1001",
+            crate::isolation::NetworkMode::Internet,
+        )
+        .is_ok());
+        request.proxy_port = None;
+        assert!(validate_prepare_request(
+            &request,
+            &"a".repeat(64),
+            412,
+            987_654_321,
+            "S-1-5-21-1-2-3-1001",
+            crate::isolation::NetworkMode::Internet,
+        )
+        .is_err());
+        request.proxy_port = Some(0);
+        assert!(validate_prepare_request(
+            &request,
+            &"a".repeat(64),
+            412,
+            987_654_321,
+            "S-1-5-21-1-2-3-1001",
+            crate::isolation::NetworkMode::Internet,
+        )
+        .is_err());
+        request.proxy_port = Some(32123);
+        assert!(validate_prepare_request(
+            &request,
+            &"a".repeat(64),
+            412,
+            987_654_321,
+            "S-1-5-21-1-2-3-1001",
+            crate::isolation::NetworkMode::None,
         )
         .is_err());
     }
@@ -4161,20 +4260,24 @@ mod tests {
     #[test]
     fn wfp_preparation_rejects_missing_bad_and_mismatched_acknowledgements() {
         let sid = "S-1-15-2-1-2-3-4-5-6-7-8-9-10-11-12";
-        assert!(validate_prepare_ack(None, &"a".repeat(64), sid).is_err());
+        assert!(validate_prepare_ack(None, &"a".repeat(64), sid, None).is_err());
         let mut ack = PrepareAck {
             version: 1,
             launch_id: "a".repeat(64),
             package_sid: sid.into(),
+            proxy_port: None,
             ready: true,
             detail: "ready".into(),
         };
-        assert!(validate_prepare_ack(Some(&ack), &"a".repeat(64), sid).is_ok());
+        assert!(validate_prepare_ack(Some(&ack), &"a".repeat(64), sid, None).is_ok());
         ack.launch_id = "b".repeat(64);
-        assert!(validate_prepare_ack(Some(&ack), &"a".repeat(64), sid).is_err());
+        assert!(validate_prepare_ack(Some(&ack), &"a".repeat(64), sid, None).is_err());
         ack.launch_id = "a".repeat(64);
+        ack.proxy_port = Some(43210);
+        assert!(validate_prepare_ack(Some(&ack), &"a".repeat(64), sid, None).is_err());
+        ack.proxy_port = None;
         ack.ready = false;
-        assert!(validate_prepare_ack(Some(&ack), &"a".repeat(64), sid).is_err());
+        assert!(validate_prepare_ack(Some(&ack), &"a".repeat(64), sid, None).is_err());
     }
 
     #[cfg(windows)]

@@ -492,11 +492,6 @@ fn run_with_launch_mode(
             "hardened test diagnostic requires the authenticated SYSTEM preparation channel",
         ));
     }
-    if preparation.is_some() && job.network == crate::isolation::NetworkMode::Internet {
-        return Err(crate::Error::isolation_unavailable(
-            "hardened Internet jobs are disabled until the shared proxy transport and WFP proxy exception pass their probes",
-        ));
-    }
     let validation_root = match hardened_stage_root {
         Some(root) => root.canonicalize().map_err(|error| {
             crate::Error::isolation_unavailable(format!(
@@ -535,6 +530,24 @@ fn run_with_launch_mode(
     } else {
         None
     };
+    let proxy = if preparation.is_some() && job.network == crate::isolation::NetworkMode::Internet {
+        let policy_bait = bait.as_ref().map(|bait| Arc::clone(&bait.policy));
+        Some(crate::sandbox::hardened::windows_proxy::start(
+            Arc::new(crate::sandbox::egress::Watch::default()),
+            policy_bait,
+        )?)
+    } else {
+        None
+    };
+    if let Some(proxy) = proxy.as_ref() {
+        let proxy_environment = proxy.environment();
+        env.retain(|(key, _)| {
+            !proxy_environment
+                .iter()
+                .any(|(proxy_key, _)| key.eq_ignore_ascii_case(proxy_key))
+        });
+        env.extend(proxy_environment);
+    }
     // FR-023: `Internet` is exactly the internetClient capability.
     let internet = match (preparation.is_some(), job.network) {
         (true, _) | (false, crate::isolation::NetworkMode::None) => None,
@@ -691,10 +704,14 @@ fn run_with_launch_mode(
             .prepare(
                 &package_sid,
                 profile.profile().name(),
-                crate::isolation::NetworkMode::None,
+                job.network,
+                proxy.as_ref().map(|proxy| proxy.port()),
             )
             .map_err(|error| abort_with(&spawned, error))?;
-        if receipt.package_sid != package_sid || receipt.launch_id != preparation.launch_id() {
+        if receipt.package_sid != package_sid
+            || receipt.launch_id != preparation.launch_id()
+            || receipt.proxy_port != proxy.as_ref().map(|proxy| proxy.port())
+        {
             return Err(abort_with(
                 &spawned,
                 crate::Error::integrity("WFP preparation receipt did not bind this package"),
@@ -764,7 +781,7 @@ fn run_with_launch_mode(
     let (stdout_thread, stdout_rx) = drain(stdout_read, Arc::clone(&budget));
     let (stderr_thread, stderr_rx) = drain(stderr_read, Arc::clone(&budget));
     let deadline = Instant::now() + job.limits.timeout;
-    let status = wait_for_tree(&job_object, deadline, &mut monitor)?;
+    let status = wait_for_tree(&job_object, deadline, &mut monitor, proxy.as_ref())?;
     let status = match status {
         Some(status) => status,
         None => JobStatus::Exited(spawned.exit_code()? as i32),
@@ -776,9 +793,18 @@ fn run_with_launch_mode(
     let _ = stderr_thread.join();
     let truncated = budget.lock().unwrap_or_else(|e| e.into_inner()).truncated;
     let mut report = monitor.finish(&job_object);
+    if let Some(proxy) = proxy.as_ref() {
+        let proxy_report = proxy.report();
+        for event in proxy_report.events {
+            report.push(event.kind, event.detail);
+        }
+        report.truncated |= proxy_report.truncated;
+    }
     if truncated {
         report.push(ActivityKind::Limit, "output");
     }
+    // Stop forwarding job traffic before revoking temporary filesystem grants.
+    drop(proxy);
     // Cleanup is part of the operation: a failed revoke is recorded, logged and
     // returned, so the next probe()/run() refuses while it is outstanding.
     if let Some(grants) = grants.as_mut() {
@@ -944,9 +970,20 @@ fn wait_for_tree(
     job_object: &ffi::Job,
     deadline: Instant,
     monitor: &mut Monitor,
+    proxy: Option<&crate::sandbox::hardened::windows_proxy::Egress>,
 ) -> crate::Result<Option<JobStatus>> {
     let mut decided = None;
     while Instant::now() < deadline {
+        if proxy.is_some_and(|proxy| proxy.tripped()) {
+            job_object.terminate().map_err(|error| {
+                crate::Error::isolation_unavailable(format!(
+                    "the proxy stopped the sandbox job but TerminateJobObject failed: {}",
+                    error.message
+                ))
+            })?;
+            decided = Some(JobStatus::Killed);
+            break;
+        }
         let stop = match job_object.next_event(POLL_MS) {
             Some(event) => match monitor.on_event(&event) {
                 Flow::Empty => break,
@@ -1201,6 +1238,7 @@ impl Monitor {
 /// Bait files placed for one job: absolute path and path relative to home.
 struct PlacedBait {
     files: Vec<(PathBuf, String)>,
+    policy: Arc<BaitSet>,
 }
 
 /// SPEC-014 section 2: the bait home is the job's `USERPROFILE` when it is
@@ -1252,7 +1290,7 @@ fn place_bait(work_dir: &Path, env: &mut Vec<(OsString, OsString)>) -> crate::Re
     if lookup(env, "HOME").is_none() {
         env.push(("HOME".into(), plain_path(&home).into_os_string()));
     }
-    let set = BaitSet::generate()?;
+    let set = Arc::new(BaitSet::generate()?);
     // Never overwrite a file the job brought (or a link planted in its place).
     if let Some(f) = set
         .files
@@ -1271,7 +1309,7 @@ fn place_bait(work_dir: &Path, env: &mut Vec<(OsString, OsString)>) -> crate::Re
         .map(|(path, f)| (path, f.rel.to_string_lossy().into_owned()))
         .collect();
     env.extend(set.env.iter().map(|(k, v)| (k.into(), v.into())));
-    Ok(PlacedBait { files })
+    Ok(PlacedBait { files, policy: set })
 }
 
 /// `internetClient`, the only capability an `Internet` job gets (FR-023).

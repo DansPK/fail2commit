@@ -1,8 +1,7 @@
 //! Per-launch, package-scoped Windows Filtering Platform guard (FR-027).
 //!
-//! The initial guard installs deny filters only. It has no permit API, so
-//! networked jobs remain unavailable until the constrained proxy path has
-//! separately passed its probes.
+//! Per-launch package policy: deny all routes and optionally permit only the
+//! exact TCP loopback proxy endpoint for the owned AppContainer SID.
 
 #![allow(unsafe_code)]
 
@@ -10,18 +9,25 @@
 pub(crate) struct PackageGuard {
     engine: windows_sys::Win32::Foundation::HANDLE,
     package_sid: crate::sandbox::windows::ffi::OwnedSid,
+    package_sid_text: String,
+    exemption_added: bool,
+    journal_path: Option<std::path::PathBuf>,
     installed: usize,
 }
 
 #[cfg(windows)]
 impl PackageGuard {
-    /// Install and read back connect, listen and receive/accept deny filters
-    /// for one AppContainer package SID across IPv4 and IPv6.
-    pub(crate) fn install(package_sid: &str) -> crate::Result<Self> {
+    /// Install deny filters for one package SID and, when `proxy_port` is
+    /// present, a higher-weight permit for TCP to that exact loopback port.
+    pub(crate) fn install(package_sid: &str, proxy_port: Option<u16>) -> crate::Result<Self> {
         use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
         use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
+        if proxy_port == Some(0) {
+            return Err(crate::Error::rejected("proxy port zero is invalid"));
+        }
         let package_sid = crate::sandbox::windows::ffi::sid_from_string(package_sid)?;
+        let package_sid_text = crate::sandbox::windows::ffi::sid_to_string(package_sid.as_psid())?;
         let mut session: wfp::FWPM_SESSION0 = unsafe { std::mem::zeroed() };
         session.flags = wfp::FWPM_SESSION_FLAG_DYNAMIC;
         let mut engine = std::ptr::null_mut();
@@ -40,18 +46,46 @@ impl PackageGuard {
         let mut guard = Self {
             engine,
             package_sid,
+            package_sid_text,
+            exemption_added: false,
+            journal_path: None,
             installed: 0,
         };
-        let layers = required_block_layers();
-        for layer in layers {
-            guard.add_package_block(layer)?;
+        let setup = (|| {
+            if proxy_port.is_some() {
+                guard.journal_path = Some(write_exemption_journal(&guard.package_sid_text)?);
+                // Set before calling the API: if the API changes OS state but then
+                // reports a failed readback, rollback still attempts exact removal.
+                guard.exemption_added = true;
+                crate::sandbox::windows::ffi::add_loopback_exemption(&guard.package_sid_text)?;
+            }
+            let layers = required_block_layers();
+            for layer in layers {
+                guard.add_package_block(layer)?;
+            }
+            if let Some(port) = proxy_port {
+                for layer in required_connect_layers() {
+                    guard.add_proxy_permit(layer, port)?;
+                }
+            }
+            let expected = layers.len() + usize::from(proxy_port.is_some());
+            if guard.installed != expected {
+                return Err(crate::Error::isolation_unavailable(
+                    "WFP package policy did not install every required filter",
+                ));
+            }
+            Ok(())
+        })();
+        match setup {
+            Ok(()) => Ok(guard),
+            Err(setup_error) => match guard.close() {
+                Ok(()) => Err(setup_error),
+                Err(cleanup_error) => Err(crate::Error::isolation_unavailable(format!(
+                    "WFP rollback failed after setup error: {}; cleanup error: {}",
+                    setup_error.message, cleanup_error.message
+                ))),
+            },
         }
-        if guard.installed != layers.len() {
-            return Err(crate::Error::isolation_unavailable(
-                "WFP package policy did not install every required filter",
-            ));
-        }
-        Ok(guard)
     }
 
     fn add_package_block(&mut self, layer: windows_sys::core::GUID) -> crate::Result<()> {
@@ -68,7 +102,7 @@ impl PackageGuard {
                 },
             },
         };
-        let weight = 0x7fff_ffff_ffff_ffffu64;
+        let weight = u64::MAX - 1;
         let name: Vec<u16> = "Fail2Commit per-job package deny\0"
             .encode_utf16()
             .collect();
@@ -105,6 +139,94 @@ impl PackageGuard {
         self.verify_filter(&key, layer)
     }
 
+    fn add_proxy_permit(&mut self, layer: windows_sys::core::GUID, port: u16) -> crate::Result<()> {
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
+        if !guid_equal(&layer, &wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V4) {
+            return Err(crate::Error::integrity(
+                "proxy permit layer must be the IPv4 connect layer used by the bound endpoint",
+            ));
+        }
+        let key = fresh_filter_key()?;
+        let mut address_v4 = wfp::FWP_V4_ADDR_AND_MASK {
+            addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            mask: u32::MAX,
+        };
+        let port_value = port.to_be();
+        let protocol = 6u8;
+        let package = wfp::FWPM_FILTER_CONDITION0 {
+            fieldKey: wfp::FWPM_CONDITION_ALE_PACKAGE_ID,
+            matchType: wfp::FWP_MATCH_EQUAL,
+            conditionValue: wfp::FWP_CONDITION_VALUE0 {
+                r#type: wfp::FWP_SID,
+                Anonymous: wfp::FWP_CONDITION_VALUE0_0 {
+                    sid: self.package_sid.as_psid().cast(),
+                },
+            },
+        };
+        let address = wfp::FWPM_FILTER_CONDITION0 {
+            fieldKey: wfp::FWPM_CONDITION_IP_REMOTE_ADDRESS_V4,
+            matchType: wfp::FWP_MATCH_EQUAL,
+            conditionValue: wfp::FWP_CONDITION_VALUE0 {
+                r#type: wfp::FWP_V4_ADDR_MASK,
+                Anonymous: wfp::FWP_CONDITION_VALUE0_0 {
+                    v4AddrMask: (&mut address_v4 as *mut wfp::FWP_V4_ADDR_AND_MASK),
+                },
+            },
+        };
+        let remote_port = wfp::FWPM_FILTER_CONDITION0 {
+            fieldKey: wfp::FWPM_CONDITION_IP_REMOTE_PORT,
+            matchType: wfp::FWP_MATCH_EQUAL,
+            conditionValue: wfp::FWP_CONDITION_VALUE0 {
+                r#type: wfp::FWP_UINT16,
+                Anonymous: wfp::FWP_CONDITION_VALUE0_0 { uint16: port_value },
+            },
+        };
+        let ip_protocol = wfp::FWPM_FILTER_CONDITION0 {
+            fieldKey: wfp::FWPM_CONDITION_IP_PROTOCOL,
+            matchType: wfp::FWP_MATCH_EQUAL,
+            conditionValue: wfp::FWP_CONDITION_VALUE0 {
+                r#type: wfp::FWP_UINT8,
+                Anonymous: wfp::FWP_CONDITION_VALUE0_0 { uint8: protocol },
+            },
+        };
+        let mut conditions = [package, address, remote_port, ip_protocol];
+        let weight = u64::MAX;
+        let name: Vec<u16> = "Fail2Commit exact proxy loopback permit\0"
+            .encode_utf16()
+            .collect();
+        let mut filter = wfp::FWPM_FILTER0 {
+            filterKey: key,
+            displayData: wfp::FWPM_DISPLAY_DATA0 {
+                name: name.as_ptr() as *mut u16,
+                description: std::ptr::null_mut(),
+            },
+            layerKey: layer,
+            subLayerKey: wfp::FWPM_SUBLAYER_UNIVERSAL,
+            flags: wfp::FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+            weight: wfp::FWP_VALUE0 {
+                r#type: wfp::FWP_UINT64,
+                Anonymous: wfp::FWP_VALUE0_0 {
+                    uint64: (&weight as *const u64).cast_mut(),
+                },
+            },
+            numFilterConditions: conditions.len() as u32,
+            filterCondition: conditions.as_mut_ptr(),
+            action: wfp::FWPM_ACTION0 {
+                r#type: wfp::FWP_ACTION_PERMIT,
+                Anonymous: wfp::FWPM_ACTION0_0::default(),
+            },
+            ..Default::default()
+        };
+        let mut id = 0u64;
+        let status =
+            unsafe { wfp::FwpmFilterAdd0(self.engine, &mut filter, std::ptr::null_mut(), &mut id) };
+        if status != 0 || id == 0 {
+            return Err(wfp_error("FwpmFilterAdd0(proxy permit)", status));
+        }
+        self.installed += 1;
+        self.verify_proxy_permit(&key, layer, port)
+    }
+
     fn verify_filter(
         &self,
         key: &windows_sys::core::GUID,
@@ -119,7 +241,12 @@ impl PackageGuard {
         let filter = unsafe { &*raw };
         let valid = guid_equal(&filter.filterKey, key)
             && guid_equal(&filter.layerKey, &layer)
+            && guid_equal(&filter.subLayerKey, &wfp::FWPM_SUBLAYER_UNIVERSAL)
             && filter.action.r#type == wfp::FWP_ACTION_BLOCK
+            && filter.flags & wfp::FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT != 0
+            && filter.weight.r#type == wfp::FWP_UINT64
+            && unsafe { !filter.weight.Anonymous.uint64.is_null() }
+            && unsafe { *filter.weight.Anonymous.uint64 == u64::MAX - 1 }
             && filter.numFilterConditions == 1
             && !filter.filterCondition.is_null()
             && unsafe {
@@ -142,10 +269,99 @@ impl PackageGuard {
         Ok(())
     }
 
+    fn verify_proxy_permit(
+        &self,
+        key: &windows_sys::core::GUID,
+        layer: windows_sys::core::GUID,
+        port: u16,
+    ) -> crate::Result<()> {
+        use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe { wfp::FwpmFilterGetByKey0(self.engine, key, &mut raw) };
+        if status != 0 || raw.is_null() {
+            return Err(wfp_error("FwpmFilterGetByKey0(proxy permit)", status));
+        }
+        let filter = unsafe { &*raw };
+        let valid = guid_equal(&filter.filterKey, key)
+            && guid_equal(&filter.layerKey, &layer)
+            && guid_equal(&filter.subLayerKey, &wfp::FWPM_SUBLAYER_UNIVERSAL)
+            && filter.action.r#type == wfp::FWP_ACTION_PERMIT
+            && filter.flags & wfp::FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT != 0
+            && filter.weight.r#type == wfp::FWP_UINT64
+            && unsafe { !filter.weight.Anonymous.uint64.is_null() }
+            && unsafe { *filter.weight.Anonymous.uint64 == u64::MAX }
+            && filter.numFilterConditions == 4
+            && !filter.filterCondition.is_null()
+            && unsafe {
+                let conditions = std::slice::from_raw_parts(
+                    filter.filterCondition,
+                    filter.numFilterConditions as usize,
+                );
+                let package = conditions.iter().find(|condition| {
+                    guid_equal(&condition.fieldKey, &wfp::FWPM_CONDITION_ALE_PACKAGE_ID)
+                });
+                let address = conditions.iter().find(|condition| {
+                    guid_equal(
+                        &condition.fieldKey,
+                        &wfp::FWPM_CONDITION_IP_REMOTE_ADDRESS_V4,
+                    )
+                });
+                let remote_port = conditions.iter().find(|condition| {
+                    guid_equal(&condition.fieldKey, &wfp::FWPM_CONDITION_IP_REMOTE_PORT)
+                });
+                let protocol = conditions.iter().find(|condition| {
+                    guid_equal(&condition.fieldKey, &wfp::FWPM_CONDITION_IP_PROTOCOL)
+                });
+                let package_valid = package.is_some_and(|condition| {
+                    condition.matchType == wfp::FWP_MATCH_EQUAL
+                        && condition.conditionValue.r#type == wfp::FWP_SID
+                        && !condition.conditionValue.Anonymous.sid.is_null()
+                        && windows_sys::Win32::Security::EqualSid(
+                            condition.conditionValue.Anonymous.sid.cast(),
+                            self.package_sid.as_psid(),
+                        ) != 0
+                });
+                let address_valid = address.is_some_and(|condition| {
+                    if condition.matchType != wfp::FWP_MATCH_EQUAL {
+                        return false;
+                    }
+                    condition.conditionValue.r#type == wfp::FWP_V4_ADDR_MASK
+                        && !condition.conditionValue.Anonymous.v4AddrMask.is_null()
+                        && (*condition.conditionValue.Anonymous.v4AddrMask).addr
+                            == u32::from_ne_bytes([127, 0, 0, 1])
+                        && (*condition.conditionValue.Anonymous.v4AddrMask).mask == u32::MAX
+                });
+                let port_valid = remote_port.is_some_and(|condition| {
+                    guid_equal(&condition.fieldKey, &wfp::FWPM_CONDITION_IP_REMOTE_PORT)
+                        && condition.matchType == wfp::FWP_MATCH_EQUAL
+                        && condition.conditionValue.r#type == wfp::FWP_UINT16
+                        && condition.conditionValue.Anonymous.uint16 == port.to_be()
+                });
+                let protocol_valid = protocol.is_some_and(|condition| {
+                    condition.matchType == wfp::FWP_MATCH_EQUAL
+                        && condition.conditionValue.r#type == wfp::FWP_UINT8
+                        && condition.conditionValue.Anonymous.uint8 == 6
+                });
+                package_valid && address_valid && port_valid && protocol_valid
+            };
+        unsafe { wfp::FwpmFreeMemory0(&mut raw.cast()) };
+        if !valid {
+            return Err(crate::Error::integrity(
+                "WFP proxy permit read-back did not match package, address, port, protocol and precedence",
+            ));
+        }
+        Ok(())
+    }
+
     /// Close the dynamic session and surface failure to the caller so it can
     /// retain the active-launch refusal marker until filter cleanup is known.
     pub(crate) fn close(&mut self) -> crate::Result<()> {
+        if self.exemption_added {
+            crate::sandbox::windows::ffi::remove_loopback_exemption(&self.package_sid_text)?;
+            self.exemption_added = false;
+        }
         if self.engine.is_null() {
+            self.clear_exemption_journal()?;
             return Ok(());
         }
         let status = unsafe {
@@ -157,6 +373,23 @@ impl PackageGuard {
             return Err(wfp_error("FwpmEngineClose0", status));
         }
         self.engine = std::ptr::null_mut();
+        self.clear_exemption_journal()?;
+        Ok(())
+    }
+
+    fn clear_exemption_journal(&mut self) -> crate::Result<()> {
+        if let Some(path) = self.journal_path.take() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    self.journal_path = Some(path);
+                    return Err(crate::Error::isolation_unavailable(format!(
+                        "cannot clear loopback exemption recovery journal: {error}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -172,6 +405,126 @@ fn required_block_layers() -> [windows_sys::core::GUID; 6] {
         wfp::FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
         wfp::FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
     ]
+}
+
+#[cfg(windows)]
+fn required_connect_layers() -> [windows_sys::core::GUID; 1] {
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
+    [wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V4]
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExemptionJournal {
+    version: u32,
+    package_sid: String,
+}
+
+#[cfg(windows)]
+fn exemption_journal_path() -> crate::Result<std::path::PathBuf> {
+    Ok(super::machine_state_path()?
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("install state has no parent"))?
+        .join("loopback-exemption.json"))
+}
+
+#[cfg(windows)]
+fn validate_package_sid(sid: &str) -> bool {
+    let mut parts = sid.split('-');
+    if parts.next() != Some("S")
+        || parts.next() != Some("1")
+        || parts.next() != Some("15")
+        || parts.next() != Some("2")
+    {
+        return false;
+    }
+    let components: Vec<_> = parts.collect();
+    (1..=15).contains(&components.len())
+        && components
+            .iter()
+            .all(|part| !part.is_empty() && part.parse::<u32>().is_ok())
+}
+
+#[cfg(windows)]
+fn write_exemption_journal(package_sid: &str) -> crate::Result<std::path::PathBuf> {
+    if !validate_package_sid(package_sid) {
+        return Err(crate::Error::integrity(
+            "refusing to journal a non-AppContainer package SID",
+        ));
+    }
+    let path = exemption_journal_path()?;
+    let record = ExemptionJournal {
+        version: 1,
+        package_sid: package_sid.to_owned(),
+    };
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|_| crate::Error::internal("cannot encode loopback exemption journal"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            crate::Error::isolation_unavailable(format!(
+                "cannot create loopback exemption recovery journal: {error}"
+            ))
+        })?;
+    if crate::ipc::winsec::owner_sid(&file)? != "S-1-5-18" {
+        let _ = std::fs::remove_file(&path);
+        return Err(crate::Error::integrity(
+            "loopback exemption journal is not SYSTEM-owned",
+        ));
+    }
+    use std::io::Write;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(crate::Error::isolation_unavailable(format!(
+            "cannot persist loopback exemption recovery journal: {error}"
+        )));
+    }
+    Ok(path)
+}
+
+/// Revoke only the package SID recorded by our protected intent journal. This
+/// runs before the listener accepts jobs, including after a service restart.
+#[cfg(windows)]
+pub(crate) fn sweep_loopback_exemption() -> crate::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let path = exemption_journal_path()?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        || metadata.len() > 1024
+    {
+        return Err(crate::Error::integrity(
+            "loopback exemption journal is unsafe or oversized",
+        ));
+    }
+    let file = std::fs::OpenOptions::new().read(true).open(&path)?;
+    if crate::ipc::winsec::owner_sid(&file)? != "S-1-5-18" {
+        return Err(crate::Error::integrity(
+            "loopback exemption journal is not SYSTEM-owned",
+        ));
+    }
+    let record: ExemptionJournal = serde_json::from_reader(file)
+        .map_err(|_| crate::Error::integrity("loopback exemption journal is malformed"))?;
+    if record.version != 1 || !validate_package_sid(&record.package_sid) {
+        return Err(crate::Error::integrity(
+            "loopback exemption journal identity is invalid",
+        ));
+    }
+    crate::sandbox::windows::ffi::remove_loopback_exemption(&record.package_sid)?;
+    std::fs::remove_file(&path).map_err(|error| {
+        crate::Error::isolation_unavailable(format!(
+            "cannot clear loopback exemption recovery journal: {error}"
+        ))
+    })
 }
 
 #[cfg(windows)]
@@ -213,6 +566,7 @@ fn guid_equal(left: &windows_sys::core::GUID, right: &windows_sys::core::GUID) -
 #[cfg(all(windows, test))]
 #[test]
 fn policy_covers_both_ip_families_for_connect_listen_and_accept() {
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
     let layers = required_block_layers();
     assert_eq!(layers.len(), 6);
     let unique = layers
@@ -220,6 +574,14 @@ fn policy_covers_both_ip_families_for_connect_listen_and_accept() {
         .map(|guid| (guid.data1, guid.data2, guid.data3, guid.data4))
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(unique.len(), layers.len());
+    // The proxy is bound to IPv4 loopback only; there must be no AppContainer
+    // exemption for IPv6 or another connect layer.
+    let permit_layers = required_connect_layers();
+    assert_eq!(permit_layers.len(), 1);
+    assert!(guid_equal(
+        &permit_layers[0],
+        &wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V4
+    ));
 }
 
 /// Run only in the disposable elevated Windows guest: this exercises the real
@@ -227,8 +589,26 @@ fn policy_covers_both_ip_families_for_connect_listen_and_accept() {
 /// so no filters persist. It intentionally does not enable loopback or egress.
 #[cfg(all(windows, test))]
 #[test]
+#[ignore = "requires a disposable elevated Windows guest; never run against the host WFP engine"]
 fn disposable_windows_dynamic_package_deny_filters_install_and_revoke() {
-    let guard = PackageGuard::install("S-1-15-2-1-2-3-4-5-6-7-8-9-10-11-12").unwrap();
+    let guard = PackageGuard::install("S-1-15-2-1-2-3-4-5-6-7-8-9-10-11-12", None).unwrap();
     assert_eq!(guard.installed, required_block_layers().len());
     drop(guard);
+}
+
+/// Runtime package-policy check for an isolated elevated guest only. It mutates
+/// the app-container loopback exemption SID list transiently and proves the
+/// list is restored after dynamic filter cleanup.
+#[cfg(all(windows, test))]
+#[test]
+#[ignore = "requires a disposable elevated Windows guest; never run against the host WFP engine"]
+fn disposable_windows_exact_proxy_permit_is_read_back_and_revoked() {
+    let before = crate::sandbox::windows::ffi::loopback_exempt_sids().unwrap();
+    let guard = PackageGuard::install("S-1-15-2-1-2-3-4-5-6-7-8-9-10-11-12", Some(32123)).unwrap();
+    assert_eq!(guard.installed, required_block_layers().len() + 1);
+    drop(guard);
+    assert_eq!(
+        crate::sandbox::windows::ffi::loopback_exempt_sids().unwrap(),
+        before
+    );
 }

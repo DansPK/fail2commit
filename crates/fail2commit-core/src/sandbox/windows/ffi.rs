@@ -1436,7 +1436,12 @@ pub(super) fn known_user_profile() -> crate::Result<PathBuf> {
 /// edits). No process is launched and no environment value is consulted; a
 /// missing export or a failing call is an error, so the caller fails closed.
 #[allow(unsafe_code)]
-pub(super) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
+pub(crate) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
+    loopback_exempt_entries().map(|entries| entries.into_iter().map(|(sid, _)| sid).collect())
+}
+
+#[allow(unsafe_code)]
+fn loopback_exempt_entries() -> crate::Result<Vec<(String, u32)>> {
     type GetConfig = unsafe extern "system" fn(*mut u32, *mut *mut SID_AND_ATTRIBUTES) -> u32;
     let library = wide(OsStr::new("FirewallAPI.dll"));
     // SAFETY: NUL-terminated module name; the loaded module is freed below.
@@ -1475,7 +1480,7 @@ pub(super) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
                 continue;
             }
             if let Ok(sid) = sid_to_string(entry.Sid) {
-                out.push(sid);
+                out.push((sid, entry.Attributes));
             }
         }
         // SAFETY: the documented sample frees each SID and then the array with
@@ -1499,6 +1504,129 @@ pub(super) fn loopback_exempt_sids() -> crate::Result<Vec<String>> {
         )));
     }
     Ok(out)
+}
+
+static LOOPBACK_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+/// Add or remove one exact AppContainer SID from FirewallAPI's loopback
+/// exemption list while preserving every preexisting SID and its attributes.
+/// The OS API manages a machine-wide SID list; it has no per-entry handle, so
+/// updates are serialized within this process and always verified by readback.
+#[allow(unsafe_code)]
+fn write_loopback_exempt_entries(entries: &[(String, u32)]) -> crate::Result<()> {
+    type SetConfig = unsafe extern "system" fn(u32, *const SID_AND_ATTRIBUTES) -> u32;
+    let owned: Vec<_> = entries
+        .iter()
+        .map(|(sid, _)| sid_from_string(sid))
+        .collect::<crate::Result<_>>()?;
+    let attributes: Vec<_> = entries.iter().map(|(_, attr)| *attr).collect();
+    let config: Vec<_> = owned
+        .iter()
+        .zip(attributes)
+        .map(|(sid, attributes)| SID_AND_ATTRIBUTES {
+            Sid: sid.as_psid(),
+            Attributes: attributes,
+        })
+        .collect();
+    let count = match u32::try_from(config.len()) {
+        Ok(count) if count <= 16_384 => count,
+        _ => {
+            return Err(crate::Error::isolation_unavailable(
+                "FirewallAPI loopback exemption list exceeds its safety bound",
+            ));
+        }
+    };
+    let library = wide(OsStr::new("FirewallAPI.dll"));
+    let module = unsafe { LoadLibraryW(library.as_ptr()) };
+    if module.is_null() {
+        return Err(unavailable("LoadLibraryW(FirewallAPI.dll)"));
+    }
+    let proc = unsafe {
+        GetProcAddress(
+            module,
+            c"NetworkIsolationSetAppContainerConfig".as_ptr().cast(),
+        )
+    };
+    if proc.is_null() {
+        unsafe { FreeLibrary(module) };
+        return Err(crate::Error::isolation_unavailable(
+            "FirewallAPI.dll does not export NetworkIsolationSetAppContainerConfig",
+        ));
+    }
+    let set_config: SetConfig = unsafe { std::mem::transmute(proc) };
+    let pointer = if config.is_empty() {
+        std::ptr::null()
+    } else {
+        config.as_ptr()
+    };
+    let status = unsafe { set_config(count, pointer) };
+    unsafe { FreeLibrary(module) };
+    if status != 0 {
+        return Err(crate::Error::isolation_unavailable(format!(
+            "NetworkIsolationSetAppContainerConfig failed: Win32 error {status}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn add_loopback_exemption(sid: &str) -> crate::Result<()> {
+    let _guard = LOOPBACK_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut entries = loopback_exempt_entries()?;
+    if entries
+        .iter()
+        .any(|(entry, _)| entry.eq_ignore_ascii_case(sid))
+    {
+        return Err(crate::Error::integrity(
+            "new AppContainer already has a loopback exemption",
+        ));
+    }
+    entries.push((sid.to_owned(), 0));
+    write_loopback_exempt_entries(&entries)?;
+    let actual = loopback_exempt_entries()?;
+    if !actual
+        .iter()
+        .any(|(entry, _)| entry.eq_ignore_ascii_case(sid))
+        || entries.iter().any(|expected| {
+            !actual
+                .iter()
+                .any(|found| found.0.eq_ignore_ascii_case(&expected.0) && found.1 == expected.1)
+        })
+    {
+        return Err(crate::Error::integrity(
+            "loopback exemption update did not read back exactly",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_loopback_exemption(sid: &str) -> crate::Result<()> {
+    let _guard = LOOPBACK_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut entries = loopback_exempt_entries()?;
+    let original_len = entries.len();
+    entries.retain(|(entry, _)| !entry.eq_ignore_ascii_case(sid));
+    if entries.len() == original_len {
+        return Ok(());
+    }
+    write_loopback_exempt_entries(&entries)?;
+    let actual = loopback_exempt_entries()?;
+    if actual
+        .iter()
+        .any(|(entry, _)| entry.eq_ignore_ascii_case(sid))
+        || entries.iter().any(|expected| {
+            !actual
+                .iter()
+                .any(|found| found.0.eq_ignore_ascii_case(&expected.0) && found.1 == expected.1)
+        })
+    {
+        return Err(crate::Error::integrity(
+            "loopback exemption removal did not read back exactly",
+        ));
+    }
+    Ok(())
 }
 
 /// A SID owned through `LocalFree`, for SIDs parsed back from a state file.
