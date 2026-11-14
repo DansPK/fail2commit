@@ -232,3 +232,38 @@ fn timeout_kills_the_vm() {
     assert!(sandbox_support::processes_with("qemu-system-x86_64").is_empty());
     std::env::remove_var("FAIL2COMMIT_HOME");
 }
+
+/// LV-04 boot gate: a comma-bearing stage path must still map correctly through
+/// QEMU's real option parser (fd-backed / escaped share path). Pending KVM.
+#[test]
+fn comma_stage_path_boots() {
+    if boot_gate("comma_stage_path_boots").is_none() {
+        return;
+    }
+    let home = tempfile::Builder::new()
+        .prefix("f2c,vm-")
+        .tempdir()
+        .unwrap();
+    std::env::set_var("FAIL2COMMIT_HOME", home.path());
+    let out = home.path().join("out");
+    let (_stage, spec) = stage_job(
+        home.path(),
+        "echo comma > out.txt",
+        &["out.txt"],
+        Some(out.clone()),
+        Duration::from_secs(30),
+    );
+    let backend = select_backend(&vm_settings());
+    assert!(
+        backend.probe().available,
+        "VM backend must be available in the gate"
+    );
+    let outcome = run_job(backend.as_ref(), &spec).expect("comma-path VM job");
+    assert_eq!(outcome.status, JobStatus::Exited(0));
+    assert_eq!(
+        fs::read_to_string(out.join("out.txt")).unwrap().trim(),
+        "comma"
+    );
+    assert!(sandbox_support::processes_with("qemu-system-x86_64").is_empty());
+    std::env::remove_var("FAIL2COMMIT_HOME");
+}
