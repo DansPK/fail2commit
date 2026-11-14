@@ -59,6 +59,8 @@ impl EffectResults {
             && self.direct_dns_udp_v6_refused
             && self.direct_udp_other_loopback_refused
             && self.direct_udp_other_loopback_v6_refused
+            && self.direct_udp_interface_v4_refused
+            && self.direct_udp_interface_v6_refused
             && self.direct_udp_private_v4_refused
             && self.direct_udp_private_v6_refused
             && self.direct_udp_metadata_v4_refused
@@ -320,21 +322,84 @@ mod tests {
             udp_listen_v6_refused: true,
         };
         assert!(complete.complete());
-        let mut missing = complete.clone();
-        missing.direct_dns_udp_v6_refused = false;
-        assert!(!missing.complete());
-        assert_eq!(missing.failed_checks(), ["direct_dns_udp_v6_refused"]);
-        missing = complete.clone();
-        missing.proxy_loopback_permitted = false;
-        assert!(!missing.complete());
-        assert_eq!(missing.failed_checks(), ["proxy_loopback_permitted"]);
-        missing = complete;
-        missing.direct_udp_other_loopback_v6_refused = false;
-        assert!(!missing.complete());
-        assert_eq!(
-            missing.failed_checks(),
-            ["direct_udp_other_loopback_v6_refused"]
-        );
+        let failures: [(&str, fn(&mut EffectResults)); 26] = [
+            ("proxy_loopback_permitted", |r| {
+                r.proxy_loopback_permitted = false
+            }),
+            ("proxy_public_route_permitted", |r| {
+                r.proxy_public_route_permitted = false
+            }),
+            ("other_loopback_refused", |r| {
+                r.other_loopback_refused = false
+            }),
+            ("other_loopback_v6_refused", |r| {
+                r.other_loopback_v6_refused = false
+            }),
+            ("direct_interface_v4_refused", |r| {
+                r.direct_interface_v4_refused = false
+            }),
+            ("direct_public_v4_refused", |r| {
+                r.direct_public_v4_refused = false
+            }),
+            ("direct_private_v4_refused", |r| {
+                r.direct_private_v4_refused = false
+            }),
+            ("direct_metadata_v4_refused", |r| {
+                r.direct_metadata_v4_refused = false
+            }),
+            ("direct_interface_v6_refused", |r| {
+                r.direct_interface_v6_refused = false
+            }),
+            ("direct_public_v6_refused", |r| {
+                r.direct_public_v6_refused = false
+            }),
+            ("direct_private_v6_refused", |r| {
+                r.direct_private_v6_refused = false
+            }),
+            ("direct_metadata_v6_refused", |r| {
+                r.direct_metadata_v6_refused = false
+            }),
+            ("direct_dns_udp_v4_refused", |r| {
+                r.direct_dns_udp_v4_refused = false
+            }),
+            ("direct_dns_udp_v6_refused", |r| {
+                r.direct_dns_udp_v6_refused = false
+            }),
+            ("direct_udp_other_loopback_refused", |r| {
+                r.direct_udp_other_loopback_refused = false
+            }),
+            ("direct_udp_other_loopback_v6_refused", |r| {
+                r.direct_udp_other_loopback_v6_refused = false
+            }),
+            ("direct_udp_interface_v4_refused", |r| {
+                r.direct_udp_interface_v4_refused = false
+            }),
+            ("direct_udp_interface_v6_refused", |r| {
+                r.direct_udp_interface_v6_refused = false
+            }),
+            ("direct_udp_private_v4_refused", |r| {
+                r.direct_udp_private_v4_refused = false
+            }),
+            ("direct_udp_private_v6_refused", |r| {
+                r.direct_udp_private_v6_refused = false
+            }),
+            ("direct_udp_metadata_v4_refused", |r| {
+                r.direct_udp_metadata_v4_refused = false
+            }),
+            ("direct_udp_metadata_v6_refused", |r| {
+                r.direct_udp_metadata_v6_refused = false
+            }),
+            ("listen_v4_refused", |r| r.listen_v4_refused = false),
+            ("listen_v6_refused", |r| r.listen_v6_refused = false),
+            ("udp_listen_v4_refused", |r| r.udp_listen_v4_refused = false),
+            ("udp_listen_v6_refused", |r| r.udp_listen_v6_refused = false),
+        ];
+        for (name, invalidate) in failures {
+            let mut missing = complete.clone();
+            invalidate(&mut missing);
+            assert!(!missing.complete(), "{name} was not mandatory");
+            assert_eq!(missing.failed_checks(), [name]);
+        }
     }
 
     #[test]

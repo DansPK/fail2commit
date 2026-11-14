@@ -295,6 +295,44 @@ enum ProcessWait {
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PreparationCleanupProof {
+    ack_sent: bool,
+    launcher_tree_empty: bool,
+    package_grants_revoked: bool,
+    package_policy_closed: bool,
+    profile_unloaded: bool,
+}
+
+#[cfg(any(windows, test))]
+impl PreparationCleanupProof {
+    fn cleanup_complete(self) -> bool {
+        self.launcher_tree_empty
+            && self.package_grants_revoked
+            && self.package_policy_closed
+            && self.profile_unloaded
+    }
+
+    fn may_clear_marker(self) -> bool {
+        self.cleanup_complete()
+    }
+
+    fn operation_succeeded(self) -> bool {
+        self.ack_sent && self.cleanup_complete()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn send_policy_ack(
+    proof: &mut PreparationCleanupProof,
+    send: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<()> {
+    send()?;
+    proof.ack_sent = true;
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
 fn termination_confirmation(
     terminate: impl FnOnce() -> std::result::Result<(), u32>,
     wait: impl FnOnce(u32) -> ProcessWait,
@@ -2767,6 +2805,7 @@ fn run_snapshot_as_sandbox(
     };
     let mut retained_process = None;
     let mut containment_confirmed = true;
+    let mut cleanup_proof = PreparationCleanupProof::default();
     let mut active_marker = None;
     let mut network_guard = None;
     let mut package_grants = None;
@@ -3108,19 +3147,25 @@ fn run_snapshot_as_sandbox(
                             message.proxy_port,
                         ) {
                             Ok(guard) => {
-                                write_prepare_ack(
-                                    ack_write.as_raw_handle() as HANDLE,
-                                    &PrepareAck {
-                                        version: 1,
-                                        launch_id: marker_id.clone(),
-                                        package_sid: message.package_sid,
-                                        proxy_port: message.proxy_port,
-                                        ready: true,
-                                        detail: "package-scoped deny filters and exact proxy endpoint read back".into(),
-                                    },
-                                )?;
+                                // Transfer both security resources into the
+                                // common checked cleanup path before the ACK
+                                // write can fail (for example, if the launcher
+                                // closes its read end after policy installation).
                                 network_guard = Some(guard);
                                 package_grants = Some(grants);
+                                send_policy_ack(&mut cleanup_proof, || {
+                                    write_prepare_ack(
+                                        ack_write.as_raw_handle() as HANDLE,
+                                        &PrepareAck {
+                                            version: 1,
+                                            launch_id: marker_id.clone(),
+                                            package_sid: message.package_sid,
+                                            proxy_port: message.proxy_port,
+                                            ready: true,
+                                            detail: "package-scoped deny filters and exact proxy endpoint read back".into(),
+                                        },
+                                    )
+                                })?;
                             }
                             Err(error) => {
                                 // PackageGuard::install has already attempted
@@ -3238,6 +3283,7 @@ fn run_snapshot_as_sandbox(
     match terminate_job_tree_and_confirm(job_raw) {
         Ok(had_residual_processes) => {
             containment_confirmed = true;
+            cleanup_proof.launcher_tree_empty = true;
             // Confirmed zero active processes before closing the last handle.
             drop(job_handle);
             if had_residual_processes && launch_result.is_ok() {
@@ -3283,6 +3329,7 @@ fn run_snapshot_as_sandbox(
             )));
         }
     }
+    cleanup_proof.package_grants_revoked = package_grants.is_none();
     if let Some(mut guard) = network_guard.take() {
         if let Err(error) = guard.close() {
             LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
@@ -3296,6 +3343,7 @@ fn run_snapshot_as_sandbox(
             return Err(error);
         }
     }
+    cleanup_proof.package_policy_closed = network_guard.is_none();
     // SAFETY: the launcher process was observed signaled or forced termination
     // was confirmed before unloading the sandbox account profile.
     if unsafe { UnloadUserProfile(token_raw, profile.profile) } == 0 {
@@ -3308,9 +3356,28 @@ fn run_snapshot_as_sandbox(
             "UnloadUserProfile failed with Win32 error {code}"
         )));
     }
+    cleanup_proof.profile_unloaded = true;
     #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
     {
         diagnostic_stage.profile_unloaded = true;
+    }
+    if !cleanup_proof.may_clear_marker() {
+        LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+        if let Some(marker) = active_marker.as_mut() {
+            marker.retain();
+        }
+        return Err(crate::Error::isolation_unavailable(
+            "launch cleanup proof is incomplete; durable refusal marker retained",
+        ));
+    }
+    if launch_result.is_ok() && !cleanup_proof.operation_succeeded() {
+        LAUNCHER_CONTAINMENT_FAILED.store(true, Ordering::SeqCst);
+        if let Some(marker) = active_marker.as_mut() {
+            marker.retain();
+        }
+        return Err(crate::Error::isolation_unavailable(
+            "launch completed without an acknowledged package policy; refusal marker retained",
+        ));
     }
     if let Some(marker) = active_marker.as_mut() {
         if let Err(error) = marker.clear() {
@@ -4726,6 +4793,41 @@ mod tests {
         assert!(decode_active_launch_marker(&partial).is_err());
         let invalid = serde_json::to_vec(&marker(Some(0), Some(10))).unwrap();
         assert!(decode_active_launch_marker(&invalid).is_err());
+    }
+
+    #[test]
+    fn failed_policy_ack_with_each_cleanup_failure_keeps_marker_and_launch_latched() {
+        let stages: [(&str, fn(&mut PreparationCleanupProof)); 4] = [
+            ("launcher tree", |proof| proof.launcher_tree_empty = false),
+            ("package grants", |proof| {
+                proof.package_grants_revoked = false
+            }),
+            ("WFP policy", |proof| proof.package_policy_closed = false),
+            ("sandbox profile", |proof| proof.profile_unloaded = false),
+        ];
+        for (stage, fail_cleanup) in stages {
+            let mut proof = PreparationCleanupProof::default();
+            assert!(send_policy_ack(&mut proof, || {
+                Err(crate::Error::isolation_unavailable(
+                    "injected preparation ACK failure",
+                ))
+            })
+            .is_err());
+            proof.launcher_tree_empty = true;
+            proof.package_grants_revoked = true;
+            proof.package_policy_closed = true;
+            proof.profile_unloaded = true;
+            fail_cleanup(&mut proof);
+            assert!(
+                !proof.operation_succeeded(),
+                "{stage} accepted a failed ACK"
+            );
+            assert!(
+                !proof.may_clear_marker(),
+                "{stage} cleared the refusal marker"
+            );
+            assert!(!response(true, "probe").probe_available);
+        }
     }
 
     #[test]
