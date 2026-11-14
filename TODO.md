@@ -26,9 +26,9 @@ Integration branch: `main` (one PR per change). Latest release `v0.1.3` (pre-rel
 
 | ID | Task | Req IDs | Owner | Status | Depends on |
 |---|---|---|---|---|---|
-| T-013 | Implement SPEC-018 (hardened sandbox mode) | FR-027 | Orca Luna worker | Windows/Linux source and packaging at 39334cc; Luna fixing Linux LP01/LP02 and checking LP03; root/Windows runtime gates and external-writer limit open; not integrated | T-007 |
+| T-013 | Implement SPEC-018 (hardened sandbox mode) | FR-027 | Orca Luna worker | source accepted by Sol and integrated from 155e823; root/Windows runtime gates and external-writer limit open; not fully verified | T-007 |
 | T-014 | Implement the FR-013 progress window and terminal line (SPEC-015 hooks are in place; `ui.progress_window` setting exists, no sink yet) | FR-013 | Orca Luna worker; Sol review | source accepted by Sol r4 and integrated from f928a45; Linux PTY flows passed; Windows GUI/current package gates pending | - |
-| T-015 | Implement SPEC-019 (VM sandbox backend) | FR-029 | - | ready | T-013 |
+| T-015 | Implement SPEC-019 (VM sandbox backend) | FR-029 | Orca Luna worker | implementation assigned after hardened source integration; lands last | T-013 |
 
 FR-029 (VM backend, Could) stays in 0.1.4 by owner decision (2026-11-13); it lands last, after T-013 and T-014.
 
