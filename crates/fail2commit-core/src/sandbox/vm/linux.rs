@@ -1644,11 +1644,14 @@ mod tests {
                 moved = moved.display(),
                 hfile = hfile.display(),
             )
-            .replace("@SENTINEL@", &home.join("sentinel-contain").display().to_string()),
+            .replace(
+                "@SENTINEL@",
+                &home.path().join("sentinel-contain").display().to_string(),
+            ),
         )
         .unwrap();
         fs::set_permissions(&qemu, fs::Permissions::from_mode(0o755)).unwrap();
-        let sentinel = home.join("sentinel-contain");
+        let sentinel = home.path().join("sentinel-contain");
 
         let mut st = state();
         st.qemu = qemu.to_string_lossy().into_owned();
