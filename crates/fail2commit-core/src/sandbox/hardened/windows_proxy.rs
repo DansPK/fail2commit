@@ -8,14 +8,14 @@
 
 use crate::isolation::ActivityKind;
 use crate::sandbox::bait::BaitSet;
-use crate::sandbox::egress::{all_public, find_head_end, has_bait, resolve, Request, Watch};
+use crate::sandbox::egress::{all_public, find_head_end, has_bait, Request, Watch};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_BODY_INSPECT: usize = 8 * 1024;
@@ -23,13 +23,111 @@ const MAX_RESOLVED_ADDRESSES: usize = 32;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_TUNNEL_BYTES: u64 = 512 * 1024 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
+const IO_POLL: Duration = Duration::from_millis(50);
+const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 const IO_CHUNK: usize = 16 * 1024;
 
-type Resolver = dyn Fn(&str, u16) -> Option<Vec<SocketAddr>> + Send + Sync;
+type Resolver = dyn Fn(&str, u16, Instant, &AtomicBool) -> Option<Vec<SocketAddr>> + Send + Sync;
 type Connector = dyn Fn(SocketAddr, Duration) -> io::Result<TcpStream> + Send + Sync;
+
+struct DnsRequest {
+    host: String,
+    port: u16,
+    result: mpsc::Sender<Option<Vec<SocketAddr>>>,
+}
+
+struct DnsPool {
+    senders: [mpsc::SyncSender<DnsRequest>; 2],
+    next: AtomicUsize,
+}
+
+static DNS_POOL: OnceLock<Option<DnsPool>> = OnceLock::new();
+
+fn dns_pool() -> Option<&'static DnsPool> {
+    DNS_POOL
+        .get_or_init(|| {
+            let mut senders = Vec::with_capacity(2);
+            for slot in 0..2 {
+                let (sender, receiver) = mpsc::sync_channel::<DnsRequest>(1);
+                let started = thread::Builder::new()
+                    .name(format!("f2c-hardened-dns-{slot}"))
+                    .spawn(move || {
+                        while let Ok(request) = receiver.recv() {
+                            let result =
+                                crate::sandbox::egress::resolve(&request.host, request.port);
+                            let _ = request.result.send(result);
+                        }
+                    });
+                if started.is_err() {
+                    return None;
+                }
+                // These two bounded workers intentionally live for the process
+                // lifetime: Windows name resolution is not cancellable through
+                // ToSocketAddrs, and per-request detached resolver threads would
+                // make proxy teardown unbounded.
+                senders.push(sender);
+            }
+            let senders: [mpsc::SyncSender<DnsRequest>; 2] = senders.try_into().ok()?;
+            Some(DnsPool {
+                senders,
+                next: AtomicUsize::new(0),
+            })
+        })
+        .as_ref()
+}
+
+fn resolve_bounded(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Option<Vec<SocketAddr>> {
+    let pool = dns_pool()?;
+    let (result, receiver) = mpsc::channel();
+    let request = DnsRequest {
+        host: host.to_owned(),
+        port,
+        result,
+    };
+    let first = pool.next.fetch_add(1, Ordering::Relaxed) % pool.senders.len();
+    let mut queued = false;
+    for offset in 0..pool.senders.len() {
+        match pool.senders[(first + offset) % pool.senders.len()].try_send(DnsRequest {
+            host: request.host.clone(),
+            port: request.port,
+            result: request.result.clone(),
+        }) {
+            Ok(()) => {
+                queued = true;
+                break;
+            }
+            Err(mpsc::TrySendError::Full(_)) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => continue,
+        }
+    }
+    if !queued {
+        return None;
+    }
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match receiver.recv_timeout(remaining.min(IO_POLL)) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
 
 /// A job-scoped proxy bound only to IPv4 loopback on an ephemeral port.
 /// Dropping it closes the listener and every accepted/upstream socket, then
@@ -96,9 +194,15 @@ impl Drop for Egress {
 }
 
 #[derive(Default)]
+struct SocketState {
+    closed: bool,
+    sockets: HashMap<u64, TcpStream>,
+}
+
+#[derive(Default)]
 struct SocketRegistry {
     next_id: AtomicU64,
-    sockets: Mutex<HashMap<u64, TcpStream>>,
+    state: Mutex<SocketState>,
 }
 
 struct SocketRegistration {
@@ -108,24 +212,79 @@ struct SocketRegistration {
 
 impl SocketRegistry {
     fn register(self: &Arc<Self>, stream: &TcpStream) -> io::Result<SocketRegistration> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.closed {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "proxy is stopping",
+            ));
+        }
         let clone = stream.try_clone()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.sockets
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .insert(id, clone);
+        state.sockets.insert(id, clone);
         Ok(SocketRegistration {
             id,
             registry: Arc::clone(self),
         })
     }
 
-    fn shutdown_all(&self) {
-        let sockets = self
-            .sockets
+    fn connect_registered(
+        self: &Arc<Self>,
+        address: SocketAddr,
+        timeout: Duration,
+        connector: &Connector,
+    ) -> io::Result<(TcpStream, SocketRegistration)> {
+        // Holding the same lock used to linearize cancellation ensures a
+        // connector cannot begin after shutdown/bait cancellation is committed.
+        // Connector implementations have a strict timeout.
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        for stream in sockets.values() {
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "proxy is stopping",
+            ));
+        }
+        let stream = connector(address, timeout)?;
+        let clone = stream.try_clone()?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        state.sockets.insert(id, clone);
+        Ok((
+            stream,
+            SocketRegistration {
+                id,
+                registry: Arc::clone(self),
+            },
+        ))
+    }
+
+    fn write_if_open(&self, stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "proxy is stopping",
+            ));
+        }
+        stream.write_all(bytes)
+    }
+
+    fn shutdown_all(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.closed = true;
+        for stream in state.sockets.values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
@@ -133,11 +292,12 @@ impl SocketRegistry {
     fn shutdown_except(&self, keep: &TcpStream) {
         let keep_local = keep.local_addr().ok();
         let keep_peer = keep.peer_addr().ok();
-        let sockets = self
-            .sockets
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        for stream in sockets.values() {
+        state.closed = true;
+        for stream in state.sockets.values() {
             if stream.local_addr().ok() == keep_local && stream.peer_addr().ok() == keep_peer {
                 continue;
             }
@@ -149,15 +309,21 @@ impl SocketRegistry {
 impl Drop for SocketRegistration {
     fn drop(&mut self) {
         self.registry
-            .sockets
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+            .sockets
             .remove(&self.id);
     }
 }
 
 pub(crate) fn start(watch: Arc<Watch>, bait: Option<Arc<BaitSet>>) -> crate::Result<Egress> {
-    start_with(watch, bait, Arc::new(resolve), Arc::new(connect_one))
+    start_with(
+        watch,
+        bait,
+        Arc::new(resolve_bounded),
+        Arc::new(connect_one),
+    )
 }
 
 fn start_with(
@@ -218,17 +384,17 @@ fn accept_loop(
                 let count = live.fetch_add(1, Ordering::SeqCst) + 1;
                 if count > MAX_CONNECTIONS {
                     live.fetch_sub(1, Ordering::SeqCst);
+                    sockets.shutdown_all();
                     watch.trip(
                         ActivityKind::Limit,
                         "egress proxy connection limit exceeded",
                     );
                     stop.store(true, Ordering::SeqCst);
-                    sockets.shutdown_all();
                     break;
                 }
                 if client.set_nodelay(true).is_err()
-                    || client.set_read_timeout(Some(HEAD_TIMEOUT)).is_err()
-                    || client.set_write_timeout(Some(HEAD_TIMEOUT)).is_err()
+                    || client.set_read_timeout(Some(IO_POLL)).is_err()
+                    || client.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
                 {
                     live.fetch_sub(1, Ordering::SeqCst);
                     watch.record(ActivityKind::NetRefused, "egress client setup failed");
@@ -272,9 +438,9 @@ fn accept_loop(
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
             Err(_) => {
+                sockets.shutdown_all();
                 watch.trip(ActivityKind::NetRefused, "egress proxy listener failed");
                 stop.store(true, Ordering::SeqCst);
-                sockets.shutdown_all();
                 break;
             }
         }
@@ -308,7 +474,8 @@ fn handle_connection(
     stop: Arc<AtomicBool>,
     sockets: Arc<SocketRegistry>,
 ) -> io::Result<()> {
-    let (head, initial_body) = match read_request(client) {
+    let request_deadline = Instant::now() + HEAD_TIMEOUT;
+    let (head, initial_body) = match read_request(client, &stop, request_deadline) {
         Ok(request) => request,
         Err(_) => {
             watch.record(
@@ -331,22 +498,33 @@ fn handle_connection(
     }
     if has_bait(bait, &head, &initial_body) {
         // Do not include the bait value or hostname in the report.
+        sockets.shutdown_except(client);
         watch.trip(ActivityKind::Bait, "egress proxy detected a bait value");
         stop.store(true, Ordering::SeqCst);
-        sockets.shutdown_except(client);
         return refuse(
             client,
             "403 Forbidden",
             "blocked by the fail2commit bait policy",
         );
     }
-    let Some(targets) = resolver(&request.host, request.port) else {
+    let Some(targets) = resolver(
+        &request.host,
+        request.port,
+        Instant::now() + RESOLVE_TIMEOUT,
+        &stop,
+    ) else {
         watch.record(
             ActivityKind::NetRefused,
             "proxy destination did not resolve",
         );
         return refuse(client, "403 Forbidden", "destination did not resolve");
     };
+    if stop.load(Ordering::SeqCst) || watch.tripped() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "proxy is stopping",
+        ));
+    }
     if targets.len() > MAX_RESOLVED_ADDRESSES || !all_public(&targets) {
         watch.record(ActivityKind::NetRefused, "proxy destination is not public");
         return refuse(
@@ -356,14 +534,17 @@ fn handle_connection(
         );
     }
     let mut upstream = None;
+    let mut upstream_registration = None;
     let connect_deadline = std::time::Instant::now() + CONNECT_TIMEOUT;
     for address in targets {
         let timeout = connect_deadline.saturating_duration_since(std::time::Instant::now());
-        if timeout.is_zero() {
+        if timeout.is_zero() || stop.load(Ordering::SeqCst) || watch.tripped() {
             break;
         }
-        if let Ok(stream) = connector(address, timeout) {
+        if let Ok((stream, registration)) = sockets.connect_registered(address, timeout, connector)
+        {
             upstream = Some(stream);
+            upstream_registration = Some(registration);
             break;
         }
     }
@@ -375,21 +556,26 @@ fn handle_connection(
         return refuse(client, "502 Bad Gateway", "destination unreachable");
     };
     upstream.set_nodelay(true)?;
-    upstream.set_read_timeout(Some(IDLE_TIMEOUT))?;
-    upstream.set_write_timeout(Some(IDLE_TIMEOUT))?;
-    let _upstream_registration = sockets.register(&upstream)?;
-    watch.record(ActivityKind::NetAllowed, request.authority());
+    upstream.set_read_timeout(Some(IO_POLL))?;
+    upstream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    let _upstream_registration = upstream_registration.expect("registered with connect");
     let total = Arc::new(AtomicU64::new(0));
+    let connection_deadline = Instant::now() + MAX_CONNECTION_LIFETIME;
     if request.method.eq_ignore_ascii_case("CONNECT") {
-        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+        if !initial_body.is_empty() {
+            account_transfer(initial_body.len(), &total, &watch, &stop, &sockets)?;
+            sockets.write_if_open(&mut upstream, &initial_body)?;
+        }
+        sockets.write_if_open(client, b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+        watch.record(ActivityKind::NetAllowed, request.authority());
         return tunnel(
             client,
             &mut upstream,
-            &initial_body,
             total,
             watch,
             stop,
             sockets,
+            connection_deadline,
         );
     }
     let forwarded_head = match forward_http_head(&head) {
@@ -399,23 +585,36 @@ fn handle_connection(
             return refuse(client, "400 Bad Request", "malformed proxy request");
         }
     };
-    upstream.write_all(&forwarded_head)?;
+    sockets.write_if_open(&mut upstream, &forwarded_head)?;
     if !initial_body.is_empty() {
-        upstream.write_all(&initial_body)?;
+        sockets.write_if_open(&mut upstream, &initial_body)?;
     }
+    watch.record(ActivityKind::NetAllowed, request.authority());
     // One plain HTTP request per client connection. Do not tunnel later client
     // bytes, which could hide a second uninspected request after the bait scan.
     upstream.shutdown(Shutdown::Write)?;
-    copy_limited(&mut upstream, client, &total, &watch, &stop, &sockets)?;
+    copy_limited(
+        &mut upstream,
+        client,
+        &total,
+        &watch,
+        &stop,
+        &sockets,
+        connection_deadline,
+    )?;
     Ok(())
 }
 
-fn read_request(stream: &mut TcpStream) -> io::Result<(Vec<u8>, Vec<u8>)> {
+fn read_request(
+    stream: &mut TcpStream,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut received = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
     while received.len() < MAX_HEAD {
         let count = chunk.len().min(MAX_HEAD - received.len());
-        let n = stream.read(&mut chunk[..count])?;
+        let n = read_cancellable(stream, &mut chunk[..count], stop, deadline)?;
         if n == 0 {
             break;
         }
@@ -459,7 +658,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<(Vec<u8>, Vec<u8>)> {
         while body.len() < inspect_target {
             let remaining = inspect_target - body.len();
             let mut buffer = vec![0u8; remaining.min(1024)];
-            let n = stream.read(&mut buffer)?;
+            let n = read_cancellable(stream, &mut buffer, stop, deadline)?;
             if n == 0 {
                 break;
             }
@@ -478,6 +677,40 @@ fn read_request(stream: &mut TcpStream) -> io::Result<(Vec<u8>, Vec<u8>)> {
         ));
     }
     Ok((head, body))
+}
+
+fn read_cancellable(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<usize> {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "proxy is stopping",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request deadline elapsed",
+            ));
+        }
+        match stream.read(buffer) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            result => return result,
+        }
+    }
 }
 
 fn request_body_length(head: &[u8]) -> io::Result<Option<usize>> {
@@ -584,20 +817,16 @@ fn forward_http_head(head: &[u8]) -> io::Result<Vec<u8>> {
 fn tunnel(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
-    initial: &[u8],
     total: Arc<AtomicU64>,
     watch: Arc<Watch>,
     stop: Arc<AtomicBool>,
     sockets: Arc<SocketRegistry>,
+    deadline: Instant,
 ) -> io::Result<()> {
-    client.set_read_timeout(Some(IDLE_TIMEOUT))?;
-    client.set_write_timeout(Some(IDLE_TIMEOUT))?;
-    upstream.set_read_timeout(Some(IDLE_TIMEOUT))?;
-    upstream.set_write_timeout(Some(IDLE_TIMEOUT))?;
-    if !initial.is_empty() {
-        account_transfer(initial.len(), &total, &watch, &stop, &sockets)?;
-        upstream.write_all(initial)?;
-    }
+    client.set_read_timeout(Some(IO_POLL))?;
+    client.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    upstream.set_read_timeout(Some(IO_POLL))?;
+    upstream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut client_read = client.try_clone()?;
     let mut upstream_write = upstream.try_clone()?;
     let thread_total = Arc::clone(&total);
@@ -612,9 +841,10 @@ fn tunnel(
             &thread_watch,
             &thread_stop,
             &thread_sockets,
+            deadline,
         )
     });
-    let download = copy_limited(upstream, client, &total, &watch, &stop, &sockets);
+    let download = copy_limited(upstream, client, &total, &watch, &stop, &sockets, deadline);
     let _ = client.shutdown(Shutdown::Write);
     let upload = upload.join().unwrap_or_else(|_| {
         Err(io::Error::new(
@@ -632,11 +862,20 @@ fn copy_limited(
     watch: &Watch,
     stop: &AtomicBool,
     sockets: &SocketRegistry,
+    deadline: Instant,
 ) -> io::Result<()> {
     let mut buffer = [0u8; IO_CHUNK];
+    let mut idle_deadline = Instant::now() + IDLE_TIMEOUT;
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline || now >= idle_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tunnel lifetime elapsed",
+            ));
         }
         let n = match reader.read(&mut buffer) {
             Ok(0) => {
@@ -645,10 +884,19 @@ fn copy_limited(
             }
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
             Err(error) => return Err(error),
         };
+        idle_deadline = Instant::now() + IDLE_TIMEOUT;
         account_transfer(n, total, watch, stop, sockets)?;
-        writer.write_all(&buffer[..n])?;
+        sockets.write_if_open(writer, &buffer[..n])?;
     }
 }
 
@@ -661,9 +909,9 @@ fn account_transfer(
 ) -> io::Result<()> {
     let after = total.fetch_add(n as u64, Ordering::SeqCst) + n as u64;
     if after > MAX_TUNNEL_BYTES {
+        sockets.shutdown_all();
         watch.trip(ActivityKind::Limit, "egress proxy transfer limit exceeded");
         stop.store(true, Ordering::SeqCst);
-        sockets.shutdown_all();
         return Err(io::Error::new(
             io::ErrorKind::Other,
             "proxy transfer limit exceeded",
@@ -696,13 +944,14 @@ fn start_fixture(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Condvar;
 
     fn proxy_to_fixture(
         upstream: SocketAddr,
         watch: Arc<Watch>,
         bait: Option<Arc<BaitSet>>,
     ) -> Egress {
-        let resolve: Arc<Resolver> = Arc::new(|_host, port| {
+        let resolve: Arc<Resolver> = Arc::new(|_host, port, _deadline, _stop| {
             Some(vec![SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(104, 16, 0, 35)),
                 port,
@@ -813,7 +1062,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let watch = Arc::new(Watch::default());
-        let resolve: Arc<Resolver> = Arc::new(move |_host, _port| {
+        let resolve: Arc<Resolver> = Arc::new(move |_host, _port, _deadline, _stop| {
             Some(vec![
                 "104.16.0.35:443".parse().unwrap(),
                 "127.0.0.1:443".parse().unwrap(),
@@ -884,7 +1133,7 @@ mod tests {
         let bait = Arc::new(BaitSet::generate().unwrap());
         let value = bait.env[1].1.clone();
         let watch = Arc::new(Watch::default());
-        let resolve: Arc<Resolver> = Arc::new(|_host, port| {
+        let resolve: Arc<Resolver> = Arc::new(|_host, port, _deadline, _stop| {
             Some(vec![SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(104, 16, 0, 35)),
                 port,
@@ -911,5 +1160,124 @@ mod tests {
         let events = watch.take_report().events;
         assert_eq!(events[0].kind, ActivityKind::Bait);
         assert!(!events[0].detail.contains(&value));
+    }
+
+    #[test]
+    fn bait_trip_cancels_a_resolver_before_upstream_connect() {
+        let bait = Arc::new(BaitSet::generate().unwrap());
+        let bait_host = bait.env[1].1.clone();
+        let watch = Arc::new(Watch::default());
+        let resolver_state = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let resolver_state_worker = Arc::clone(&resolver_state);
+        let resolve: Arc<Resolver> = Arc::new(move |_host, port, _deadline, stop| {
+            let (gate, changed) = &*resolver_state_worker;
+            let mut state = gate.lock().unwrap();
+            state.0 = true;
+            changed.notify_all();
+            while !state.1 && !stop.load(Ordering::SeqCst) {
+                state = changed.wait(state).unwrap();
+            }
+            Some(vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(104, 16, 0, 35)),
+                port,
+            )])
+        });
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connects_for_connector = Arc::clone(&connects);
+        let connector: Arc<Connector> = Arc::new(move |_address, _timeout| {
+            connects_for_connector.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "fixture"))
+        });
+        let proxy = start_fixture(Arc::clone(&watch), Some(bait), resolve, connector).unwrap();
+
+        let mut slow = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port())).unwrap();
+        slow.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(slow, "CONNECT slow.invalid:443 HTTP/1.1\r\n\r\n").unwrap();
+        {
+            let (gate, changed) = &*resolver_state;
+            let mut state = gate.lock().unwrap();
+            while !state.0 {
+                state = changed.wait(state).unwrap();
+            }
+        }
+
+        let mut bait_client = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port())).unwrap();
+        bait_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(bait_client, "CONNECT {bait_host}:443 HTTP/1.1\r\n\r\n").unwrap();
+        let mut reply = Vec::new();
+        bait_client.read_to_end(&mut reply).unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 403 Forbidden\r\n"));
+
+        let (gate, changed) = &*resolver_state;
+        gate.lock().unwrap().1 = true;
+        changed.notify_all();
+        let mut canceled_reply = Vec::new();
+        let _ = slow.read_to_end(&mut canceled_reply);
+        assert_eq!(connects.load(Ordering::SeqCst), 0);
+        drop(proxy);
+    }
+
+    #[test]
+    fn dropping_proxy_cancels_a_slow_client_with_bounded_join() {
+        let watch = Arc::new(Watch::default());
+        let resolver: Arc<Resolver> = Arc::new(|_host, port, _deadline, _stop| {
+            Some(vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(104, 16, 0, 35)),
+                port,
+            )])
+        });
+        let connector: Arc<Connector> =
+            Arc::new(|_, _| Err(io::Error::new(io::ErrorKind::ConnectionRefused, "unused")));
+        let proxy = start_fixture(watch, None, resolver, connector).unwrap();
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port())).unwrap();
+        client.write_all(b"C").unwrap();
+        let accepted_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let accepted = proxy
+                .sockets
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .sockets
+                .len();
+            if accepted > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < accepted_deadline,
+                "client was not accepted"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        drop(proxy);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = client.shutdown(Shutdown::Both);
+    }
+
+    #[test]
+    fn request_deadline_is_monotonic_across_trickled_fragments() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..8 {
+                let _ = stream.write_all(b"A");
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.set_read_timeout(Some(IO_POLL)).unwrap();
+        let started = Instant::now();
+        let result = read_request(
+            &mut client,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_millis(150),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(400));
+        sender.join().unwrap();
     }
 }

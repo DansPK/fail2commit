@@ -50,11 +50,20 @@ impl Request {
     /// Parse CONNECT authority or an absolute HTTP URI. Origin-form requests do
     /// not identify a destination and are refused by both transports.
     pub(crate) fn parse(head: &[u8]) -> Option<Self> {
-        let text = String::from_utf8_lossy(head);
-        let line = text.lines().next()?;
+        let text = std::str::from_utf8(head).ok()?;
+        let line = text.split("\r\n").next()?;
         let mut parts = line.split(' ');
-        let method = parts.next()?.to_string();
+        let method = parts.next()?;
         let target = parts.next()?;
+        let version = parts.next()?;
+        if parts.next().is_some()
+            || !valid_method(method)
+            || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+            || target.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
+        {
+            return None;
+        }
+        let method = method.to_owned();
         let (host, port) = if method.eq_ignore_ascii_case("CONNECT") {
             split_authority(target, 443)?
         } else {
@@ -82,16 +91,46 @@ impl Request {
 fn split_authority(value: &str, default_port: u16) -> Option<(String, u16)> {
     if let Some(rest) = value.strip_prefix('[') {
         let (host, tail) = rest.split_once(']')?;
-        let port = match tail.strip_prefix(':') {
-            Some(port) => port.parse().ok()?,
-            None => default_port,
+        let host = host.parse::<std::net::Ipv6Addr>().ok()?.to_string();
+        let port = match tail {
+            "" => default_port,
+            tail if tail.starts_with(':') && !tail[1..].contains(':') => tail[1..].parse().ok()?,
+            _ => return None,
         };
         return Some((host.to_owned(), port));
     }
-    match value.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => Some((host.to_owned(), port.parse().ok()?)),
-        _ => Some((value.to_owned(), default_port)),
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => (host, port.parse().ok()?),
+        Some(_) => return None,
+        None => (value, default_port),
+    };
+    if !valid_host(host) {
+        return None;
     }
+    Some((host.to_owned(), port))
+}
+
+fn valid_method(method: &str) -> bool {
+    !method.is_empty()
+        && method
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 pub(crate) fn all_public(addrs: &[SocketAddr]) -> bool {
@@ -144,6 +183,17 @@ mod tests {
         let v6 = Request::parse(b"CONNECT [2001:4860:4860::8888]:443 HTTP/1.1\r\n\r\n")
             .expect("IPv6 CONNECT request");
         assert_eq!(v6.authority(), "[2001:4860:4860::8888]:443");
+        for malformed in [
+            b"CONNECT [::1]trailing HTTP/1.1\r\n\r\n".as_slice(),
+            b"CONNECT [::1]:443junk HTTP/1.1\r\n\r\n",
+            b"CONNECT [not-ipv6]:443 HTTP/1.1\r\n\r\n",
+            b"CONNECT host:443 extra HTTP/1.1\r\n\r\n",
+            b"CONNECT host:443 HTTP/1.2\r\n\r\n",
+            b"CONNECT user@host:443 HTTP/1.1\r\n\r\n",
+            b"GET http://host/path  HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(Request::parse(malformed).is_none(), "{malformed:?}");
+        }
 
         let socket = |address: &str| address.parse::<SocketAddr>().unwrap();
         assert!(all_public(&[socket("104.16.0.35:443")]));
