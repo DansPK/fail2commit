@@ -1424,15 +1424,20 @@ fn clear_stale_profiles(stage_root: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-struct ValidatedPaths {
-    program: PathBuf,
-    cwd: PathBuf,
-    read_only: Vec<PathBuf>,
-    work_dir: PathBuf,
+pub(crate) struct ValidatedPaths {
+    pub(crate) program: PathBuf,
+    pub(crate) cwd: PathBuf,
+    pub(crate) read_only: Vec<PathBuf>,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) identities: Vec<(PathBuf, (u32, u32, u32))>,
+}
+
+pub(crate) struct VmPathPins {
+    _objects: Vec<ffi::StagedObject>,
 }
 
 impl ValidatedPaths {
-    fn new(job: &JobSpec, stage_root: &Path) -> crate::Result<Self> {
+    pub(crate) fn new(job: &JobSpec, stage_root: &Path) -> crate::Result<Self> {
         let work_dir = canonical_dir(&job.work_dir, "work_dir")?;
         let cwd = canonical_dir(&job.cwd, "cwd")?;
         let program = canonical_file(&job.program, "program")?;
@@ -1495,13 +1500,52 @@ impl ValidatedPaths {
         // Nothing is granted until every staged object has been inspected
         // through its own handle: no reparse points, no multi-link files, and no
         // final path outside the stage root (S7B-001).
-        walk_stage(&stage, stage_root, |_| Ok(()))?;
+        let mut identities = Vec::new();
+        let anchor = ffi::StagedObject::open(stage_root)?;
+        require_plain(&anchor, stage_root)?;
+        identities.push((stage_root.to_path_buf(), anchor.identity()));
+        walk_stage(&stage, stage_root, |object| {
+            identities.push((object.path().to_path_buf(), object.identity()));
+            Ok(())
+        })?;
+        identities.sort_by(|left, right| {
+            left.0
+                .to_string_lossy()
+                .to_lowercase()
+                .cmp(&right.0.to_string_lossy().to_lowercase())
+        });
         Ok(Self {
             program,
             cwd,
             read_only,
             work_dir,
+            identities,
         })
+    }
+
+    /// Pin the common stage anchor, writable mount directory, and every object
+    /// under read-only input roots. This blocks replacement while WSB maps them.
+    pub(crate) fn pin_vm_mounts(&self, stage_root: &Path) -> crate::Result<VmPathPins> {
+        let expected: std::collections::HashMap<_, _> = self.identities.iter().cloned().collect();
+        let mut held = Vec::new();
+        let mut pin_one = |path: &Path| -> crate::Result<()> {
+            let pin = ffi::StagedObject::open_vm_pin(path)?;
+            require_plain(&pin, stage_root)?;
+            if expected.get(path) != Some(&pin.identity()) {
+                return Err(crate::Error::integrity(format!(
+                    "staged object identity changed before VM mapping: {}",
+                    path.display()
+                )));
+            }
+            held.push(pin);
+            Ok(())
+        };
+        pin_one(stage_root)?;
+        pin_one(&self.work_dir)?;
+        for root in &self.read_only {
+            walk_stage(root, stage_root, |object| pin_one(object.path()))?;
+        }
+        Ok(VmPathPins { _objects: held })
     }
 }
 fn canonical_existing(path: &Path, label: &str) -> crate::Result<PathBuf> {
@@ -1574,7 +1618,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
 /// anything that is not really below it. `FAIL2COMMIT_HOME` relocates the whole
 /// trusted directory set, which is the documented mechanism for disposable test
 /// homes (`crate::paths`), and is honoured here for the same reason.
-fn stage_root() -> crate::Result<PathBuf> {
+pub(crate) fn stage_root() -> crate::Result<PathBuf> {
     let paths = TrustedPaths::resolve().map_err(|error| {
         crate::Error::isolation_unavailable(format!(
             "the trusted per-user state directory is unavailable: {}",
