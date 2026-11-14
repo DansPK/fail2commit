@@ -109,10 +109,12 @@ named → §1 fallback. No VM is started by the probe.
 ```text
 qemu-system-x86_64 -M microvm -kernel <recorded> -initrd <prepared>
   -append "console=ttyS0 quiet" -m <memory+headroom> -smp 2 -no-reboot -nographic
-  -virtfs local,path=<jobdir>,mount_tag=f2cjob,security_model=passthrough
-  -virtfs local,path=/usr,mount_tag=f2cusr,security_model=none,readonly=on  (+ /lib* as needed)
+  -fsdev local,id=job,path=<jobdir>,security_model=passthrough
+  -device virtio-9p-device,fsdev=job,mount_tag=f2cjob
+  -fsdev local,id=usr,path=/usr,security_model=none,readonly=on
+  -device virtio-9p-device,fsdev=usr,mount_tag=f2cusr  (+ /lib* as needed)
   -netdev user,id=n,restrict=<on for none | off for internet>
-  -device virtio-net-pci,netdev=n
+  -device virtio-net-device,netdev=n
 ```
 
 - Guest init: mount the 9p shares, run `fail2commit sandbox launch
@@ -124,6 +126,14 @@ qemu-system-x86_64 -M microvm -kernel <recorded> -initrd <prepared>
 - Host waits for `outcome.json` + qemu exit; kills qemu on timeout. The VM is
   a process: gone means no qemu process and no VM disk (there is none —
   initramfs + shares only).
+
+CR-025 (2026-11-14): microvm has no PCI bus, so shares and network use
+explicit virtio MMIO devices; `-virtfs` is a PCI shorthand and is not used.
+Preparation/probe must verify QEMU device support, guest `virtio_mmio`,
+`virtio_net`, `9p` and `9pnet_virtio` support (built in or included modules),
+and the microvm device-count limit. Missing or incompatible prepared support
+is unavailable, not a successful probe. Sources: [microvm](https://www.qemu.org/docs/master/system/i386/microvm.html)
+and [invocation](https://www.qemu.org/docs/master/system/invocation.html).
 
 ### 4.3 Probe (cached)
 
