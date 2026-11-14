@@ -11,6 +11,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 const MAX_ACL_OUTPUT: usize = 128 * 1024;
 const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
@@ -23,6 +27,19 @@ struct Journal {
     uid: u32,
     scope_unit: Option<String>,
     records: Vec<JournalRecord>,
+    #[serde(default)]
+    cleanup_roots: Vec<CleanupRoot>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupRoot {
+    path: String,
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    parent_dev: u64,
+    parent_ino: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -47,22 +64,94 @@ pub(crate) struct GrantGuard {
     targets: Vec<Target>,
     uid: u32,
     scope_unit: Option<String>,
+    retain_temporary_roots: Arc<AtomicBool>,
     active: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PeerIdentity {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+}
+
+pub(crate) type RetentionLatch = Arc<AtomicBool>;
+
+pub(crate) struct RetainedTempDir {
+    temp: Option<tempfile::TempDir>,
+    latch: RetentionLatch,
+}
+
+impl RetainedTempDir {
+    pub(crate) fn new(temp: tempfile::TempDir, latch: RetentionLatch) -> Self {
+        Self {
+            temp: Some(temp),
+            latch,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.temp.as_ref().expect("tempdir is present").path()
+    }
+}
+
+impl Drop for RetainedTempDir {
+    fn drop(&mut self) {
+        if self.latch.load(Ordering::Acquire) {
+            if let Some(temp) = self.temp.take() {
+                // Keeping a root-owned, randomly named recovery target is safer
+                // than leaving a journal that can never restore its ACLs.
+                let _ = temp.keep();
+            }
+        }
+    }
 }
 
 impl GrantGuard {
     pub(crate) fn apply(
         job: &JobSpec,
+        client: &std::os::unix::net::UnixStream,
         peer_uid: u32,
         sandbox_uid: u32,
         extra: &[(PathBuf, &'static str)],
         journal_dir: &Path,
         scope_unit: Option<&str>,
+        retain_temporary_roots: Arc<AtomicBool>,
+        trusted_probe_root: Option<&Path>,
     ) -> crate::Result<Self> {
+        let peer = peer_identity(client)?;
+        if peer.uid != peer_uid {
+            return Err(crate::Error::integrity(
+                "ACL peer credentials changed after service authentication",
+            ));
+        }
+        Self::apply_as_peer(
+            job,
+            &peer,
+            sandbox_uid,
+            extra,
+            journal_dir,
+            scope_unit,
+            retain_temporary_roots,
+            trusted_probe_root,
+        )
+    }
+
+    fn apply_as_peer(
+        job: &JobSpec,
+        peer: &PeerIdentity,
+        sandbox_uid: u32,
+        extra: &[(PathBuf, &'static str)],
+        journal_dir: &Path,
+        scope_unit: Option<&str>,
+        retain_temporary_roots: Arc<AtomicBool>,
+        trusted_probe_root: Option<&Path>,
+    ) -> crate::Result<Self> {
+        let peer_uid = peer.uid;
         let getfacl = trusted_tool("getfacl")?;
         let setfacl = trusted_tool("setfacl")?;
         verify_journal_dir(journal_dir)?;
-        let requests = collect_requests(job, peer_uid, sandbox_uid, extra)?;
+        let requests = collect_requests(job, peer, sandbox_uid, extra, trusted_probe_root)?;
         if requests.len() > MAX_TARGETS {
             return Err(crate::Error::isolation_unavailable(
                 "hardened ACL target count exceeds the safety limit",
@@ -132,11 +221,13 @@ impl GrantGuard {
             .map_err(|_| crate::Error::internal("cannot generate ACL journal identity"))?;
         let journal_path = journal_dir.join(format!("grant-{}.json", hex::encode(random)));
         random.fill(0);
+        let cleanup_roots = cleanup_roots_from_targets(&targets, journal_dir, peer_uid)?;
         let journal = Journal {
-            version: 1,
+            version: 2,
             uid: peer_uid,
             scope_unit: scope_unit.map(str::to_owned),
             records,
+            cleanup_roots,
         };
         write_journal(&journal_path, &journal)?;
 
@@ -145,6 +236,7 @@ impl GrantGuard {
             targets,
             uid: peer_uid,
             scope_unit: scope_unit.map(str::to_owned),
+            retain_temporary_roots,
             active: true,
         };
         for target in &guard.targets {
@@ -185,6 +277,7 @@ impl GrantGuard {
     /// Keep the root-owned journal for service-start recovery when a launcher
     /// or system scope could not be proven stopped.
     pub(crate) fn defer_recovery(&mut self) {
+        self.retain_temporary_roots.store(true, Ordering::Release);
         self.active = false;
     }
 }
@@ -194,7 +287,212 @@ impl Drop for GrantGuard {
         // Restoration is allowed only after the caller proves that the job's
         // system scope is inactive. Any implicit drop keeps the journal so
         // the next service start can kill the recorded scope before recovery.
+        if self.active {
+            self.retain_temporary_roots.store(true, Ordering::Release);
+        }
     }
+}
+
+fn cleanup_roots_from_targets(
+    targets: &[Target],
+    journal_dir: &Path,
+    peer_uid: u32,
+) -> crate::Result<Vec<CleanupRoot>> {
+    use std::os::unix::fs::MetadataExt;
+    let jobs = Path::new("/run/fail2commit-hardened/jobs");
+    let probe_stages = journal_dir.join("probe-stages");
+    let mut roots = BTreeMap::<PathBuf, CleanupRoot>::new();
+    for target in targets {
+        let path = &target.path;
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let known_temp = (parent == jobs && name.starts_with("job-"))
+            || (parent == probe_stages && name.starts_with("probe-"));
+        if !known_temp || !target.file.metadata()?.is_dir() {
+            continue;
+        }
+        let parent_meta = fs::symlink_metadata(parent)?;
+        if !parent_meta.is_dir()
+            || parent_meta.file_type().is_symlink()
+            || parent_meta.uid() != 0
+            || parent_meta.mode() & 0o777 != 0o700
+        {
+            return Err(crate::Error::integrity(
+                "hardened temporary target parent is not a private root-owned directory",
+            ));
+        }
+        let meta = target.file.metadata()?;
+        if meta.uid() != 0 && meta.uid() != peer_uid {
+            return Err(crate::Error::integrity(
+                "hardened temporary root has an unexpected owner",
+            ));
+        }
+        roots.insert(
+            path.clone(),
+            CleanupRoot {
+                path: path.to_string_lossy().into_owned(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                uid: meta.uid(),
+                parent_dev: parent_meta.dev(),
+                parent_ino: parent_meta.ino(),
+            },
+        );
+    }
+    Ok(roots.into_values().collect())
+}
+
+fn legacy_cleanup_roots_from_records(
+    records: &[JournalRecord],
+    journal_dir: &Path,
+) -> crate::Result<Vec<CleanupRoot>> {
+    use std::os::unix::fs::MetadataExt;
+    let jobs = Path::new("/run/fail2commit-hardened/jobs");
+    let probe_stages = journal_dir.join("probe-stages");
+    let mut roots = BTreeMap::<PathBuf, CleanupRoot>::new();
+    for record in records {
+        let path = PathBuf::from(&record.path);
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if !((parent == jobs && name.starts_with("job-"))
+            || (parent == probe_stages && name.starts_with("probe-")))
+        {
+            continue;
+        }
+        let (parent_dev, parent_ino) = match fs::symlink_metadata(parent) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, 0),
+            Err(error) => return Err(error.into()),
+            Ok(meta)
+                if meta.is_dir()
+                    && !meta.file_type().is_symlink()
+                    && meta.uid() == 0
+                    && meta.mode() & 0o777 == 0o700 =>
+            {
+                (meta.dev(), meta.ino())
+            }
+            Ok(_) => {
+                return Err(crate::Error::integrity(
+                    "legacy cleanup target parent is not a private root-owned directory",
+                ))
+            }
+        };
+        roots.insert(
+            path.clone(),
+            CleanupRoot {
+                path: path.to_string_lossy().into_owned(),
+                dev: record.dev,
+                ino: record.ino,
+                uid: record.uid,
+                parent_dev,
+                parent_ino,
+            },
+        );
+    }
+    Ok(roots.into_values().collect())
+}
+
+fn validate_cleanup_root(
+    root: &CleanupRoot,
+    journal_dir: &Path,
+    test_parent: Option<&Path>,
+) -> crate::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let path = Path::new(&root.path);
+    let Some(parent) = path.parent() else {
+        return Err(crate::Error::integrity("cleanup root has no parent"));
+    };
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let jobs = Path::new("/run/fail2commit-hardened/jobs");
+    let probe_stages = journal_dir.join("probe-stages");
+    let managed_parent = (parent == jobs && name.starts_with("job-"))
+        || (parent == probe_stages && name.starts_with("probe-"));
+    let test_parent_match =
+        test_parent.is_some_and(|test_parent| parent == test_parent) && name.starts_with("probe-");
+    if !managed_parent && !test_parent_match {
+        return Err(crate::Error::integrity(
+            "cleanup journal names a path outside the managed temporary roots",
+        ));
+    }
+    let parent_meta = match fs::symlink_metadata(parent) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+        Ok(meta) => meta,
+    };
+    if !parent_meta.is_dir()
+        || parent_meta.file_type().is_symlink()
+        || (parent_meta.uid() != 0 && !test_parent_match)
+        || parent_meta.mode() & 0o777 != 0o700
+        || (root.parent_dev != 0 && parent_meta.dev() != root.parent_dev)
+        || (root.parent_ino != 0 && parent_meta.ino() != root.parent_ino)
+    {
+        return Err(crate::Error::integrity(
+            "cleanup root parent identity changed",
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+        Ok(meta)
+            if meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && meta.dev() == root.dev
+                && meta.ino() == root.ino
+                && meta.uid() == root.uid
+                && meta.mode() & 0o077 == 0 =>
+        {
+            Ok(true)
+        }
+        Ok(meta) => Err(crate::Error::integrity(format!(
+            "cleanup temporary root identity changed (dev {}->{}, ino {}->{}, uid {}->{}, mode {:o})",
+            root.dev,
+            meta.dev(),
+            root.ino,
+            meta.ino(),
+            root.uid,
+            meta.uid(),
+            meta.mode() & 0o777
+        ))),
+    }
+}
+
+fn cleanup_recovered_roots(
+    roots: &[(CleanupRoot, bool)],
+    journal_dir: &Path,
+    test_parent: Option<&Path>,
+) -> crate::Result<()> {
+    for (root, existed) in roots {
+        if !existed {
+            continue;
+        }
+        if !validate_cleanup_root(root, journal_dir, test_parent)? {
+            continue;
+        }
+        fs::remove_dir_all(&root.path)?;
+    }
+    Ok(())
+}
+
+fn complete_recovery(
+    restore: impl FnOnce() -> crate::Result<()>,
+    cleanup: impl FnOnce() -> crate::Result<()>,
+    remove_journal: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<()> {
+    restore()?;
+    cleanup()?;
+    remove_journal()
 }
 
 pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
@@ -241,24 +539,78 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
         let bytes = fs::read(&path)?;
         let journal: Journal = serde_json::from_slice(&bytes)
             .map_err(|_| crate::Error::integrity("hardened ACL recovery journal is malformed"))?;
-        if journal.version != 1 || journal.uid == 0 || journal.records.len() > MAX_TARGETS {
+        if !matches!(journal.version, 1 | 2)
+            || journal.uid == 0
+            || journal.records.len() > MAX_TARGETS
+            || journal.cleanup_roots.len() > 2
+            || (journal.version == 1 && !journal.cleanup_roots.is_empty())
+        {
             return Err(crate::Error::integrity(
                 "hardened ACL recovery journal identity is invalid",
             ));
         }
         ensure_scope_inactive(journal.scope_unit.as_deref())?;
+        let cleanup_root_specs = if journal.version == 1 && journal.cleanup_roots.is_empty() {
+            legacy_cleanup_roots_from_records(&journal.records, journal_dir)?
+        } else {
+            journal.cleanup_roots.clone()
+        };
+        if cleanup_root_specs.len() > 2
+            || cleanup_root_specs
+                .iter()
+                .any(|root| root.uid != 0 && root.uid != journal.uid)
+        {
+            return Err(crate::Error::integrity(
+                "cleanup journal contains an unexpected temporary root identity",
+            ));
+        }
+        let cleanup_roots = cleanup_root_specs
+            .into_iter()
+            .map(|root| {
+                if !journal.records.iter().any(|record| {
+                    record.path == root.path
+                        && record.dev == root.dev
+                        && record.ino == root.ino
+                        && record.uid == root.uid
+                }) {
+                    return Err(crate::Error::integrity(
+                        "cleanup root is not bound to an exact ACL journal target",
+                    ));
+                }
+                let exists = validate_cleanup_root(&root, journal_dir, None)?;
+                Ok((root, exists))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
         let mut targets = Vec::with_capacity(journal.records.len());
-        for record in journal.records {
+        for record in &journal.records {
+            let target_path = Path::new(&record.path);
+            let is_managed_temp_target = cleanup_roots.iter().any(|(root, _)| {
+                target_path == Path::new(&root.path) || target_path.starts_with(&root.path)
+            });
+            match fs::symlink_metadata(target_path) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && is_managed_temp_target =>
+                {
+                    // A previous cleanup may have removed part of this exact
+                    // recorded disposable tree, or /run may have reset at boot.
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) => {}
+            }
             let file = open_recovery_target(&record, journal.uid)?;
             targets.push(Target {
                 path: PathBuf::from(&record.path),
                 file,
-                record,
+                record: record.clone(),
                 permissions: String::new(),
             });
         }
-        restore_targets(&setfacl, journal.uid, &targets)?;
-        remove_journal(&path)?;
+        complete_recovery(
+            || restore_targets(&setfacl, journal.uid, &targets),
+            || cleanup_recovered_roots(&cleanup_roots, journal_dir, None),
+            || remove_journal(&path),
+        )?;
     }
     sweep_probe_stages(journal_dir)?;
     Ok(())
@@ -457,6 +809,7 @@ pub(crate) fn mark_probe_scope(
         uid,
         scope_unit: Some(scope_unit.to_owned()),
         records: Vec::new(),
+        cleanup_roots: Vec::new(),
     };
     write_journal(&path, &marker)?;
     Ok(path)
@@ -486,32 +839,39 @@ pub(crate) fn clear_probe_scope_marker(path: &Path, scope_unit: &str) -> crate::
 
 fn collect_requests(
     job: &JobSpec,
-    peer_uid: u32,
+    peer: &PeerIdentity,
     sandbox_uid: u32,
     extra: &[(PathBuf, &'static str)],
+    trusted_probe_root: Option<&Path>,
 ) -> crate::Result<BTreeMap<PathBuf, String>> {
     let mut requests = BTreeMap::<PathBuf, String>::new();
     let mut roots = Vec::new();
+    let shell = trusted_tool("sh")?;
     for path in &job.read_only {
-        let canonical = canonical_job_dir(path, peer_uid)?;
+        verify_peer_traversal(&shell, peer, path, true, trusted_probe_root)?;
+        let canonical = canonical_job_dir(path, peer.uid)?;
+        verify_peer_traversal(&shell, peer, &canonical, true, trusted_probe_root)?;
         roots.push(canonical.clone());
         collect_tree(
             &canonical,
             "r-x",
-            peer_uid,
+            peer.uid,
             &mut requests,
             &mut BTreeSet::new(),
         )?;
     }
-    let work = canonical_job_dir(&job.work_dir, peer_uid)?;
+    verify_peer_traversal(&shell, peer, &job.work_dir, true, trusted_probe_root)?;
+    let work = canonical_job_dir(&job.work_dir, peer.uid)?;
+    verify_peer_traversal(&shell, peer, &work, true, trusted_probe_root)?;
     roots.push(work.clone());
-    collect_tree(&work, "rwX", peer_uid, &mut requests, &mut BTreeSet::new())?;
+    collect_tree(&work, "rwX", peer.uid, &mut requests, &mut BTreeSet::new())?;
     let cwd = job.cwd.canonicalize()?;
     if !cwd.starts_with(&work) {
         return Err(crate::Error::rejected(
             "hardened Linux cwd is outside its granted work directory",
         ));
     }
+    verify_peer_traversal(&shell, peer, &job.cwd, true, trusted_probe_root)?;
     for root in &roots {
         let mut parent = root.parent();
         while let Some(path) = parent {
@@ -545,9 +905,171 @@ fn collect_requests(
         merge_permission(&mut requests, canonical, permissions);
     }
     for path in requests.keys() {
-        let _ = open_acl_target(path, peer_uid)?;
+        let _ = open_acl_target(path, peer.uid)?;
     }
     Ok(requests)
+}
+
+fn verify_peer_traversal(
+    shell: &Path,
+    peer: &PeerIdentity,
+    path: &Path,
+    require_leaf_read: bool,
+    trusted_probe_root: Option<&Path>,
+) -> crate::Result<()> {
+    if !path.is_absolute() {
+        return Err(crate::Error::rejected(
+            "caller-selected ACL path must be absolute",
+        ));
+    }
+    if trusted_probe_root.is_some_and(|root| !path.starts_with(root)) {
+        return Err(crate::Error::integrity(
+            "trusted probe path escaped its fixed service-owned staging root",
+        ));
+    }
+    let mut ancestors: Vec<_> = path.ancestors().collect();
+    ancestors.reverse();
+    for (index, ancestor) in ancestors.iter().enumerate() {
+        if *ancestor == Path::new("") {
+            continue;
+        }
+        if trusted_probe_root.is_some_and(|root| root.starts_with(ancestor)) {
+            // Fixed probe staging ancestors are service-owned; peer traversal
+            // applies only below the trusted service root. Snapshot ancestors
+            // use the separate service-only `extra` list above.
+            continue;
+        }
+        let require_read = require_leaf_read && index + 1 == ancestors.len();
+        let mut command = Command::new(shell);
+        command
+            .args(["-c", "test -x \"$1\"", "f2c-peer-check"])
+            .arg(ancestor);
+        set_command_peer_identity(&mut command, peer);
+        if !command.status()?.success() {
+            return Err(crate::Error::rejected(format!(
+                "authenticated caller cannot traverse requested path ancestor {}",
+                ancestor.display()
+            )));
+        }
+        if require_read {
+            let mut command = Command::new(shell);
+            command
+                .args(["-c", "test -r \"$1\"", "f2c-peer-check"])
+                .arg(ancestor);
+            set_command_peer_identity(&mut command, peer);
+            if !command.status()?.success() {
+                return Err(crate::Error::rejected(format!(
+                    "authenticated caller cannot read requested stage root {}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn set_command_peer_identity(command: &mut Command, peer: &PeerIdentity) {
+    use std::os::unix::process::CommandExt;
+    if current_process_matches_peer(peer) {
+        return;
+    }
+    let uid = peer.uid as libc::uid_t;
+    let gid = peer.gid as libc::gid_t;
+    let groups: Vec<libc::gid_t> = peer.groups.iter().map(|gid| *gid as libc::gid_t).collect();
+    // SAFETY: the pre-exec closure performs only credential syscalls and uses
+    // a captured immutable group vector; the child then execs the trusted shell.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setresgid(gid, gid, gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setresuid(uid, uid, uid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[allow(unsafe_code)]
+fn current_process_matches_peer(peer: &PeerIdentity) -> bool {
+    // SAFETY: these calls only read this process's credentials and group list.
+    if unsafe { libc::getuid() } != peer.uid
+        || unsafe { libc::geteuid() } != peer.uid
+        || unsafe { libc::getgid() } != peer.gid
+        || unsafe { libc::getegid() } != peer.gid
+    {
+        return false;
+    }
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return false;
+    }
+    let mut current = vec![0 as libc::gid_t; count as usize];
+    if unsafe { libc::getgroups(count, current.as_mut_ptr()) } < 0 {
+        return false;
+    }
+    let mut peer_groups = peer.groups.clone();
+    current.sort_unstable();
+    peer_groups.sort_unstable();
+    current
+        .into_iter()
+        .map(|gid| gid as u32)
+        .collect::<Vec<_>>()
+        == peer_groups
+}
+
+#[allow(unsafe_code)]
+fn peer_identity(stream: &std::os::unix::net::UnixStream) -> crate::Result<PeerIdentity> {
+    use std::os::fd::AsRawFd;
+    const MAX_GROUPS: usize = 65_536;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut cred_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: cred and cred_len are writable buffers and fd is a live socket.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut cred_len,
+        )
+    } != 0
+        || cred_len as usize != std::mem::size_of::<libc::ucred>()
+    {
+        return Err(crate::Error::rejected(
+            "cannot authenticate ACL peer credentials",
+        ));
+    }
+    let mut groups = vec![0 as libc::gid_t; MAX_GROUPS];
+    let mut groups_len = std::mem::size_of_val(groups.as_slice()) as libc::socklen_t;
+    // SAFETY: groups is a fixed bounded output buffer for SO_PEERGROUPS.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERGROUPS,
+            groups.as_mut_ptr().cast(),
+            &mut groups_len,
+        )
+    } != 0
+        || groups_len as usize > std::mem::size_of_val(groups.as_slice())
+        || groups_len as usize % std::mem::size_of::<libc::gid_t>() != 0
+    {
+        return Err(crate::Error::rejected(
+            "cannot authenticate ACL peer supplementary groups",
+        ));
+    }
+    groups.truncate(groups_len as usize / std::mem::size_of::<libc::gid_t>());
+    Ok(PeerIdentity {
+        uid: cred.uid,
+        gid: cred.gid,
+        groups: groups.into_iter().map(|gid| gid as u32).collect(),
+    })
 }
 
 fn canonical_job_dir(path: &Path, peer_uid: u32) -> crate::Result<PathBuf> {
@@ -1146,6 +1668,32 @@ mod tests {
         }
     }
 
+    fn current_peer() -> PeerIdentity {
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer_identity(&client).unwrap()
+    }
+
+    #[test]
+    fn effective_peer_traversal_check_rejects_an_inaccessible_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let peer = current_peer();
+        let tree = tempfile::tempdir().unwrap();
+        let hidden = tree.path().join("inaccessible");
+        std::fs::create_dir(&hidden).unwrap();
+        let leaf = hidden.join("leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        let shell = trusted_tool("sh").unwrap();
+        verify_peer_traversal(&shell, &peer, &leaf, true, None).unwrap();
+
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root bypasses DAC by design; the privileged fixture below exercises
+        // the service-to-unprivileged-peer path on a root-enabled test host.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(verify_peer_traversal(&shell, &peer, &leaf, true, None).is_err());
+        }
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     #[test]
     fn acl_grant_widens_mask_without_widening_existing_group_or_named_user_access() {
         let baseline =
@@ -1207,9 +1755,9 @@ mod tests {
         std::fs::write(&outside_file, b"secret").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside_file, work.join("escape")).unwrap();
-        let uid = std::fs::metadata(&work).unwrap().uid();
+        let peer = current_peer();
         let spec = job(&work, &readonly);
-        assert!(collect_requests(&spec, uid, u32::MAX, &[]).is_err());
+        assert!(collect_requests(&spec, &peer, u32::MAX, &[], None).is_err());
     }
 
     #[test]
@@ -1350,15 +1898,120 @@ mod tests {
         assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 1);
     }
 
+    #[test]
+    fn retained_targets_survive_guard_drop_until_acl_recovery_and_retry() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = tempfile::tempdir().unwrap();
+        let parent = base.path().join("probe-stages");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("probe-")
+            .tempdir_in(&parent)
+            .unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = temp.path().to_path_buf();
+        std::fs::write(root.join("target"), b"still journaled").unwrap();
+        let latch = Arc::new(AtomicBool::new(false));
+        let retained = RetainedTempDir::new(temp, latch.clone());
+        let guard = GrantGuard {
+            journal_path: base.path().join("grant-test.json"),
+            targets: Vec::new(),
+            uid: unsafe { libc::getuid() },
+            scope_unit: None,
+            retain_temporary_roots: latch.clone(),
+            active: true,
+        };
+        drop(guard);
+        drop(retained);
+        assert!(root.join("target").is_file());
+
+        let root_meta = std::fs::symlink_metadata(&root).unwrap();
+        let parent_meta = std::fs::symlink_metadata(&parent).unwrap();
+        let cleanup = CleanupRoot {
+            path: root.to_string_lossy().into_owned(),
+            dev: root_meta.dev(),
+            ino: root_meta.ino(),
+            uid: root_meta.uid(),
+            parent_dev: parent_meta.dev(),
+            parent_ino: parent_meta.ino(),
+        };
+        let roots = vec![(cleanup, true)];
+        let journal = base.path().join("grant-test.json");
+        std::fs::write(&journal, b"pending recovery").unwrap();
+        let first = complete_recovery(
+            || {
+                Err(crate::Error::isolation_unavailable(
+                    "injected ACL restore failure",
+                ))
+            },
+            || cleanup_recovered_roots(&roots, base.path(), Some(&parent)),
+            || {
+                std::fs::remove_file(&journal)?;
+                Ok(())
+            },
+        );
+        assert!(first.is_err());
+        assert!(root.join("target").is_file());
+        assert!(journal.is_file());
+
+        complete_recovery(
+            || {
+                assert!(root.join("target").is_file());
+                Ok(())
+            },
+            || cleanup_recovered_roots(&roots, base.path(), Some(&parent)),
+            || {
+                std::fs::remove_file(&journal)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!root.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn v1_journals_reconstruct_only_fixed_temporary_root_paths() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let root = Path::new("/run/fail2commit-hardened/jobs")
+            .join(format!("job-{}", hex::encode(random)));
+        // SAFETY: getuid only reads the test process's real UID.
+        let uid = unsafe { libc::getuid() };
+        let record = JournalRecord {
+            path: root.to_string_lossy().into_owned(),
+            dev: 31,
+            ino: 47,
+            uid,
+            acl: "# file: snapshot\nuser::rwx\ngroup::---\nmask::---\nother::---\n".into(),
+        };
+        let roots = legacy_cleanup_roots_from_records(&[record], journal_dir.path()).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].path, root.to_string_lossy().as_ref());
+        assert_eq!(roots[0].dev, 31);
+        assert_eq!(roots[0].ino, 47);
+        assert_eq!(
+            roots[0].uid, uid,
+            "legacy cleanup identity comes from the journaled root object"
+        );
+        assert!(!validate_cleanup_root(&roots[0], journal_dir.path(), None).unwrap());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires root to create a peer-owned tree containing a root-owned fixture"]
-    fn grant_guard_rejects_inaccessible_root_owned_file_without_acl_or_journal_changes() {
+    #[ignore = "requires root to create a peer-owned stage behind a root-only ancestor"]
+    fn grant_guard_rejects_peer_owned_stage_behind_root_only_ancestor_before_acl_changes() {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
         let tree = tempfile::tempdir_in("/tmp").unwrap();
-        let work = tree.path().join("work");
-        let readonly = tree.path().join("readonly");
+        std::fs::set_permissions(tree.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hidden = tree.path().join("root-only-parent");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let work = hidden.join("work");
+        let readonly = hidden.join("readonly");
         std::fs::create_dir(&work).unwrap();
         std::fs::create_dir(&readonly).unwrap();
         let secret = readonly.join("root-only.txt");
@@ -1391,12 +2044,24 @@ mod tests {
             .output()
             .unwrap();
         assert!(before.status.success());
-        let result = GrantGuard::apply(
+        let root_acl_path = hidden.to_str().unwrap();
+        let before_parent = Command::new(&acl_tool)
+            .args(["--absolute-names", "--numeric", "--", root_acl_path])
+            .output()
+            .unwrap();
+        assert!(before_parent.status.success());
+        let result = GrantGuard::apply_as_peer(
             &job(&work, &readonly),
-            peer_uid,
+            &PeerIdentity {
+                uid: peer_uid,
+                gid: peer_uid,
+                groups: vec![peer_uid],
+            },
             u32::MAX,
             &[],
             &journal,
+            None,
+            Arc::new(AtomicBool::new(false)),
             None,
         );
         assert!(result.is_err());
@@ -1412,5 +2077,11 @@ mod tests {
             .unwrap();
         assert!(after.status.success());
         assert_eq!(before.stdout, after.stdout);
+        let after_parent = Command::new(&acl_tool)
+            .args(["--absolute-names", "--numeric", "--", root_acl_path])
+            .output()
+            .unwrap();
+        assert!(after_parent.status.success());
+        assert_eq!(before_parent.stdout, after_parent.stdout);
     }
 }

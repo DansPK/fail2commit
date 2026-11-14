@@ -1015,7 +1015,15 @@ fn serve_one(
             }
             "LAUNCH" => match req.job_dir.as_deref() {
                 Some(job_dir) => {
-                    match run_linux_service_job(job_dir, uid, sandbox, stream, false) {
+                    match run_linux_service_job(
+                        job_dir,
+                        uid,
+                        sandbox,
+                        stream,
+                        false,
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        None,
+                    ) {
                         Ok(detail) => linux_response(true, true, detail),
                         Err(error) => linux_response(false, false, error.message),
                     }
@@ -1218,9 +1226,11 @@ fn run_linux_probe_job(
 
     let acl_dir = super::lifecycle::linux_acl_journal_dir();
     let probe_root = super::linux_acl::probe_stage_dir(&acl_dir)?;
+    let retention = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let temp = tempfile::Builder::new()
         .prefix("probe-")
-        .tempdir_in(probe_root)?;
+        .tempdir_in(&probe_root)?;
+    let temp = super::linux_acl::RetainedTempDir::new(temp, retention.clone());
     let root = temp.path().canonicalize()?;
     let work = root.join("work");
     let read_only = root.join("readonly");
@@ -1318,6 +1328,8 @@ fn run_linux_probe_job(
         sandbox_uid,
         client,
         network == crate::isolation::NetworkMode::Internet,
+        retention,
+        Some(&probe_root),
     )?;
     let output = open_linux_regular(
         &root.join("outcome.json"),
@@ -1912,6 +1924,8 @@ fn run_linux_service_job(
     sandbox_uid: u32,
     client: &std::os::unix::net::UnixStream,
     allow_internet_probe: bool,
+    retention: super::linux_acl::RetentionLatch,
+    trusted_probe_root: Option<&Path>,
 ) -> crate::Result<String> {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -2015,6 +2029,8 @@ fn run_linux_service_job(
     let snapshot = tempfile::Builder::new()
         .prefix("job-")
         .tempdir_in(runtime_jobs)?;
+    std::fs::set_permissions(snapshot.path(), std::fs::Permissions::from_mode(0o700))?;
+    let snapshot = super::linux_acl::RetainedTempDir::new(snapshot, retention.clone());
     let root = snapshot.path();
     let input = root.join("input");
     let output = root.join("output");
@@ -2056,11 +2072,14 @@ fn run_linux_service_job(
     let journal_dir = super::lifecycle::linux_acl_journal_dir();
     let mut grants = super::linux_acl::GrantGuard::apply(
         &job,
+        client,
         peer_uid,
         sandbox_uid,
         &extra,
         &journal_dir,
         Some(&unit),
+        retention,
+        trusted_probe_root,
     )?;
     let setpriv = trusted_linux_tool(&["/usr/bin/setpriv", "/bin/setpriv"])?;
     let systemd_run = trusted_linux_tool(&["/usr/bin/systemd-run"])?;
