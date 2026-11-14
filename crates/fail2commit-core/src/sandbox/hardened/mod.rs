@@ -1,6 +1,8 @@
 //! Hardened-mode wire contract and backends (FR-027, SPEC-018).
 
 pub mod lifecycle;
+#[cfg(target_os = "linux")]
+mod linux_acl;
 pub mod protocol;
 pub mod service;
 #[cfg(windows)]
@@ -86,6 +88,87 @@ pub fn launch(jobfile: &std::path::Path, watchdog: Option<u64>) -> crate::Result
     launch_with_control(jobfile, watchdog, None, None, None)
 }
 
+/// Service-invoked Linux probe: run a short disposable job under the real
+/// hardened launcher and require watchdog EOF to kill its sandbox tree.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub fn run_linux_watchdog_probe(watchdog: Option<u64>) -> crate::Result<()> {
+    use crate::isolation::{JobLimits, JobSpec, JobStatus, NetworkMode};
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err(crate::Error::rejected(
+            "hardened Linux watchdog probe must run as the sandbox account",
+        ));
+    }
+    let watchdog_fd = watchdog
+        .and_then(|fd| i32::try_from(fd).ok())
+        .filter(|fd| *fd >= 0)
+        .ok_or_else(|| crate::Error::rejected("hardened Linux watchdog probe requires a fd"))?;
+    let state_dir = std::path::Path::new("/var/lib/fail2commit-hardened");
+    let state_metadata = std::fs::symlink_metadata(state_dir)?;
+    // SAFETY: geteuid has no preconditions.
+    if state_metadata.uid() != unsafe { libc::geteuid() }
+        || state_metadata.mode() & 0o077 != 0
+        || !state_metadata.is_dir()
+        || state_metadata.file_type().is_symlink()
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux watchdog probe work root is not private and sandbox-owned",
+        ));
+    }
+    let work = tempfile::Builder::new()
+        .prefix("probe-")
+        .tempdir_in(state_dir)?;
+    let job = JobSpec {
+        program: std::path::PathBuf::from("/bin/sleep"),
+        args: vec!["10".into()],
+        cwd: work.path().to_path_buf(),
+        env: Vec::new(),
+        read_only: Vec::new(),
+        work_dir: work.path().to_path_buf(),
+        exports: Vec::new(),
+        export_to: None,
+        limits: JobLimits {
+            timeout: std::time::Duration::from_secs(15),
+            memory_bytes: Some(128 * 1024 * 1024),
+            max_processes: Some(8),
+            max_output_bytes: 1024,
+            disk_bytes: Some(1024 * 1024),
+        },
+        network: NetworkMode::None,
+        bait: false,
+    };
+    let outcome = crate::sandbox::linux::run_hardened_with_ready(&job, watchdog_fd, || {
+        let mut output = std::io::stdout().lock();
+        output.write_all(b"F2C-WATCHDOG-READY\n")?;
+        output.flush()?;
+        Ok(())
+    })?;
+    let watchdog_cancelled = outcome.status == JobStatus::Killed
+        && outcome.report.events.iter().any(|event| {
+            event.kind == crate::isolation::ActivityKind::Blocked
+                && event.detail.contains("watchdog")
+        });
+    let result = serde_json::json!({
+        "watchdog_cancelled": watchdog_cancelled,
+        "status": outcome.status,
+    });
+    std::io::stdout().write_all(&serde_json::to_vec(&result).map_err(|_| {
+        crate::Error::internal("cannot encode hardened Linux watchdog probe result")
+    })?)?;
+    std::io::stdout().write_all(b"\n")?;
+    std::io::stdout().flush()?;
+    if watchdog_cancelled {
+        Ok(())
+    } else {
+        Err(crate::Error::isolation_unavailable(
+            "hardened Linux watchdog probe did not kill the sandbox process tree",
+        ))
+    }
+}
+
 pub fn launch_with_control(
     jobfile: &std::path::Path,
     watchdog: Option<u64>,
@@ -140,7 +223,20 @@ fn launch_with_control_mode(
             test_diagnostic,
         )
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        if prepare_request.is_some()
+            || prepare_ack.is_some()
+            || launch_id.is_some()
+            || test_diagnostic
+        {
+            return Err(crate::Error::rejected(
+                "Windows preparation controls are invalid for the Linux hardened launcher",
+            ));
+        }
+        service::launch_linux_hidden(jobfile, watchdog)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (
             jobfile,
@@ -286,7 +382,7 @@ struct HardenedBackend;
 impl SandboxBackend for HardenedBackend {
     fn probe(&self) -> ProbeReport {
         #[cfg(target_os = "linux")]
-        let (service, peer_auth, detail) = service::probe_linux();
+        let (service, peer_auth, platform_controls, detail) = service::probe_linux();
         #[cfg(windows)]
         let (service, peer_auth, effect_probe, detail) = service::probe_windows();
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -298,21 +394,47 @@ impl SandboxBackend for HardenedBackend {
         );
         #[cfg(target_os = "linux")]
         let effect_probe = false;
+        #[cfg(target_os = "linux")]
+        let launcher_verified = platform_controls;
+        #[cfg(windows)]
+        let launcher_verified = false;
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let launcher_verified = false;
+        #[cfg(target_os = "linux")]
+        let platform_verified = platform_controls;
+        #[cfg(windows)]
+        let platform_verified = false;
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let platform_verified = false;
+        #[cfg(target_os = "linux")]
+        let available = service && peer_auth && platform_controls;
+        #[cfg(not(target_os = "linux"))]
+        let available = false;
+        let mut controls = vec![
+            ("service_running".into(), service),
+            ("peer_authentication".into(), peer_auth),
+            ("launcher_watchdog".into(), launcher_verified),
+            ("platform_controls".into(), platform_verified),
+            ("wfp_lpac_traffic_effects".into(), effect_probe),
+        ];
+        #[cfg(target_os = "linux")]
+        controls.push(("service_egress_effects".into(), false));
+        #[cfg(target_os = "linux")]
+        let report_detail = format!(
+            "{detail}; hardened Linux launcher controls are {}; Internet egress remains disabled until its service effect probes pass",
+            if available { "verified" } else { "not verified" }
+        );
+        #[cfg(not(target_os = "linux"))]
+        let report_detail = detail;
         ProbeReport {
             backend: if cfg!(windows) {
                 "hardened-appcontainer"
             } else {
                 "hardened-bubblewrap"
             },
-            available: false,
-            detail: format!("{detail}; launcher and platform controls are not verified"),
-            controls: vec![
-                ("service_running".into(), service),
-                ("peer_authentication".into(), peer_auth),
-                ("launcher_watchdog".into(), false),
-                ("platform_controls".into(), false),
-                ("wfp_lpac_traffic_effects".into(), effect_probe),
-            ],
+            available,
+            detail: report_detail,
+            controls,
         }
     }
 
@@ -321,7 +443,11 @@ impl SandboxBackend for HardenedBackend {
         {
             service::run_windows(job)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            service::run_linux(job)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = job;
             Err(crate::Error::isolation_unavailable(

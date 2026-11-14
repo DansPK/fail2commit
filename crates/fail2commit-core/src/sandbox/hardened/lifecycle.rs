@@ -15,6 +15,8 @@ const LINUX_RUN_DIR: &str = "/run/fail2commit-hardened";
 #[cfg(target_os = "linux")]
 const LINUX_DATA_DIR: &str = "/var/lib/fail2commit-hardened";
 #[cfg(target_os = "linux")]
+const LINUX_ACL_DIR: &str = "/var/lib/fail2commit-hardened-acl";
+#[cfg(target_os = "linux")]
 const SANDBOX_USER: &str = "f2c-sandbox";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,6 +132,11 @@ pub(crate) fn installed_state() -> crate::Result<InstallState> {
         .ok_or_else(|| crate::Error::isolation_unavailable("hardened mode is not installed"))
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_acl_journal_dir() -> PathBuf {
+    PathBuf::from(LINUX_ACL_DIR)
+}
+
 fn service_active() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -179,6 +186,7 @@ fn owned_service_config(
         && start_type == 2
 }
 
+#[cfg(windows)]
 fn recorded_sid_matches(recorded: Option<&str>, current: Option<&str>) -> crate::Result<bool> {
     let recorded = recorded.ok_or_else(|| {
         crate::Error::integrity("legacy hardened state cannot authorize account deletion")
@@ -242,10 +250,11 @@ fn persist_uid_before_create(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::recorded_sid_matches;
     use super::{
         cleanup_then_remove_state, owned_service_config, persist_uid_before_create,
-        recorded_executable_matches, recorded_sid_matches, system_uid_candidate, system_uid_range,
-        InstallState,
+        recorded_executable_matches, system_uid_candidate, system_uid_range, InstallState,
     };
     use std::path::Path;
 
@@ -333,6 +342,7 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(windows)]
     #[test]
     fn recorded_account_sid_must_match_before_name_based_deletion() {
         assert!(
@@ -397,6 +407,23 @@ mod tests {
         assert!(system_uid_candidate("a:x:100:1::/:/bin/sh", 100, 100).is_err());
         assert!(system_uid_range("SYS_UID_MIN 500\nSYS_UID_MAX 100\n").is_err());
     }
+
+    #[test]
+    fn linux_service_unit_keeps_system_hardening_and_opens_only_required_job_roots() {
+        let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
+        assert!(unit.contains("ProtectSystem=strict"));
+        assert!(unit.contains("ProtectHome=read-only"));
+        assert!(unit.contains("NoNewPrivileges=yes"));
+        assert!(unit.contains(
+            "ReadWritePaths=/home /run/fail2commit-hardened /var/lib/fail2commit-hardened /var/lib/fail2commit-hardened-acl"
+        ));
+        let writable_roots = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ReadWritePaths="))
+            .unwrap()
+            .split_whitespace();
+        assert!(!writable_roots.into_iter().any(|path| path == "/"));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -431,6 +458,7 @@ mod linux {
         }
     }
 
+    #[allow(unsafe_code)]
     pub(super) fn install() -> crate::Result<serde_json::Value> {
         require_root()?;
         if read_state()?.is_some() {
@@ -466,6 +494,7 @@ mod linux {
             socket_unit.as_path(),
             service_unit.as_path(),
             Path::new(LINUX_DATA_DIR),
+            Path::new(LINUX_ACL_DIR),
             Path::new(LINUX_RUN_DIR),
         ] {
             match std::fs::symlink_metadata(path) {
@@ -538,6 +567,8 @@ mod linux {
             std::fs::create_dir_all(LINUX_DATA_DIR)?;
             run("chown", &[&account_uid, LINUX_DATA_DIR])?;
             std::fs::set_permissions(LINUX_DATA_DIR, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::create_dir(LINUX_ACL_DIR)?;
+            std::fs::set_permissions(LINUX_ACL_DIR, std::fs::Permissions::from_mode(0o700))?;
             std::fs::create_dir_all(LINUX_RUN_DIR)?;
             std::fs::set_permissions(LINUX_RUN_DIR, std::fs::Permissions::from_mode(0o755))?;
             let socket = include_str!("../../../../../packaging/linux/fail2commit-hardened.socket")
@@ -653,6 +684,7 @@ mod linux {
                 remove_unit_file(path)?;
             }
             run("systemctl", &["daemon-reload"])?;
+            super::super::linux_acl::recover_if_present(Path::new(LINUX_ACL_DIR))?;
 
             let account = Command::new("getent")
                 .args(["passwd", SANDBOX_USER])
@@ -679,6 +711,7 @@ mod linux {
                 )));
             }
             remove_owned_dir(Path::new(LINUX_DATA_DIR), state.sandbox_uid)?;
+            remove_owned_dir(Path::new(LINUX_ACL_DIR), Some(0))?;
             remove_owned_dir(Path::new(LINUX_RUN_DIR), Some(0))?;
             remove_owned_dir(Path::new(LINUX_BIN_DIR), Some(0))?;
             remove_state_temp()?;

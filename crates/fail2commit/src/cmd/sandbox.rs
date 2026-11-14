@@ -41,6 +41,12 @@ pub enum Action {
     /// Fixed internal payload for the authenticated Windows network probe.
     #[command(hide = true)]
     EgressProbe,
+    /// Linux service watchdog and cgroup self-test entry point.
+    #[command(hide = true)]
+    HardenedProbe {
+        #[arg(long)]
+        watchdog: Option<u64>,
+    },
 }
 
 pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
@@ -53,7 +59,10 @@ pub fn run(ctx: &Ctx, args: Args) -> CmdResult {
                 .sandbox
                 .enabled
         }
-        Action::Serve | Action::Launch { .. } | Action::EgressProbe => {
+        Action::Serve
+        | Action::Launch { .. }
+        | Action::EgressProbe
+        | Action::HardenedProbe { .. } => {
             return Err(fail2commit_core::Error::rejected(
                 "private sandbox entry point was not routed",
             ));

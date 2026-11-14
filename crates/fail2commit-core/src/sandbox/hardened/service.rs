@@ -1,5 +1,7 @@
 //! Minimal authenticated service transport for SPEC-018 §4.2.
 
+#![allow(unsafe_code)]
+
 #[cfg(any(target_os = "linux", windows, test))]
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "linux", windows, test))]
@@ -31,6 +33,8 @@ struct Response {
     probe_available: bool,
     #[serde(default)]
     effect_probe_passed: bool,
+    #[serde(default)]
+    network_probe_available: bool,
     #[serde(default = "default_true")]
     containment_confirmed: bool,
     detail: String,
@@ -149,6 +153,260 @@ pub(super) fn run_windows(
     result
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn run_linux(
+    job: &crate::isolation::JobSpec,
+) -> crate::Result<crate::isolation::JobOutcome> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let state = super::lifecycle::installed_state()?;
+    // SAFETY: getuid has no preconditions and returns the real caller uid.
+    let uid = unsafe { libc::getuid() };
+    if uid != state.installer_uid || uid == 0 {
+        return Err(crate::Error::rejected(
+            "hardened launch must be requested by the installed non-root account",
+        ));
+    }
+    let status = linux_service_request(
+        &Request {
+            op: "STATUS".into(),
+            job_dir: None,
+        },
+        std::time::Duration::from_secs(45),
+    )?;
+    if !status.ok || !status.service_running {
+        return Err(crate::Error::isolation_unavailable(status.detail));
+    }
+    if !status.probe_available {
+        return Err(crate::Error::isolation_unavailable(
+            "hardened Linux launcher, watchdog and platform controls are unavailable",
+        ));
+    }
+    if job.network == crate::isolation::NetworkMode::Internet && !status.network_probe_available {
+        return Err(crate::Error::isolation_unavailable(
+            "hardened Linux Internet jobs remain unavailable until service-owned egress effect probes pass",
+        ));
+    }
+
+    let paths = crate::paths::TrustedPaths::resolve()?;
+    crate::fsutil::ensure_private_dir(&paths.cache_dir)?;
+    let job_dir = tempfile::Builder::new()
+        .prefix("hardened-job-")
+        .tempdir_in(&paths.cache_dir)?;
+    let stage_root = paths.cache_dir.join("sandbox-stage");
+    let encoded = super::protocol::encode_hardened_job(job, &stage_root)?;
+    let job_path = job_dir.path().join("job.json");
+    let mut job_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&job_path)?;
+    job_file.write_all(&encoded)?;
+    job_file.sync_all()?;
+    let request = Request {
+        op: "LAUNCH".into(),
+        job_dir: Some(job_dir.path().to_string_lossy().into_owned()),
+    };
+    let reply = linux_service_request(
+        &request,
+        job.limits
+            .timeout
+            .saturating_add(std::time::Duration::from_secs(45)),
+    )?;
+    if !reply.ok || !reply.containment_confirmed {
+        return Err(crate::Error::isolation_unavailable(reply.detail));
+    }
+    let outcome_path = job_dir.path().join("outcome.json");
+    let outcome_file = open_linux_regular(&outcome_path, uid, super::protocol::MAX_OUTCOME_BYTES)?;
+    let mut bytes = Vec::new();
+    outcome_file
+        .take((super::protocol::MAX_OUTCOME_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    super::protocol::decode_outcome(&bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn launch_linux_hidden(jobfile: &Path, watchdog: Option<u64>) -> crate::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let watchdog_fd = watchdog
+        .and_then(|fd| i32::try_from(fd).ok())
+        .filter(|fd| *fd >= 0)
+        .ok_or_else(|| crate::Error::rejected("hardened Linux launcher requires a watchdog fd"))?;
+    // SAFETY: geteuid has no preconditions and returns the effective uid.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err(crate::Error::rejected(
+            "hardened Linux launcher must not run as root",
+        ));
+    }
+    let output_dir = validate_linux_snapshot_paths(jobfile)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(jobfile)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() == 0
+        || metadata.len() > super::protocol::MAX_JOB_BYTES as u64
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux launcher job snapshot owner, type or size is invalid",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take((super::protocol::MAX_JOB_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() != metadata.len() as usize {
+        return Err(crate::Error::integrity(
+            "hardened Linux launcher job snapshot changed while reading",
+        ));
+    }
+    let (job, _stage_root, diagnostic) = super::protocol::decode_hardened_job_for_service(&bytes)?;
+    if diagnostic {
+        return Err(crate::Error::rejected(
+            "Linux hardened diagnostic jobs are unavailable in this build",
+        ));
+    }
+    let outcome = crate::sandbox::linux::run_hardened(&job, watchdog_fd)?;
+    let encoded = super::protocol::encode_outcome(&outcome)?;
+    if encoded.len() > super::protocol::MAX_OUTCOME_BYTES {
+        return Err(crate::Error::integrity(
+            "hardened Linux launcher outcome exceeded its size limit",
+        ));
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(output_dir.join("outcome.json"))?;
+    output.write_all(&encoded)?;
+    output.sync_all()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_snapshot_paths(jobfile: &Path) -> crate::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let jobs = Path::new("/run/fail2commit-hardened/jobs");
+    let canonical_jobs = jobs.canonicalize()?;
+    let canonical_jobfile = jobfile.canonicalize()?;
+    if canonical_jobfile != jobfile
+        || jobfile.file_name().and_then(|s| s.to_str()) != Some("job.json")
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux launcher path is not the canonical service snapshot job.json",
+        ));
+    }
+    let input = jobfile
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("hardened Linux snapshot has no input directory"))?;
+    let root = input
+        .parent()
+        .ok_or_else(|| crate::Error::integrity("hardened Linux snapshot has no root directory"))?;
+    if input.file_name().and_then(|s| s.to_str()) != Some("input")
+        || root.parent() != Some(canonical_jobs.as_path())
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux snapshot is outside the service-owned job store",
+        ));
+    }
+    for path in [canonical_jobs.as_path(), root, input] {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(crate::Error::integrity(
+                "hardened Linux snapshot ancestor is not a private root-owned directory",
+            ));
+        }
+    }
+    let output = root.join("output");
+    let output_metadata = std::fs::symlink_metadata(&output)?;
+    if !output_metadata.is_dir()
+        || output_metadata.file_type().is_symlink()
+        || output_metadata.uid() != 0
+        || output_metadata.mode() & 0o077 != 0
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux outcome directory is not a private root-owned ACL grant directory",
+        ));
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_service_request(
+    request: &Request,
+    read_timeout: std::time::Duration,
+) -> crate::Result<Response> {
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect("/run/fail2commit-hardened/sock")?;
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: peer and len are writable buffers for SO_PEERCRED.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut peer as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || len as usize != std::mem::size_of::<libc::ucred>() || peer.uid != 0 {
+        return Err(crate::Error::integrity(
+            "hardened service peer is not verified as root",
+        ));
+    }
+    let mut encoded = serde_json::to_vec(request)
+        .map_err(|_| crate::Error::internal("cannot encode hardened Linux service request"))?;
+    encoded.push(b'\n');
+    if encoded.len() >= MAX_REQUEST {
+        return Err(crate::Error::invalid(
+            "hardened Linux service request exceeds size limit",
+        ));
+    }
+    stream.write_all(&encoded)?;
+    stream.flush()?;
+    let mut line = Vec::new();
+    BufReader::new(stream)
+        .take(MAX_REQUEST as u64)
+        .read_until(b'\n', &mut line)?;
+    decode_response(&line)
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_regular(path: &Path, owner_uid: u32, limit: usize) -> crate::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != owner_uid
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > limit as u64
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux outcome file owner, type or size is invalid",
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn open_service_pipe(name: &str) -> crate::Result<std::fs::File> {
@@ -235,8 +493,9 @@ fn response(ok: bool, detail: impl Into<String>) -> Response {
         service_running: true,
         probe_available: false,
         effect_probe_passed: false,
+        network_probe_available: false,
         containment_confirmed: true,
-        detail: detail.into(),
+        detail: bounded_linux_detail(detail.into()),
     }
 }
 
@@ -436,6 +695,10 @@ pub fn serve_linux() -> crate::Result<()> {
     use std::os::unix::net::UnixListener;
     let state = super::lifecycle::installed_state()?;
     require_root_and_trusted_runtime_dir()?;
+    let acl_dir = super::lifecycle::linux_acl_journal_dir();
+    ensure_linux_private_dir(&acl_dir, 0o700)?;
+    super::linux_acl::recover(&acl_dir)?;
+    ensure_linux_private_dir(Path::new("/run/fail2commit-hardened/jobs"), 0o700)?;
     let pid = std::process::id().to_string();
     let fds = std::env::var("LISTEN_FDS").unwrap_or_default();
     if std::env::var("LISTEN_PID").ok().as_deref() != Some(&pid) || fds != "1" {
@@ -446,14 +709,10 @@ pub fn serve_linux() -> crate::Result<()> {
     // SAFETY: systemd passes the listening Unix stream socket as fd 3 when
     // LISTEN_PID matches and LISTEN_FDS is exactly one; ownership transfers here.
     let listener = unsafe { UnixListener::from_raw_fd(3) };
-    let sandbox_uid = std::process::Command::new("id")
-        .args(["-u", "f2c-sandbox"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(u32::MAX);
+    let sandbox_uid = state.sandbox_uid.ok_or_else(|| {
+        crate::Error::integrity("hardened Linux install state has no sandbox uid")
+    })?;
+    let _identity = linux_sandbox_identity(&state.account, sandbox_uid)?;
     if !peer_uid_allowed(state.installer_uid, state.installer_uid, sandbox_uid) {
         return Err(crate::Error::integrity(
             "installer uid collides with root or f2c-sandbox",
@@ -480,13 +739,37 @@ pub fn serve_linux() -> crate::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn ensure_linux_private_dir(path: &Path, mode: u32) -> crate::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    match std::fs::create_dir(path) {
+        Ok(()) => std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o777 != mode
+    {
+        return Err(crate::Error::integrity(format!(
+            "hardened service directory is not root-owned with mode {mode:o}: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-pub(super) fn probe_linux() -> (bool, bool, String) {
+pub(super) fn probe_linux() -> (bool, bool, bool, String) {
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     let result = (|| -> crate::Result<Response> {
         let mut stream = UnixStream::connect("/run/fail2commit-hardened/sock")?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(45)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
         let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: peer and len are writable buffers for SO_PEERCRED.
@@ -511,7 +794,7 @@ pub(super) fn probe_linux() -> (bool, bool, String) {
             .read_line(&mut line)?;
         let r = serde_json::from_str::<Response>(&line)
             .map_err(|_| crate::Error::integrity("malformed service status response"))?;
-        if !r.ok || !r.service_running {
+        if !r.service_running {
             return Err(crate::Error::isolation_unavailable(
                 "service refused status request",
             ));
@@ -519,8 +802,8 @@ pub(super) fn probe_linux() -> (bool, bool, String) {
         Ok(r)
     })();
     match result {
-        Ok(r) => (true, true, r.detail),
-        Err(e) => (false, false, e.message),
+        Ok(r) => (true, true, r.probe_available, r.detail),
+        Err(e) => (false, false, false, e.message),
     }
 }
 
@@ -709,12 +992,658 @@ fn serve_one(
 ) -> crate::Result<()> {
     let line = read_request_deadline(stream, REQUEST_TIMEOUT)?;
     let req = decode_request(&line)?;
-    let result = dispatch(req, uid, installer, sandbox);
+    let result = if !peer_uid_allowed(uid, installer, sandbox) {
+        linux_response(false, false, "peer uid is not authorized")
+    } else if let Err(error) = super::linux_acl::recover(&super::lifecycle::linux_acl_journal_dir())
+    {
+        linux_response(false, false, error.message)
+    } else {
+        match req.op.as_str() {
+            "STATUS" if req.job_dir.is_none() => {
+                let state = super::lifecycle::installed_state();
+                match state.and_then(|state| linux_watchdog_probe_cached(&state, sandbox)) {
+                    Ok(()) => linux_status_response(
+                        true,
+                        "Linux service launcher and watchdog effect probe passed",
+                    ),
+                    Err(error) => linux_status_response(false, error.message),
+                }
+            }
+            "LAUNCH" => match req.job_dir.as_deref() {
+                Some(job_dir) => match run_linux_service_job(job_dir, uid, sandbox, stream) {
+                    Ok(detail) => linux_response(true, true, detail),
+                    Err(error) => linux_response(false, false, error.message),
+                },
+                None => linux_response(false, false, "job_dir is required"),
+            },
+            _ => linux_response(false, false, "unknown or malformed operation"),
+        }
+    };
     serde_json::to_writer(&mut *stream, &result)
         .map_err(|e| crate::Error::internal(e.to_string()))?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_response(ok: bool, contained: bool, detail: impl Into<String>) -> Response {
+    Response {
+        ok,
+        service_running: true,
+        probe_available: false,
+        effect_probe_passed: false,
+        network_probe_available: false,
+        containment_confirmed: contained,
+        detail: bounded_linux_detail(detail.into()),
+    }
+}
+
+#[cfg(any(target_os = "linux", windows, test))]
+fn bounded_linux_detail(detail: String) -> String {
+    detail.chars().take(512).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_status_response(probe_available: bool, detail: impl Into<String>) -> Response {
+    Response {
+        ok: true,
+        service_running: true,
+        probe_available,
+        effect_probe_passed: false,
+        network_probe_available: false,
+        containment_confirmed: true,
+        detail: bounded_linux_detail(detail.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_watchdog_probe(
+    state: &super::lifecycle::InstallState,
+    sandbox_uid: u32,
+) -> crate::Result<()> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    if state.sandbox_uid != Some(sandbox_uid) || state.installer_uid == 0 {
+        return Err(crate::Error::integrity(
+            "hardened Linux watchdog probe install identity is invalid",
+        ));
+    }
+    let executable = trusted_linux_executable(&state.executable)?;
+    let (uid, gid) = linux_sandbox_identity(&state.account, sandbox_uid)?;
+    let setpriv = trusted_linux_tool(&["/usr/bin/setpriv", "/bin/setpriv"])?;
+    let systemd_run = trusted_linux_tool(&["/usr/bin/systemd-run"])?;
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|_| crate::Error::internal("cannot generate Linux probe scope identity"))?;
+    let unit = format!("f2c-hardened-probe-{}.scope", hex::encode(random));
+    random.fill(0);
+    let mut command = Command::new(systemd_run);
+    command
+        .args([
+            "--scope",
+            "--wait",
+            "--pipe",
+            "--quiet",
+            "--collect",
+            "--expand-environment=no",
+            "--unit",
+            &unit,
+            "--property",
+            "TasksMax=8",
+            "--property",
+            "MemoryMax=134217728",
+            "--property",
+            "MemorySwapMax=0",
+            "--",
+        ])
+        .arg(setpriv)
+        .args([
+            "--reuid",
+            &uid.to_string(),
+            "--regid",
+            &gid.to_string(),
+            "--init-groups",
+            "--",
+        ])
+        .arg(executable)
+        .args(["sandbox", "hardened-probe", "--watchdog", "0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|error| {
+        crate::Error::isolation_unavailable(format!("cannot start Linux watchdog probe: {error}"))
+    })?;
+    let watchdog = child.stdin.take().ok_or_else(|| {
+        crate::Error::isolation_unavailable("Linux watchdog probe channel is unavailable")
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| crate::Error::internal("Linux watchdog probe stdout is unavailable"))?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let output_thread = std::thread::spawn(move || -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        let mut reader = BufReader::new(stdout);
+        let mut ready = Vec::new();
+        reader.by_ref().take(128).read_until(b'\n', &mut ready)?;
+        let _ = ready_tx.send(ready.clone());
+        let mut rest = Vec::new();
+        reader.take(8193).read_to_end(&mut rest)?;
+        Ok((ready, rest))
+    });
+    let ready = match ready_rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(ready) if ready == b"F2C-WATCHDOG-READY\n" => ready,
+        _ => {
+            drop(watchdog);
+            let _ = terminate_linux_scope(&unit);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = output_thread.join();
+            return Err(crate::Error::isolation_unavailable(
+                "Linux watchdog probe did not complete platform controls before its deadline",
+            ));
+        }
+    };
+    let _ = ready;
+    // The launcher writes READY only after the sandbox self-test and cgroup
+    // readback succeeded; EOF now tests the actual watchdog cancellation path.
+    drop(watchdog);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                let _ = output_thread.join();
+                return Err(crate::Error::isolation_unavailable(format!(
+                    "Linux watchdog probe launcher exited with {status}"
+                )));
+            }
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = terminate_linux_scope(&unit);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = output_thread.join();
+            return Err(crate::Error::isolation_unavailable(
+                "Linux watchdog probe did not stop within its service deadline",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let (_ready, bytes) = output_thread
+        .join()
+        .map_err(|_| crate::Error::internal("Linux watchdog probe reader panicked"))??;
+    if bytes.len() > 8192 || !linux_scope_inactive(&unit, Duration::from_secs(5))? {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux watchdog probe scope did not stop cleanly",
+        ));
+    }
+    let result: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| crate::Error::integrity("Linux watchdog probe returned malformed output"))?;
+    if result
+        .get("watchdog_cancelled")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux watchdog effect probe did not confirm process-tree cancellation",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_watchdog_probe_cached(
+    state: &super::lifecycle::InstallState,
+    sandbox_uid: u32,
+) -> crate::Result<()> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static LAST_PASS: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let cache = LAST_PASS.get_or_init(|| Mutex::new(None));
+    {
+        let last = cache
+            .lock()
+            .map_err(|_| crate::Error::internal("Linux probe cache is poisoned"))?;
+        if last.is_some_and(|at| at.elapsed() < Duration::from_secs(30)) {
+            return Ok(());
+        }
+    }
+    linux_watchdog_probe(state, sandbox_uid)?;
+    let mut last = cache
+        .lock()
+        .map_err(|_| crate::Error::internal("Linux probe cache is poisoned"))?;
+    *last = Some(Instant::now());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_service_job(
+    client_job_dir: &str,
+    peer_uid: u32,
+    sandbox_uid: u32,
+    client: &std::os::unix::net::UnixStream,
+) -> crate::Result<String> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let state = super::lifecycle::installed_state()?;
+    if state.installer_uid != peer_uid || state.sandbox_uid != Some(sandbox_uid) {
+        return Err(crate::Error::integrity(
+            "service install identity differs from the authenticated peer",
+        ));
+    }
+    linux_watchdog_probe_cached(&state, sandbox_uid)?;
+    let executable = trusted_linux_executable(&state.executable)?;
+    let (account_uid, account_gid) = linux_sandbox_identity(&state.account, sandbox_uid)?;
+    let source_dir = std::path::PathBuf::from(client_job_dir);
+    if !source_dir.is_absolute() || source_dir.canonicalize()? != source_dir {
+        return Err(crate::Error::rejected(
+            "hardened Linux job directory must be an absolute canonical path",
+        ));
+    }
+    let source_dir_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(&source_dir)?;
+    let source_dir_meta = source_dir_file.metadata()?;
+    let opened_source_dir = std::fs::read_link(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        source_dir_file.as_raw_fd()
+    ))?;
+    let path_source_dir_meta = std::fs::symlink_metadata(&source_dir)?;
+    if !source_dir_meta.is_dir()
+        || source_dir_meta.uid() != peer_uid
+        || source_dir_meta.mode() & 0o077 != 0
+        || opened_source_dir != source_dir
+        || path_source_dir_meta.dev() != source_dir_meta.dev()
+        || path_source_dir_meta.ino() != source_dir_meta.ino()
+    {
+        return Err(crate::Error::rejected(
+            "hardened Linux job directory is not private and peer-owned",
+        ));
+    }
+    let source_fd = unsafe {
+        libc::openat(
+            source_dir_file.as_raw_fd(),
+            c"job.json".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if source_fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut source = unsafe { std::fs::File::from_raw_fd(source_fd) };
+    let before = source.metadata()?;
+    if !before.is_file()
+        || before.uid() != peer_uid
+        || before.nlink() != 1
+        || before.mode() & 0o022 != 0
+        || before.len() == 0
+        || before.len() > super::protocol::MAX_JOB_BYTES as u64
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux job request is not a bounded peer-owned regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    Read::by_ref(&mut source)
+        .take((super::protocol::MAX_JOB_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let after = source.metadata()?;
+    if bytes.len() != before.len() as usize
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.size() != after.size()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+        || before.uid() != after.uid()
+        || before.nlink() != after.nlink()
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux job request changed while it was snapshotted",
+        ));
+    }
+    let (job, _stage_root, diagnostic) = super::protocol::decode_hardened_job_for_service(&bytes)?;
+    if diagnostic {
+        return Err(crate::Error::rejected(
+            "Linux hardened diagnostic jobs are unavailable",
+        ));
+    }
+    if job.network == crate::isolation::NetworkMode::Internet {
+        return Err(crate::Error::isolation_unavailable(
+            "Linux Internet execution remains disabled until the authenticated service egress effect probe passes",
+        ));
+    }
+
+    let runtime_jobs = Path::new("/run/fail2commit-hardened/jobs");
+    let snapshot = tempfile::Builder::new()
+        .prefix("job-")
+        .tempdir_in(runtime_jobs)?;
+    let root = snapshot.path();
+    let input = root.join("input");
+    let output = root.join("output");
+    std::fs::create_dir(&input)?;
+    std::fs::create_dir(&output)?;
+    std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700))?;
+    let jobfile = input.join("job.json");
+    let mut snapshot_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&jobfile)?;
+    snapshot_file.write_all(&bytes)?;
+    snapshot_file.sync_all()?;
+    drop(snapshot_file);
+    let root = root.canonicalize()?;
+    let input = input.canonicalize()?;
+    let output = output.canonicalize()?;
+    let jobfile = jobfile.canonicalize()?;
+    if !root.starts_with(runtime_jobs) || !input.starts_with(&root) || !output.starts_with(&root) {
+        return Err(crate::Error::integrity(
+            "hardened Linux immutable snapshot escaped its root-owned job store",
+        ));
+    }
+
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|_| crate::Error::internal("cannot generate hardened job scope identity"))?;
+    let unit = format!("f2c-hardened-job-{}.scope", hex::encode(random));
+    random.fill(0);
+    let extra = [
+        (root.clone(), "--x"),
+        (input.clone(), "r-x"),
+        (jobfile.clone(), "r--"),
+        (output.clone(), "rwx"),
+    ];
+    let journal_dir = super::lifecycle::linux_acl_journal_dir();
+    let mut grants =
+        super::linux_acl::GrantGuard::apply(&job, peer_uid, &extra, &journal_dir, Some(&unit))?;
+    let setpriv = trusted_linux_tool(&["/usr/bin/setpriv", "/bin/setpriv"])?;
+    let systemd_run = trusted_linux_tool(&["/usr/bin/systemd-run"])?;
+    let tasks = job.limits.max_processes.unwrap_or(256).clamp(1, 32768);
+    let memory = job
+        .limits
+        .memory_bytes
+        .unwrap_or(1024 * 1024 * 1024)
+        .max(64 * 1024 * 1024);
+    let mut command = Command::new(systemd_run);
+    command
+        .args([
+            "--scope",
+            "--wait",
+            "--pipe",
+            "--quiet",
+            "--collect",
+            "--expand-environment=no",
+            "--unit",
+            &unit,
+            "--property",
+            &format!("TasksMax={tasks}"),
+            "--property",
+            &format!("MemoryMax={memory}"),
+            "--property",
+            "MemorySwapMax=0",
+            "--",
+        ])
+        .arg(setpriv)
+        .args([
+            "--reuid",
+            &account_uid.to_string(),
+            "--regid",
+            &account_gid.to_string(),
+            "--init-groups",
+            "--",
+        ])
+        .arg(&executable)
+        .args(["sandbox", "launch"])
+        .arg(&jobfile)
+        .args(["--watchdog", "0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut scope = command.spawn().map_err(|error| {
+        crate::Error::isolation_unavailable(format!("cannot start hardened system scope: {error}"))
+    })?;
+    let mut watchdog = scope.stdin.take();
+    if watchdog.is_none() {
+        let _ = terminate_linux_scope(&unit);
+        if !linux_scope_inactive(&unit, Duration::from_secs(5))? {
+            grants.defer_recovery();
+            return Err(crate::Error::isolation_unavailable(
+                "launcher watchdog channel is unavailable and system scope did not stop",
+            ));
+        }
+        grants.release()?;
+        return Err(crate::Error::isolation_unavailable(
+            "launcher watchdog channel could not be created",
+        ));
+    }
+    let deadline = Instant::now() + job.limits.timeout + Duration::from_secs(30);
+    let mut disconnected = false;
+    let mut timed_out = false;
+    let status = loop {
+        if !disconnected && linux_client_disconnected(client) {
+            disconnected = true;
+            watchdog.take();
+        }
+        if let Some(status) = scope.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            watchdog.take();
+            let _ = terminate_linux_scope(&unit);
+            let _ = scope.kill();
+            break scope.wait()?;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    drop(watchdog);
+    if !linux_scope_inactive(&unit, Duration::from_secs(5))? {
+        grants.defer_recovery();
+        return Err(crate::Error::isolation_unavailable(
+            "hardened Linux launcher scope is still active; ACL journal retained for recovery",
+        ));
+    }
+    if !status.success() || timed_out || disconnected {
+        grants.release()?;
+        return Err(crate::Error::isolation_unavailable(if timed_out {
+            "hardened Linux launcher exceeded its service deadline"
+        } else if disconnected {
+            "hardened Linux client disconnected; job was contained and its result was discarded"
+        } else {
+            "hardened Linux launcher rejected the job or failed its mandatory controls"
+        }));
+    }
+    let outcome_path = output.join("outcome.json");
+    let outcome_file = open_linux_regular(
+        &outcome_path,
+        sandbox_uid,
+        super::protocol::MAX_OUTCOME_BYTES,
+    )?;
+    let mut encoded = Vec::new();
+    outcome_file
+        .take((super::protocol::MAX_OUTCOME_BYTES + 1) as u64)
+        .read_to_end(&mut encoded)?;
+    let outcome = super::protocol::decode_outcome(&encoded)?;
+    if let Some(file) = outcome_file_from_client_dir(&source_dir_file, peer_uid)? {
+        let mut output = file;
+        output.write_all(&encoded)?;
+        output.sync_all()?;
+        // SAFETY: output is a newly created file owned by this service.
+        if unsafe { libc::fchown(output.as_raw_fd(), peer_uid, u32::MAX) } != 0 {
+            grants.defer_recovery();
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fsync accepts the live directory descriptor.
+        if unsafe { libc::fsync(source_dir_file.as_raw_fd()) } != 0 {
+            grants.defer_recovery();
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    grants.release()?;
+    Ok(format!(
+        "hardened Linux job completed with {:?}",
+        outcome.status
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn outcome_file_from_client_dir(
+    directory: &std::fs::File,
+    _peer_uid: u32,
+) -> crate::Result<Option<std::fs::File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"outcome.json".as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) }))
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_linux_executable(path: &str) -> crate::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let requested = Path::new(path);
+    let canonical = requested.canonicalize()?;
+    let metadata = std::fs::symlink_metadata(&canonical)?;
+    let parent = std::fs::symlink_metadata(canonical.parent().unwrap_or(Path::new("/")))?;
+    if canonical != requested
+        || !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+        || parent.uid() != 0
+        || parent.mode() & 0o022 != 0
+    {
+        return Err(crate::Error::integrity(
+            "hardened Linux installed executable is not a trusted root-owned file",
+        ));
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_linux_tool(paths: &[&str]) -> crate::Result<std::path::PathBuf> {
+    paths
+        .iter()
+        .find_map(|path| trusted_linux_executable(path).ok())
+        .ok_or_else(|| {
+            crate::Error::isolation_unavailable("required root-owned system tool is unavailable")
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sandbox_identity(account: &str, expected_uid: u32) -> crate::Result<(u32, u32)> {
+    if account != "f2c-sandbox" {
+        return Err(crate::Error::integrity(
+            "unexpected hardened Linux service account",
+        ));
+    }
+    let passwd = std::fs::read_to_string("/etc/passwd")?;
+    for line in passwd.lines() {
+        let mut fields = line.split(':');
+        if fields.next() != Some(account) {
+            continue;
+        }
+        let _password = fields.next();
+        let uid = fields.next().and_then(|s| s.parse::<u32>().ok());
+        let gid = fields.next().and_then(|s| s.parse::<u32>().ok());
+        if uid == Some(expected_uid) && uid != Some(0) {
+            return gid
+                .map(|gid| (expected_uid, gid))
+                .ok_or_else(|| crate::Error::integrity("sandbox account group is malformed"));
+        }
+        return Err(crate::Error::integrity(
+            "sandbox account uid differs from installed state",
+        ));
+    }
+    Err(crate::Error::integrity(
+        "hardened Linux sandbox account is missing",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_client_disconnected(client: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut byte = 0u8;
+    let rc = unsafe {
+        libc::recv(
+            client.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    rc == 0
+        || (rc < 0
+            && !matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ))
+        || rc > 0
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_scope(unit: &str) -> crate::Result<()> {
+    let systemctl = trusted_linux_tool(&["/usr/bin/systemctl", "/bin/systemctl"])?;
+    let output = std::process::Command::new(systemctl)
+        .args(["kill", "--kill-whom=all", "--signal=KILL", unit])
+        .output()?;
+    if output.status.success() || linux_scope_inactive(unit, std::time::Duration::ZERO)? {
+        Ok(())
+    } else {
+        Err(crate::Error::isolation_unavailable(
+            "cannot kill hardened Linux system scope",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_scope_inactive(unit: &str, timeout: std::time::Duration) -> crate::Result<bool> {
+    let systemctl = trusted_linux_tool(&["/usr/bin/systemctl", "/bin/systemctl"])?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let output = std::process::Command::new(&systemctl)
+            .args(["show", "--property=ActiveState", "--value", unit])
+            .output()?;
+        if !output.status.success() {
+            return Err(crate::Error::isolation_unavailable(
+                "cannot read hardened Linux scope state",
+            ));
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "active" | "activating" | "deactivating" | "reloading" => {}
+            "inactive" | "failed" | "" => return Ok(true),
+            _ => {
+                return Err(crate::Error::integrity(
+                    "systemd returned an unknown hardened scope state",
+                ))
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 #[cfg(windows)]
@@ -5137,6 +6066,29 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(read_request_deadline(&mut server, std::time::Duration::from_millis(40)).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_peer_credentials_are_read_from_kernel_socket_metadata() {
+        let (service, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: getuid has no preconditions and reports the test process's real uid.
+        let actual_uid = unsafe { libc::getuid() };
+        assert_eq!(peer_uid(&service).unwrap(), actual_uid);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_service_detects_closed_or_protocol_smuggled_client_streams() {
+        let (service, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(!linux_client_disconnected(&service));
+        drop(client);
+        assert!(linux_client_disconnected(&service));
+
+        let (service, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::io::Write;
+        client.write_all(b"unexpected trailing bytes").unwrap();
+        assert!(linux_client_disconnected(&service));
     }
 
     #[cfg(target_os = "linux")]

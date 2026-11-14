@@ -134,6 +134,13 @@ fn main() -> ExitCode {
                         .map_or(70, |_| 0),
                 );
             }
+            #[cfg(target_os = "linux")]
+            cmd::sandbox::Action::HardenedProbe { watchdog } => {
+                return exit(
+                    fail2commit_core::sandbox::hardened::run_linux_watchdog_probe(*watchdog)
+                        .map_or(70, |_| 0),
+                );
+            }
             #[cfg(all(feature = "hardened-test-diagnostics", debug_assertions))]
             cmd::sandbox::Action::Launch {
                 jobfile,

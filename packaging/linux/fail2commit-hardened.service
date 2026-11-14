@@ -14,6 +14,11 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
+# The privileged launcher snapshots peer-owned jobs and applies temporary ACL
+# grants only beneath user-owned paths. Keep the rest of the filesystem
+# read-only while allowing those exact service data roots and the account's
+# home tree to be updated for the duration of a job.
+ReadWritePaths=/home /run/fail2commit-hardened /var/lib/fail2commit-hardened /var/lib/fail2commit-hardened-acl
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
