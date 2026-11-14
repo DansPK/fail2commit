@@ -554,11 +554,12 @@ fn verify_qemu_support(qemu: &Path) -> crate::Result<String> {
 #[derive(Debug)]
 pub(super) enum Containment {
     /// Every member of the group that was alive at containment start is
-    /// gone; mapped state may be released.
+    /// proven gone by a complete scan; mapped state may be released.
     Confirmed,
-    /// Members persisted at the deadline; mapped state must NOT be released
-    /// (the caller retains the guards and quarantines for recovery, R2-01).
-    Unconfirmed { live: Vec<i32> },
+    /// Members persisted, or membership could not be proven complete, at the
+    /// deadline; mapped state must NOT be released (the caller retains the
+    /// guards and quarantines for recovery, R2-01/R3-01).
+    Unconfirmed { live: Vec<i32>, uncertain: bool },
 }
 
 /// Parse `(pgrp, starttime_ticks, state)` from a /proc/<pid>/stat line. The
@@ -610,29 +611,92 @@ pub(super) fn group_bound_ticks_now() -> u64 {
     }
 }
 
-/// Pids whose process group is `pgid` and whose recorded start is within the
-/// containment bound (so reused pids of an unrelated same-numbered group are
-/// not counted as ours). Bounded number of /proc scans, zombies included
-/// (they still hold their group slot until reaped).
-pub(super) fn group_members(pgid: i32, bound_ticks: u64) -> Vec<i32> {
+/// Result of one /proc group-membership enumeration (R3-01/R3-04). An
+/// incomplete pass is never evidence that a group is dead.
+#[derive(Debug)]
+pub(super) enum MemberScan {
+    /// Every entry was enumerated and readable within the time budget;
+    /// the pids are exactly the bound-matching members that exist.
+    Complete(Vec<i32>),
+    /// Enumeration failed, an entry's stat could not be read (except that
+    /// the process vanished mid-walk), a stat could not be parsed while the
+    /// entry stayed present, the entry cap was hit, or the deadline expired
+    /// mid-walk. Treat as "alive or unknown", never as absent.
+    Uncertain,
+}
+
+/// Enumerate pids whose process group is `pgid` and whose recorded start is
+/// within the containment bound, deadline-aware and error-honest (R3-01).
+/// Zombies are included: they still hold their group slot until reaped.
+pub(super) fn group_members_checked(pgid: i32, bound_ticks: u64, stop: Instant) -> MemberScan {
     let mut live = Vec::new();
     let Ok(entries) = fs::read_dir("/proc") else {
-        return live;
+        return MemberScan::Uncertain;
     };
-    for entry in entries.flatten().take(65_536) {
+    let mut seen = 0usize;
+    for entry in entries {
+        if Instant::now() >= stop {
+            return MemberScan::Uncertain;
+        }
+        seen += 1;
+        if seen > 65_536 {
+            return MemberScan::Uncertain;
+        }
+        let Ok(entry) = entry else {
+            return MemberScan::Uncertain;
+        };
         let Ok(pid): Result<i32, _> = entry.file_name().to_string_lossy().parse() else {
             continue;
         };
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // The process vanished mid-walk: fully gone, not a member.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Anything else (permission, transient proc state) is unknown.
+            Err(_) => return MemberScan::Uncertain,
         };
-        if let Some((pgrp, start, _state)) = parse_stat_pgrp_start(&stat) {
-            if pgrp == pgid && start <= bound_ticks {
-                live.push(pid);
+        match parse_stat_pgrp_start(&stat) {
+            Some((pgrp, start, _state)) => {
+                if pgrp == pgid && start <= bound_ticks {
+                    live.push(pid);
+                }
             }
+            // Present but unparsable: unknown state, never "absent".
+            None => return MemberScan::Uncertain,
         }
     }
-    live
+    MemberScan::Complete(live)
+}
+
+/// Does `pid` still match our exact group identity right now? Used to
+/// re-validate immediately before signalling (R3-01).
+fn still_group_member(pid: i32, pgid: i32, bound_ticks: u64) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => parse_stat_pgrp_start(&stat)
+            .is_some_and(|(pgrp, start, _)| pgrp == pgid && start <= bound_ticks),
+        Err(_) => false,
+    }
+}
+
+/// Kernel-backed existence probe of a numeric process group id: a zero
+/// signal never delivers but reports whether any process carries the id.
+#[derive(Debug, PartialEq, Eq)]
+enum GroupProbe {
+    Present,
+    Gone,
+    Unknown,
+}
+
+fn probe_group(pgid: i32) -> GroupProbe {
+    // SAFETY: a zero signal probes existence only; nothing is delivered.
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
+        return GroupProbe::Present;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => GroupProbe::Gone,
+        // EPERM and anything else: a group exists that we cannot judge.
+        _ => GroupProbe::Unknown,
+    }
 }
 
 /// Bounded, exact-identity containment of an owned process group (R2-01).
@@ -650,7 +714,9 @@ pub(super) fn contain_group(
     let bound_ticks = group_bound_ticks_now();
     if let Some(child) = child {
         // The leader is unreaped, so its pid (the group id) cannot be reused:
-        // one exact group kill reaches every current member.
+        // one exact group kill reaches every current member. The owned leader
+        // stays as evidence in the caller's Child until this loop reaps it or
+        // the deadline proves it unkillable (then the caller retains it).
         // SAFETY: kill targets this child's own process group with a signal.
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
         loop {
@@ -660,34 +726,85 @@ pub(super) fn contain_group(
                 Err(_) => break,
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        return Containment::Unconfirmed { live: vec![pgid] };
+                        return Containment::Unconfirmed {
+                            live: vec![pgid],
+                            uncertain: false,
+                        };
                     }
                     std::thread::sleep(POLL_INTERVAL);
                 }
             }
         }
     }
-    // Survivors: killed individually by exact pid (never by -pgid after the
-    // leader was reaped). Their parent reaps them after death; a parent that
-    // never reaps leaves a zombie in the group, which correctly counts as
-    // not-contained until the deadline.
+    // Survivors: killed individually by exact pid after immediate identity
+    // re-validation, never by -pgid once the leader is reaped. Their parent
+    // reaps them after death; a parent that never reaps leaves a zombie in
+    // the group, which correctly counts as not-contained until the deadline.
     let mut killed = std::collections::BTreeSet::new();
     loop {
-        let members = group_members(pgid, bound_ticks);
-        for pid in members.iter().copied() {
-            if killed.insert(pid) {
-                // SAFETY: pid came from this just-read /proc scan and is
-                // signalled with a constant kill signal; the narrow
-                // scan-to-signal pid-reuse window errs fail-closed because a
-                // wrongly spared member keeps containment Unconfirmed.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+        let mut members = match group_members_checked(pgid, bound_ticks, deadline) {
+            MemberScan::Complete(members) => members,
+            MemberScan::Uncertain => {
+                if Instant::now() >= deadline {
+                    return Containment::Unconfirmed {
+                        live: Vec::new(),
+                        uncertain: true,
+                    };
+                }
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
             }
+        };
+        for pid in members.iter().copied() {
+            if killed.contains(&pid) {
+                continue;
+            }
+            // Re-validate the exact identity immediately before signalling
+            // (R3-01): a pid recycled since enumeration must not be touched.
+            if !still_group_member(pid, pgid, bound_ticks) {
+                continue;
+            }
+            // SAFETY: pid passed immediate pgrp+starttime revalidation and
+            // is signalled with a constant kill signal.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            killed.insert(pid);
         }
         if members.is_empty() {
-            return Containment::Confirmed;
+            // Kernel-backed absence evidence. Present/Unknown after a
+            // complete empty identity scan means the numeric id is owned by
+            // something else (or not judgeable): re-scan to prove it, and
+            // never confirm from a probe we cannot trust.
+            match probe_group(pgid) {
+                GroupProbe::Gone => return Containment::Confirmed,
+                GroupProbe::Present => {
+                    if let MemberScan::Complete(second) =
+                        group_members_checked(pgid, bound_ticks, deadline)
+                    {
+                        if second.is_empty() {
+                            // Group id exists but carries none of our
+                            // identity-bound members: reused, not ours.
+                            return Containment::Confirmed;
+                        }
+                        // Bound-matching members are live; carry them so the
+                        // deadline report is truthful and kill them next pass.
+                        members = second;
+                    }
+                }
+                GroupProbe::Unknown => {
+                    if Instant::now() >= deadline {
+                        return Containment::Unconfirmed {
+                            live: Vec::new(),
+                            uncertain: true,
+                        };
+                    }
+                }
+            }
         }
         if Instant::now() >= deadline {
-            return Containment::Unconfirmed { live: members };
+            return Containment::Unconfirmed {
+                live: members,
+                uncertain: false,
+            };
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -2110,5 +2227,42 @@ exit 0
         // never deleting an arbitrary file planted in the state path.
         assert!(remove_inner(&state_path, &lib_dir).is_err());
         assert!(state_path.exists());
+    }
+
+    #[test]
+    fn member_scan_distinguishes_complete_from_uncertain() {
+        // R3-01: a complete scan proves membership; an exhausted or failed
+        // scan is Uncertain and can never be read as "group gone".
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 5")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        let bound = group_bound_ticks_now();
+        match group_members_checked(pgid, bound, Instant::now() + Duration::from_secs(2)) {
+            MemberScan::Complete(members) => {
+                assert!(
+                    members.contains(&pgid),
+                    "own child must be listed: {members:?}"
+                );
+                assert!(still_group_member(pgid, pgid, bound));
+            }
+            MemberScan::Uncertain => panic!("scan of a quiet proc must be complete"),
+        }
+        // A scan whose budget is already spent is Uncertain, never empty.
+        assert!(matches!(
+            group_members_checked(pgid, bound, Instant::now()),
+            MemberScan::Uncertain
+        ));
+        // SAFETY: SIGKILL targets the group this test created (pgid == child).
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        let _ = child.wait();
+        match group_members_checked(pgid, u64::MAX, Instant::now() + Duration::from_secs(2)) {
+            MemberScan::Complete(members) => assert!(!members.contains(&pgid)),
+            // Uncertain remains a legitimate conservative answer.
+            MemberScan::Uncertain => {}
+        }
     }
 }

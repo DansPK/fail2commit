@@ -327,6 +327,16 @@ fn retain_containment(stage_root: &Path, guards: Contained) -> crate::Error {
     }
 }
 
+/// True only when a complete, deadline-bounded identity scan proves the
+/// contained group has no bound-matching members. An uncertain scan is
+/// never "gone" (R3-01): recovery refuses while membership is unproven.
+fn group_proven_gone(pgid: i32, bound: u64) -> bool {
+    matches!(
+        prepare::group_members_checked(pgid, bound, Instant::now() + Duration::from_secs(2)),
+        prepare::MemberScan::Complete(members) if members.is_empty()
+    )
+}
+
 /// Refuse or recover before touching a new VM (R2-01): while any contained
 /// group from a prior attempt is still live, every new VM run stays refused;
 /// once the exact identities are proven gone, retained guards drop, the
@@ -339,13 +349,13 @@ fn recover_or_refuse(stage_root: &Path) -> crate::Result<()> {
     }
     let mut live_in_process = 0usize;
     for guard in retained.into_iter() {
-        if prepare::group_members(guard.record.pgid as i32, guard.record.bound_ticks).is_empty() {
+        if group_proven_gone(guard.record.pgid as i32, guard.record.bound_ticks) {
             // Confirmed gone: dropping the guards releases pins and deletes
             // the per-run control/result directories through their owners.
             continue;
         }
         live_in_process += 1;
-        // Still live: re-retain (never drop while contained).
+        // Still live (or unproven): re-retain (never drop while contained).
         contained_registry().push(guard);
     }
     if live_in_process > 0 {
@@ -382,7 +392,7 @@ fn recover_or_refuse(stage_root: &Path) -> crate::Result<()> {
     })?;
     let mut all_dead = true;
     for record in &file.records {
-        if !prepare::group_members(record.pgid as i32, record.bound_ticks).is_empty() {
+        if !group_proven_gone(record.pgid as i32, record.bound_ticks) {
             all_dead = false;
         }
     }
@@ -590,10 +600,11 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
                         Err(_) => Ok(timeout_outcome()),
                     };
                 }
-                prepare::Containment::Unconfirmed { live } => {
+                prepare::Containment::Unconfirmed { live, uncertain } => {
                     return Err(quarantined(
                         format!(
-                            "the micro-VM outlived its deadline and its group survived (live pids {live:?})"
+                            "the micro-VM outlived its deadline and containment stayed unconfirmed (live pids {live:?}{})",
+                            if uncertain { ", membership scan incomplete" } else { "" }
                         ),
                         pins,
                         control_dir,
@@ -610,10 +621,11 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
                         "wait for QEMU: {error}"
                     )));
                 }
-                prepare::Containment::Unconfirmed { live } => {
+                prepare::Containment::Unconfirmed { live, uncertain } => {
                     return Err(quarantined(
                         format!(
-                            "the QEMU wait failed ({error}) and the group survived (live pids {live:?})"
+                            "the QEMU wait failed ({error}) and containment stayed unconfirmed (live pids {live:?}{})",
+                            if uncertain { ", membership scan incomplete" } else { "" }
                         ),
                         pins,
                         control_dir,
@@ -628,9 +640,16 @@ fn run_job(host: &ReadyHost, job: &JobSpec) -> crate::Result<JobOutcome> {
     // kills only, because a group id may be reused after the leader is gone.
     match prepare::contain_group(None, pgid, Instant::now() + CLEANUP_GRACE) {
         prepare::Containment::Confirmed => {}
-        prepare::Containment::Unconfirmed { live } => {
+        prepare::Containment::Unconfirmed { live, uncertain } => {
             return Err(quarantined(
-                format!("the exited micro-VM left group members alive (live pids {live:?})"),
+                format!(
+                    "the exited micro-VM left containment unconfirmed (live pids {live:?}{})",
+                    if uncertain {
+                        ", membership scan incomplete"
+                    } else {
+                        ""
+                    }
+                ),
                 pins,
                 control_dir,
                 result_dir,
@@ -1666,9 +1685,7 @@ mod tests {
         j.read_only = vec![input.clone()];
         j.limits.timeout = Duration::from_secs(2);
 
-        let err = run_job_retry_txtbsy(&host, &j)
-            .err()
-            .expect("unkillable group member must fail containment");
+        let err = run_job_retry_txtbsy(&host, &j).unwrap_err(); // unkillable group member must fail containment
         assert!(
             err.message.contains("containment unconfirmed"),
             "{}",
@@ -1708,11 +1725,11 @@ mod tests {
         let pgid = rec["pgid"].as_u64().unwrap() as i32;
         let bound = rec["bound_ticks"].as_u64().unwrap();
         let until = Instant::now() + Duration::from_secs(5);
-        while !prepare::group_members(pgid, bound).is_empty() && Instant::now() < until {
+        while !group_proven_gone(pgid, bound) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            prepare::group_members(pgid, bound).is_empty(),
+            group_proven_gone(pgid, bound),
             "contained identity never recovered"
         );
 
