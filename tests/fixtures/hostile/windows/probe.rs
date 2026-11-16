@@ -8,7 +8,9 @@
 //! injection, hooking, input synthesis or screen capture.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{
+    Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -141,9 +143,31 @@ fn main() {
             }
             "udp" => {
                 let a = take(1);
-                let r = UdpSocket::bind("0.0.0.0:0").and_then(|s| {
+                let address = if let Some(scope_id) = a[0].strip_prefix("ff02::1%") {
+                    scope_id
+                        .strip_suffix(":9")
+                        .unwrap_or(scope_id)
+                        .parse::<u32>()
+                        .ok()
+                        .map(|scope_id| {
+                        SocketAddr::V6(SocketAddrV6::new(
+                            "ff02::1".parse::<Ipv6Addr>().expect("constant IPv6 group"),
+                            9,
+                            0,
+                            scope_id,
+                        ))
+                    })
+                } else {
+                    a[0].parse::<SocketAddr>().ok()
+                };
+                let r = address.ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid UDP target")
+                }).and_then(|address| {
+                    let bind = if address.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+                    UdpSocket::bind(bind).and_then(|s| {
                     let _ = s.set_broadcast(true);
-                    s.send_to(b"catalogue", &a[0])
+                        s.send_to(b"catalogue", address)
+                    })
                 });
                 say(&format!("udp:{}", a[0]), &outcome(r));
                 1

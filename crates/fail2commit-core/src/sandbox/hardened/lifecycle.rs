@@ -1404,6 +1404,7 @@ mod windows {
             // not authority to touch SCM or the local account.
             return Ok(serde_json::json!({"installed":false,"removed":true}));
         };
+        let state_path = crate::sandbox::hardened::machine_state_path()?;
         let recorded_sid = state.sandbox_sid.as_deref().ok_or_else(|| {
             crate::Error::integrity(
                 "legacy hardened state cannot authorize deletion of the sandbox account",
@@ -1428,6 +1429,10 @@ mod windows {
                 0x0001 | 0x0004 | 0x0020 | 0x00010000,
             )
         };
+        let data_dir = state_path
+            .parent()
+            .ok_or_else(|| crate::Error::integrity("install state has no parent"))?;
+        let jobs = data_dir.join("jobs");
         if svc.is_null() {
             // ERROR_SERVICE_DOES_NOT_EXIST; a missing service is an expected
             // partial-install/removal state, other SCM failures are not.
@@ -1524,6 +1529,12 @@ mod windows {
                 CloseServiceHandle(manager);
             }
         }
+        ensure_no_active_launch()?;
+        crate::sandbox::hardened::service::remove_snapshot_store(&jobs)?;
+        // The service normally reconciles its intent journal on startup. Also
+        // do so here after stop (and when the service was already removed), so
+        // an exemption journal cannot strand the machine-state directory.
+        crate::sandbox::hardened::windows_wfp::sweep_loopback_exemption()?;
         set_interactive_logon_denied(false, &mut sandbox_sid)?;
         set_batch_logon_allowed(false, &mut sandbox_sid)?;
         let current_sid = lookup_account_sid()?.map(|(_, sid)| sid);
@@ -1541,16 +1552,42 @@ mod windows {
             ));
         }
         std::fs::remove_dir_all(expected.parent().unwrap())?;
-        let p = crate::sandbox::hardened::machine_state_path()?;
-        if p.exists() {
-            std::fs::remove_file(&p)?;
-        }
-        if let Some(d) = p.parent() {
-            if d.exists() {
-                std::fs::remove_dir(d)?;
-            }
+        let data_dir = state_path
+            .parent()
+            .ok_or_else(|| crate::Error::integrity("install state has no parent"))?;
+        remove_regular_machine_file(&data_dir.join("sandbox.secret"), "sandbox secret")?;
+        remove_regular_machine_file(&state_path, "install state")?;
+        if data_dir.exists() {
+            std::fs::remove_dir(data_dir).map_err(|error| {
+                crate::Error::internal(format!(
+                    "cannot remove hardened state directory {}: {error}",
+                    data_dir.display()
+                ))
+            })?;
         }
         Ok(serde_json::json!({"installed":false,"removed":true}))
+    }
+
+    fn remove_regular_machine_file(path: &std::path::Path, label: &str) -> crate::Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        const REPARSE: u32 = 0x400;
+
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_attributes() & REPARSE != 0 {
+            return Err(crate::Error::integrity(format!(
+                "hardened {label} is not a plain file"
+            )));
+        }
+        std::fs::remove_file(path).map_err(|error| {
+            crate::Error::internal(format!(
+                "cannot remove hardened {label} {}: {error}",
+                path.display()
+            ))
+        })
     }
 
     fn ensure_no_active_launch() -> crate::Result<()> {
