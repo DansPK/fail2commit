@@ -1514,21 +1514,42 @@ mod windows {
             ));
         }
         std::fs::remove_dir_all(expected.parent().unwrap())?;
-        let p = state_path;
-        if p.exists() {
-            std::fs::remove_file(&p)?;
-        }
-        if let Some(d) = p.parent() {
-            if d.exists() {
-                std::fs::remove_dir(d).map_err(|error| {
-                    crate::Error::internal(format!(
-                        "cannot remove hardened state directory {}: {error}",
-                        d.display()
-                    ))
-                })?;
-            }
+        let data_dir = state_path
+            .parent()
+            .ok_or_else(|| crate::Error::integrity("install state has no parent"))?;
+        remove_regular_machine_file(&data_dir.join("sandbox.secret"), "sandbox secret")?;
+        remove_regular_machine_file(&state_path, "install state")?;
+        if data_dir.exists() {
+            std::fs::remove_dir(data_dir).map_err(|error| {
+                crate::Error::internal(format!(
+                    "cannot remove hardened state directory {}: {error}",
+                    data_dir.display()
+                ))
+            })?;
         }
         Ok(serde_json::json!({"installed":false,"removed":true}))
+    }
+
+    fn remove_regular_machine_file(path: &std::path::Path, label: &str) -> crate::Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        const REPARSE: u32 = 0x400;
+
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_attributes() & REPARSE != 0 {
+            return Err(crate::Error::integrity(format!(
+                "hardened {label} is not a plain file"
+            )));
+        }
+        std::fs::remove_file(path).map_err(|error| {
+            crate::Error::internal(format!(
+                "cannot remove hardened {label} {}: {error}",
+                path.display()
+            ))
+        })
     }
 
     fn ensure_no_active_launch() -> crate::Result<()> {
