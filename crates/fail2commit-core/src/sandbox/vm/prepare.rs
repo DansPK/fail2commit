@@ -2840,6 +2840,49 @@ exit 0
         assert!(state_path.exists());
     }
 
+    /// TC-029-12 (SPEC-019): a kernel update after prepare makes the recorded
+    /// hash stale; verification fails closed and names `vm prepare`.
+    #[test]
+    fn stale_prepare_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = dir.path().join("vmlinuz-test");
+        let initramfs = dir.path().join("initramfs.cpio");
+        let qemu = dir.path().join("qemu-system-x86_64");
+        fs::write(&kernel, b"kernel image v1").unwrap();
+        fs::write(&initramfs, b"initramfs bytes").unwrap();
+        fs::write(&qemu, b"qemu bytes").unwrap();
+        let mut st = VmState {
+            version: 1,
+            kernel_release: "6.12.0-test".into(),
+            kernel: kernel.to_string_lossy().into_owned(),
+            kernel_sha256: hash_file(&kernel).unwrap(),
+            initramfs: initramfs.to_string_lossy().into_owned(),
+            initramfs_sha256: hash_file(&initramfs).unwrap(),
+            qemu: qemu.to_string_lossy().into_owned(),
+            qemu_sha256: hash_file(&qemu).unwrap(),
+            qemu_version: "QEMU test".into(),
+            system_shares: vec![],
+            module_names: vec![],
+            max_inputs: 1,
+            created_unix: 0,
+        };
+        assert!(verify_hashes(&st).is_ok());
+        // The distro updates the kernel in place: same path, new content.
+        fs::write(&kernel, b"kernel image v2 (updated)").unwrap();
+        let err = verify_hashes(&st).expect_err("updated kernel must fail closed");
+        assert_eq!(err.code, crate::ResultCode::IntegrityFailure);
+        assert!(
+            err.message.contains("kernel hash mismatch") && err.message.contains("vm prepare"),
+            "{}",
+            err.message
+        );
+        // A missing prepared file also names vm prepare, never silently passes.
+        st.kernel_sha256 = hash_file(&kernel).unwrap();
+        fs::remove_file(&initramfs).unwrap();
+        let err = verify_hashes(&st).expect_err("missing initramfs must fail closed");
+        assert!(err.message.contains("vm prepare"), "{}", err.message);
+    }
+
     /// Regression (linux-gates 2026-11-17): QEMU 10 `-device help` prints
     /// `name "virtio-9p-device", bus virtio-bus`; the bare-word matcher used
     /// by `verify_qemu_support` refused every prepare on Debian 13 even though

@@ -511,6 +511,61 @@ mod tests {
         assert!(validate_vm_guest_job(&guest, &guest.work_dir, &mounts).is_err());
     }
 
+    /// TC-029-11 (SPEC-019): a guest job.json carrying host paths is refused
+    /// before anything runs. The Windows twin above covers drive-letter
+    /// paths; this exercises the Linux guest mount envelope.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guest_paths_are_validated() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let stage = PathBuf::from("/mnt/fail2commit-vm/jobs").join(id);
+        let work = stage.join("work");
+        let input = stage.join("input-0");
+        let mounts = vec![PathBuf::from("/usr"), stage.clone()];
+        let mut guest = JobSpec {
+            program: input.join("tool"),
+            args: vec![],
+            cwd: work.clone(),
+            env: vec![],
+            read_only: vec![input.clone()],
+            work_dir: work.clone(),
+            exports: Vec::new(),
+            export_to: None,
+            limits: JobLimits {
+                timeout: Duration::from_secs(10),
+                memory_bytes: None,
+                max_processes: None,
+                max_output_bytes: 4096,
+                disk_bytes: None,
+            },
+            network: NetworkMode::None,
+            bait: false,
+        };
+        assert!(validate_vm_guest_job(&guest, &work, &mounts).is_ok());
+
+        // Host paths in any field are refused.
+        guest.program = PathBuf::from("/home/dev/tool");
+        assert!(validate_vm_guest_job(&guest, &work, &mounts).is_err());
+        guest.program = input.join("tool");
+        guest.read_only = vec![PathBuf::from("/home/dev/.ssh")];
+        assert!(validate_vm_guest_job(&guest, &work, &mounts).is_err());
+        guest.read_only = vec![input.clone()];
+        guest.cwd = PathBuf::from("/etc");
+        assert!(validate_vm_guest_job(&guest, &work, &mounts).is_err());
+        guest.cwd = work.clone();
+        guest.work_dir = PathBuf::from("/tmp/host-work");
+        assert!(validate_vm_guest_job(&guest, &work, &mounts).is_err());
+        guest.work_dir = work.clone();
+        // Traversal out of the assigned mounts is refused even when the
+        // spelling starts inside them.
+        guest.program = stage.join("../host/tool");
+        assert!(validate_vm_guest_job(&guest, &work, &mounts).is_err());
+        guest.program = input.join("tool");
+        // A guest-side export destination is never allowed.
+        guest.export_to = Some(PathBuf::from("/mnt/fail2commit-vm/out"));
+        assert!(validate_vm_guest_job(&guest, &work, &mounts).is_err());
+    }
+
     #[test]
     fn vm_outcome_transport_binds_fresh_identity_and_bounds_payload() {
         let outcome = JobOutcome {
