@@ -804,7 +804,27 @@ fn hb033_hb034_non_local_private_ranges_are_stopped() {
 #[test]
 fn hb036_hb037_listen_multicast_and_broadcast_are_refused() {
     let st = stage();
-    for mode in [NetworkMode::Internet, NetworkMode::None] {
+    let mut failures = Vec::new();
+    let (subnet_broadcast, ipv6_scope) = guest_network_targets();
+    let datagram_targets = [
+        ("multicast 224.0.0.251:5353", "224.0.0.251:5353".to_string()),
+        (
+            "limited broadcast 255.255.255.255:9",
+            "255.255.255.255:9".to_string(),
+        ),
+        ("subnet-directed broadcast", format!("{subnet_broadcast}:9")),
+        (
+            "routable multicast 239.255.255.250:1900",
+            "239.255.255.250:1900".to_string(),
+        ),
+        (
+            "IPv6 link-local all-nodes multicast",
+            format!("ff02::1%{ipv6_scope}:9"),
+        ),
+    ];
+    // Test the no-network contract first; then check all datagram targets
+    // independently in each mode so one failure never hides another result.
+    for mode in [NetworkMode::None, NetworkMode::Internet] {
         let out = run(&spec(&st, &["listen"], mode, false));
         let listen = answers(&out).get("listen").cloned().unwrap_or_default();
         let survived = answers(&out).contains_key("listen-survived");
@@ -813,27 +833,79 @@ fn hb036_hb037_listen_multicast_and_broadcast_are_refused() {
             "listen {mode:?}: {listen} status={:?} {refused:?}",
             out.status
         );
-        assert!(!survived, "a listener stayed up in {mode:?}");
-        assert!(
-            denied(&listen)
-                || (out.status == JobStatus::Killed
-                    && refused.iter().any(|d| d.starts_with("listen "))),
-            "listen not refused in {mode:?}"
-        );
+        if survived {
+            failures.push(format!("listener stayed up in {mode:?}"));
+        }
+        if !(denied(&listen)
+            || (out.status == JobStatus::Killed
+                && refused.iter().any(|d| d.starts_with("listen "))))
+        {
+            failures.push(format!("listener not refused in {mode:?}"));
+        }
 
-        let out = run(&spec(
-            &st,
-            &["udp", "224.0.0.251:5353", "udp", "255.255.255.255:9"],
-            mode,
-            false,
-        ));
-        for t in ["224.0.0.251:5353", "255.255.255.255:9"] {
-            assert!(
-                denied(&answer(&out, &format!("udp:{t}"))),
-                "udp {t} sent in {mode:?}"
+        for (label, target) in &datagram_targets {
+            let out = run(&spec(&st, &["udp", target], mode, false));
+            let response = answers(&out).get(&format!("udp:{target}")).cloned();
+            let refused = response.as_deref().is_some_and(denied);
+            println!(
+                "udp {label} ({target}) {mode:?}: answer={response:?} status={:?} report={:?}",
+                out.status, out.report.events
             );
+            if !refused {
+                failures.push(format!(
+                    "udp {label} ({target}) was not refused in {mode:?}: {response:?}"
+                ));
+            }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+fn guest_network_targets() -> (std::net::Ipv4Addr, u32) {
+    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+    let powershell = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let output = Command::new(powershell)
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^(127\\.|169\\.254\\.)' -and $_.PrefixLength -lt 32 } | Sort-Object InterfaceIndex | Select-Object -First 1 | ForEach-Object { '{0}/{1}/{2}' -f $_.IPAddress, $_.PrefixLength, $_.InterfaceIndex }",
+        ])
+        .output()
+        .expect("query guest network adapter");
+    assert!(
+        output.status.success(),
+        "Get-NetIPAddress failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let facts = String::from_utf8_lossy(&output.stdout);
+    let mut parts = facts.trim().split('/');
+    let ip: std::net::Ipv4Addr = parts
+        .next()
+        .expect("adapter IPv4 address")
+        .parse()
+        .expect("valid adapter IPv4 address");
+    let prefix: u32 = parts
+        .next()
+        .expect("adapter prefix length")
+        .parse()
+        .expect("valid adapter prefix length");
+    let interface_index: u32 = parts
+        .next()
+        .expect("adapter interface index")
+        .parse()
+        .expect("valid adapter interface index");
+    assert!(prefix <= 32);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let broadcast = std::net::Ipv4Addr::from((u32::from(ip) & mask) | !mask);
+    (broadcast, interface_index)
 }
 
 // ---- FR-024: bait -------------------------------------------------------

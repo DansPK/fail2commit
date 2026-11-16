@@ -3933,6 +3933,30 @@ fn ensure_snapshot_store(path: &Path) -> crate::Result<std::path::PathBuf> {
 }
 
 #[cfg(windows)]
+pub(super) fn remove_snapshot_store(path: &Path) -> crate::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const REPARSE: u32 = 0x400;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || metadata.file_attributes() & REPARSE != 0 {
+        return Err(crate::Error::integrity(
+            "hardened snapshot store is not a plain directory",
+        ));
+    }
+    sweep_stale_snapshots(path)?;
+    std::fs::remove_dir(path).map_err(|error| {
+        crate::Error::internal(format!(
+            "cannot remove hardened snapshot store {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(windows)]
 fn sweep_stale_snapshots(path: &Path) -> crate::Result<()> {
     use std::os::windows::fs::MetadataExt;
     const REPARSE: u32 = 0x400;
