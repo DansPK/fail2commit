@@ -1707,6 +1707,12 @@ fn linux_watchdog_probe(
     }
 }
 
+/// `systemd-run --scope` already runs the command in the foreground with
+/// inherited stdio; systemd >= 257 rejects `--scope` combined with `--wait`
+/// or `--pipe` ("--pty/--pipe is not compatible in timer or --scope mode").
+#[cfg(target_os = "linux")]
+const LINUX_SCOPE_FLAGS: [&str; 4] = ["--scope", "--quiet", "--collect", "--expand-environment=no"];
+
 #[cfg(target_os = "linux")]
 fn linux_watchdog_probe_in_scope(
     unit: &str,
@@ -1721,13 +1727,8 @@ fn linux_watchdog_probe_in_scope(
 
     let mut command = Command::new(systemd_run);
     command
+        .args(LINUX_SCOPE_FLAGS)
         .args([
-            "--scope",
-            "--wait",
-            "--pipe",
-            "--quiet",
-            "--collect",
-            "--expand-environment=no",
             "--unit",
             unit,
             "--property",
@@ -2095,13 +2096,8 @@ fn run_linux_service_job(
         .max(64 * 1024 * 1024);
     let mut command = Command::new(systemd_run);
     command
+        .args(LINUX_SCOPE_FLAGS)
         .args([
-            "--scope",
-            "--wait",
-            "--pipe",
-            "--quiet",
-            "--collect",
-            "--expand-environment=no",
             "--unit",
             &unit,
             "--property",
@@ -5981,6 +5977,15 @@ pub(super) fn launch_hidden(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_scope_flags_are_valid_for_systemd_257() {
+        assert!(LINUX_SCOPE_FLAGS.contains(&"--scope"));
+        for bad in ["--wait", "--pipe", "--pty"] {
+            assert!(!LINUX_SCOPE_FLAGS.contains(&bad), "{bad} breaks --scope");
+        }
+    }
 
     #[cfg(all(windows, feature = "hardened-test-diagnostics", debug_assertions))]
     #[test]
