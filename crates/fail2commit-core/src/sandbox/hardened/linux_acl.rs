@@ -1268,6 +1268,12 @@ fn open_acl_target(path: &Path, peer_uid: u32) -> crate::Result<File> {
     Ok(file)
 }
 
+/// `--modify` takes the next word as its ACL spec, so `--no-mask` must come first
+/// (`--modify --no-mask spec` made setfacl parse "--no-mask" as the spec and fail on Debian 13).
+fn setfacl_grant_args(spec: &str) -> [&str; 4] {
+    ["--no-mask", "--modify", spec, "--"]
+}
+
 fn set_acl(tool: &Path, target: &Target, uid: u32, permissions: &str) -> crate::Result<()> {
     let proc_path = proc_fd_path(std::process::id(), target.file.as_raw_fd());
     let metadata = target.file.metadata()?;
@@ -1280,7 +1286,7 @@ fn set_acl(tool: &Path, target: &Target, uid: u32, permissions: &str) -> crate::
     )?;
     if !spec.is_empty() {
         let output = Command::new(tool)
-            .args(["--modify", "--no-mask", &spec, "--"])
+            .args(setfacl_grant_args(&spec))
             .arg(&proc_path)
             .output()?;
         if !output.status.success() {
@@ -1922,6 +1928,14 @@ mod tests {
         cleanup_pending(&pending, uid).unwrap();
         assert!(!pending.exists());
         assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn setfacl_modify_is_immediately_followed_by_its_spec() {
+        let args = setfacl_grant_args("u:101:--x,m::r-x");
+        let at = args.iter().position(|a| *a == "--modify").unwrap();
+        assert_eq!(args[at + 1], "u:101:--x,m::r-x");
+        assert_eq!(args[3], "--");
     }
 
     #[test]
