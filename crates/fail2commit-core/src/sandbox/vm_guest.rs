@@ -12,7 +12,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+#[cfg_attr(windows, allow(dead_code))]
 const MAX_GUEST_JOB: u64 = 1024 * 1024;
+#[cfg_attr(windows, allow(dead_code))]
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
@@ -108,6 +110,7 @@ mod windows_dispatch_tests {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn guest_identity(jobfile: &Path) -> crate::Result<String> {
     #[cfg(windows)]
     {
@@ -156,23 +159,7 @@ fn guest_identity(jobfile: &Path) -> crate::Result<String> {
     }
 }
 
-#[cfg(windows)]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn control_file_identity_must_be_fresh_safe_hex_component() {
-        let path = Path::new(r"C:\f2c\control\0123456789abcdef0123456789abcdef\job.json");
-        assert_eq!(
-            guest_identity(path).unwrap(),
-            "0123456789abcdef0123456789abcdef"
-        );
-        assert!(guest_identity(Path::new(r"C:\f2c\control\..\bad\job.json")).is_err());
-        assert!(guest_identity(Path::new(r"C:\f2c\control\ABC\job.json")).is_err());
-    }
-}
-
+#[cfg_attr(windows, allow(dead_code))]
 fn read_control_job(jobfile: &Path) -> crate::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -204,6 +191,7 @@ fn read_control_job(jobfile: &Path) -> crate::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn valid_identity(id: &str) -> bool {
     id.len() == 32
         && id
@@ -211,16 +199,19 @@ fn valid_identity(id: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 #[cfg(windows)]
 fn guest_stage_root() -> PathBuf {
     PathBuf::from(r"C:\f2c\cache\sandbox-stage")
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 #[cfg(windows)]
 fn guest_work_path(identity: &str) -> PathBuf {
     guest_stage_root().join(identity).join("work")
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 #[cfg(windows)]
 fn guest_outcome_path(identity: &str) -> PathBuf {
     PathBuf::from(r"C:\f2c\result")
@@ -545,5 +536,22 @@ mod linux_tests {
             "{}",
             err.message
         );
+    }
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_file_identity_must_be_fresh_safe_hex_component() {
+        let path = Path::new(r"C:\f2c\control\0123456789abcdef0123456789abcdef\job.json");
+        assert_eq!(
+            guest_identity(path).unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert!(guest_identity(Path::new(r"C:\f2c\control\..\bad\job.json")).is_err());
+        assert!(guest_identity(Path::new(r"C:\f2c\control\ABC\job.json")).is_err());
     }
 }

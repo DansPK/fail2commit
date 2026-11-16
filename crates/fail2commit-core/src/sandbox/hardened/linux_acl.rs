@@ -108,6 +108,7 @@ impl Drop for RetainedTempDir {
 }
 
 impl GrantGuard {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply(
         job: &JobSpec,
         client: &std::os::unix::net::UnixStream,
@@ -137,6 +138,7 @@ impl GrantGuard {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_as_peer(
         job: &JobSpec,
         peer: &PeerIdentity,
@@ -598,7 +600,7 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
                 Err(error) => return Err(error.into()),
                 Ok(_) => {}
             }
-            let file = open_recovery_target(&record, journal.uid)?;
+            let file = open_recovery_target(record, journal.uid)?;
             targets.push(Target {
                 path: PathBuf::from(&record.path),
                 file,
@@ -1016,11 +1018,7 @@ fn current_process_matches_peer(peer: &PeerIdentity) -> bool {
     let mut peer_groups = peer.groups.clone();
     current.sort_unstable();
     peer_groups.sort_unstable();
-    current
-        .into_iter()
-        .map(|gid| gid as u32)
-        .collect::<Vec<_>>()
-        == peer_groups
+    current.into_iter().collect::<Vec<_>>() == peer_groups
 }
 
 #[allow(unsafe_code)]
@@ -1058,7 +1056,7 @@ fn peer_identity(stream: &std::os::unix::net::UnixStream) -> crate::Result<PeerI
         )
     } != 0
         || groups_len as usize > std::mem::size_of_val(groups.as_slice())
-        || groups_len as usize % std::mem::size_of::<libc::gid_t>() != 0
+        || !(groups_len as usize).is_multiple_of(std::mem::size_of::<libc::gid_t>())
     {
         return Err(crate::Error::rejected(
             "cannot authenticate ACL peer supplementary groups",
@@ -1068,7 +1066,7 @@ fn peer_identity(stream: &std::os::unix::net::UnixStream) -> crate::Result<PeerI
     Ok(PeerIdentity {
         uid: cred.uid,
         gid: cred.gid,
-        groups: groups.into_iter().map(|gid| gid as u32).collect(),
+        groups,
     })
 }
 
@@ -1308,11 +1306,9 @@ fn acl_grant_spec(
             if value != *bits {
                 specs.push(format!("g::{}", format_bits(value)));
             }
-        } else if tag == "user" || tag == "group" {
-            if value != *bits {
-                let short = if tag == "user" { 'u' } else { 'g' };
-                specs.push(format!("{short}:{qualifier}:{}", format_bits(value)));
-            }
+        } else if (tag == "user" || tag == "group") && value != *bits {
+            let short = if tag == "user" { 'u' } else { 'g' };
+            specs.push(format!("{short}:{qualifier}:{}", format_bits(value)));
         }
     }
     if !entries.contains_key(&("user".to_owned(), uid_text.clone())) {

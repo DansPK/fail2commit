@@ -126,3 +126,26 @@ Conducted in temporary root `/tmp/f2c-smoke-XXXXXX` with isolated `HOME`:
   - `fail2commit` (Mach-O 64-bit executable arm64)
   - `LICENSE`
   - `README-MACOS.txt` (quarantine removal note and macOS fail-closed documentation)
+
+---
+
+## 4. Merge with cdf9e43
+
+Integration merge of `origin/DansPK/f2c-0.1.4` (moving base from `b0deb7b` to `cdf9e43`).
+
+### Verification Checks & Exit Codes
+
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: Exit code `0`
+- `cargo fmt --all -- --check`: Exit code `0`
+- `cargo test --workspace --locked`: Exit code `0` (all tests passed)
+- Release build & Packaging (`packaging/macos/build.sh`): Exit code `0`
+
+### Artifact Details
+
+- **Archive File**: `target/dist/fail2commit-0.1.3-aarch64-apple-darwin.tar.gz`
+- **SHA-256 File**: `target/dist/fail2commit-0.1.3-aarch64-apple-darwin.tar.gz.sha256`
+- **SHA-256**:
+  ```
+  22c8cbc5b194dccf05514e44b14c7fdb70a1454109bc19fc31d1c6d6a5008043
+  ```
+

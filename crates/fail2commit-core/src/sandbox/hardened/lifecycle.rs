@@ -86,6 +86,7 @@ pub fn uninstall() -> crate::Result<serde_json::Value> {
     }
 }
 
+#[allow(clippy::needless_return)]
 fn read_state() -> crate::Result<Option<InstallState>> {
     #[cfg(target_os = "linux")]
     {
@@ -155,6 +156,7 @@ fn service_active() -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
 fn recorded_executable_matches(recorded: &str, expected: &std::path::Path) -> bool {
     std::path::Path::new(recorded) == expected
 }
@@ -172,6 +174,7 @@ fn cleanup_then_remove_state(
     }
 }
 
+#[cfg(any(windows, test))]
 fn owned_service_config(
     binary: &str,
     account: &str,
