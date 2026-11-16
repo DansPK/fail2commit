@@ -205,7 +205,7 @@ fn recorded_sid_matches(recorded: Option<&str>, current: Option<&str>) -> crate:
 fn system_uid_range(login_defs: &str) -> crate::Result<(u32, u32)> {
     let mut min = None;
     let mut max = None;
-    let mut uid_min = None;
+    let mut uid_min: Option<u32> = None;
     for line in login_defs.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let mut fields = line.split_whitespace();
