@@ -4,9 +4,9 @@
 
 #[cfg(any(target_os = "linux", windows, test))]
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "linux", windows, test))]
-use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(any(target_os = "linux", windows))]
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(any(target_os = "linux", windows, test))]
 use std::path::Path;
 
 #[cfg(any(target_os = "linux", windows, test))]
@@ -6558,6 +6558,7 @@ mod tests {
         assert!(marker_blocks_cleanup::<()>(&Err(())));
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn windows_path_comparison_handles_case_and_verbatim_prefix_only() {
         assert!(same_windows_path(

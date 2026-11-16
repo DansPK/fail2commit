@@ -68,12 +68,19 @@ fn no_scratch(project: &std::path::Path) {
 /// a plain container has none, and the guard correctly fails closed there.
 /// Skip with a pending-evidence note unless `F2C_REQUIRE_SANDBOX` demands it.
 fn require_sandbox(test: &str) -> bool {
-    if !cfg!(target_os = "linux") {
+    if cfg!(windows) {
         return true;
     }
     let probe = fail2commit_core::sandbox::platform_backend().probe();
     if probe.available {
         return true;
+    }
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "SKIPPED {test}: no sandbox backend on this platform ({}); fail closed",
+            probe.detail
+        );
+        return false;
     }
     assert!(
         std::env::var_os("F2C_REQUIRE_SANDBOX").is_none(),
@@ -467,4 +474,33 @@ fn sandbox_off_optional_script_is_skipped_without_asking() {
     assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
     assert_eq!(r.json["data"]["scripts"], "Skipped");
     assert!(!marker.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_install_script_fails_closed_with_isolation_unavailable() {
+    require_node();
+    let n = NpmWorld::new(&[], true);
+    let marker = n.w.env.root.join("marker.txt");
+    n.reg.publish(&Pkg::new("script-pkg", "1.0.0").script(
+        "install",
+        &format!(
+            "node -e \"require('fs').writeFileSync({}, 'ran')\"",
+            js(&marker).replace('"', "'")
+        ),
+    ));
+    let r = n.w.run(
+        &n.project,
+        &[
+            "--json",
+            "--approver",
+            "none",
+            "npm",
+            "install",
+            "script-pkg",
+        ],
+    );
+    assert_eq!(r.code, 14, "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(r.json["code"], "isolation_unavailable", "{}", r.json);
+    assert!(!marker.exists(), "marker file should not be created");
 }
