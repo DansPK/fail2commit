@@ -1390,6 +1390,10 @@ mod windows {
                 0x0001 | 0x0004 | 0x0020 | 0x00010000,
             )
         };
+        let data_dir = state_path
+            .parent()
+            .ok_or_else(|| crate::Error::integrity("install state has no parent"))?;
+        let jobs = data_dir.join("jobs");
         if svc.is_null() {
             // ERROR_SERVICE_DOES_NOT_EXIST; a missing service is an expected
             // partial-install/removal state, other SCM failures are not.
@@ -1473,17 +1477,6 @@ mod windows {
                 }
                 return Err(error);
             }
-            let jobs = state_path
-                .parent()
-                .ok_or_else(|| crate::Error::integrity("install state has no parent"))?
-                .join("jobs");
-            if let Err(error) = crate::sandbox::hardened::service::remove_snapshot_store(&jobs) {
-                unsafe {
-                    CloseServiceHandle(svc);
-                    CloseServiceHandle(manager);
-                }
-                return Err(error);
-            }
             if unsafe { DeleteService(svc) } == 0 {
                 let e = std::io::Error::last_os_error();
                 unsafe {
@@ -1497,6 +1490,12 @@ mod windows {
                 CloseServiceHandle(manager);
             }
         }
+        ensure_no_active_launch()?;
+        crate::sandbox::hardened::service::remove_snapshot_store(&jobs)?;
+        // The service normally reconciles its intent journal on startup. Also
+        // do so here after stop (and when the service was already removed), so
+        // an exemption journal cannot strand the machine-state directory.
+        crate::sandbox::hardened::windows_wfp::sweep_loopback_exemption()?;
         set_interactive_logon_denied(false, &mut sandbox_sid)?;
         set_batch_logon_allowed(false, &mut sandbox_sid)?;
         let current_sid = lookup_account_sid()?.map(|(_, sid)| sid);

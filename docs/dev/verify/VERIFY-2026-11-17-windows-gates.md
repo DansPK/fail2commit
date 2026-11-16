@@ -101,7 +101,7 @@ The two remaining default-mode sandbox failures are `hb030_internet_mode_reaches
 
 ### Regression fix
 
-`process_creation_time` treated a terminated process as live while another process still held its process handle. The Windows profile sweeper therefore retained the dead owner's profile. The fix in `crates/fail2commit-core/src/sandbox/windows/watch.rs` adds `SYNCHRONIZE`, checks `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT`, and adds `terminated_child_is_not_considered_live_while_parent_holds_its_handle`. The targeted guest test passed (exit 0; 1 passed, 21 filtered out).
+`process_creation_time` treated a terminated process as live while another process still held its process handle. The Windows profile sweeper therefore retained the dead owner's profile. The fix in `crates/fail2commit-core/src/sandbox/windows/watch.rs` adds `SYNCHRONIZE`, treats only `WaitForSingleObject(handle, 0) == WAIT_OBJECT_0` as dead, and falls back to query-only creation-time lookup when opening with `SYNCHRONIZE` fails with `ERROR_ACCESS_DENIED`. It adds `terminated_child_is_not_considered_live_while_parent_holds_its_handle`. The targeted guest test passed (exit 0; 1 passed, 21 filtered out).
 
 ## FR-013 — Windows progress window
 
@@ -146,7 +146,7 @@ The first uninstall's directory-not-empty failure was from `C:\ProgramData\fail2
 
 - FR-013 native successful npm/pip phase-window screenshots, hidden-window toggle, terminal line, and successful JSON silence remain unverified.
 - Default Windows sandbox catalogue still fails HB-030 and HB-036/HB-037 as detailed above.
-- FR-027 readiness remains unavailable; first uninstall failed before successful retry; Windows hardened runtime effects and the external FirewallAPI writer condition remain open.
+- FR-027 readiness remains unavailable; the first-uninstall cleanup bug was fixed at `ddc6731`. Follow-up residual cases: U1 (service already deleted, but its protected snapshot store remains) is now handled after either SCM branch; U2 (`loopback-exemption.json` remains) is reconciled before deleting machine state; U3 (unsafe reparse point or unexpected stale-job object) now has a documented manual recovery procedure. Windows hardened runtime effects and the external FirewallAPI writer condition remain open.
 - TC-029-2 remains blocked by unavailable nested virtualization.
 - Win10 cross-check was not run due VM resource constraints.
 - Snapshot `f2c-014-wingates-pre` was restored on both Win11 and Win10.
@@ -157,7 +157,7 @@ The first uninstall's directory-not-empty failure was from `C:\ProgramData\fail2
 
 The exact requested target does not exist at release tag `v0.1.3` (`6e28cff5ebb10f6cb5f4c830c92a8731564fd6b1`): `cargo test -p fail2commit --test sandbox_hostile_windows --locked -j 2 -- hb030` and the corresponding `hb036` invocation both exited 101 with `no test target named sandbox_hostile_windows`. The available 0.1.3 Windows matrix has no HB-030 or HB-036 test. Its ignored equivalent `cargo test -p fail2commit --test sandbox_windows_matrix --locked -j 2 -- external_tcp_is_denied --ignored --nocapture` passed (1 passed, exit 0).
 
-For a direct UDP baseline, a temporary guest-only diagnostic was added to the 0.1.3 matrix helper and then discarded with the VM snapshot. Its no-capability AppContainer returned `UDP_SEND_RESULT=Ok(14)` for both `224.0.0.251:5353` and `255.255.255.255:9` (diagnostic test exit 0). At `a3932ee`, the original Internet-first test failed on multicast, before it reached None mode or either broadcast case. This is an existing Windows AppContainer policy gap, not a regression introduced after 0.1.3.
+For a direct UDP baseline, a temporary guest-only diagnostic (not present in the repository) was added to the 0.1.3 matrix helper and then discarded with the VM snapshot. Its no-capability AppContainer returned `UDP_SEND_RESULT=Ok(14)` for both `224.0.0.251:5353` and `255.255.255.255:9` (diagnostic test exit 0). At `a3932ee`, the original Internet-first test failed on multicast, before it reached None mode or either broadcast case. This is an existing Windows AppContainer policy gap, not a regression introduced after 0.1.3.
 
 After reordering/splitting `hb036_hb037_listen_multicast_and_broadcast_are_refused` in `2ce4fda`, guest command `cargo test -p fail2commit --test sandbox_hostile_windows --locked -j 2 -- hb036 --nocapture` exited 101 after recording every case: None multicast `Some("ok")`, None broadcast `Some("ok")`, Internet multicast `Some("ok")`, Internet broadcast `Some("ok")`; the TCP listener was killed in both modes. Guest `pktmon` captured outbound Ethernet frames for `224.0.0.251:5353` and `255.255.255.255:9` on the VM NIC while the None-first matrix was running, confirming this is not just `send_to` reporting local queue acceptance. The active Windows Firewall profile was Public, enabled, with default outbound action Allow. AppContainer token verification still shows zero capabilities in None mode, but that is insufficient to block these UDP egress packets; the default backend has no per-job packet filter, so adding equivalent enforcement requires privileged per-job networking state and is not a small safe default-mode change. TC-023-6 explicitly requires these sends to fail, so the spec deviation remains open for the owner.
 
