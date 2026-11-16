@@ -1,5 +1,7 @@
 //! Hardened-mode wire contract and backends (FR-027, SPEC-018).
 
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+
 pub mod lifecycle;
 #[cfg(target_os = "linux")]
 mod linux_acl;

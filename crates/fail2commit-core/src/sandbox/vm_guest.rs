@@ -2,6 +2,8 @@
 //! only fixed guest mounts are accepted and the normal platform sandbox still
 //! owns the actual untrusted process.
 
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+
 use std::fs::OpenOptions;
 use std::io::Read;
 #[cfg(unix)]

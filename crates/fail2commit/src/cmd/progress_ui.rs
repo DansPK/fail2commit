@@ -3,9 +3,12 @@
 use fail2commit_core::progress::{End, Progress, Step};
 use fail2commit_core::protocol::Finding;
 use std::io::{IsTerminal, Write};
-use std::sync::{mpsc, Mutex};
+#[cfg(windows)]
+use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::Instant;
 
+#[cfg(windows)]
 const HANDOVER_ARG: &str = "--f2c-progress-result-window";
 const MAX_HANDOVER_BYTES: usize = 1024;
 
@@ -131,7 +134,7 @@ impl Progress for ProgressUi {
             let _ = std::io::stderr().flush();
         }
     }
-    fn finish(&self, end: End, _summary: &str) {
+    fn finish(&self, _end: End, _summary: &str) {
         if self.terminal {
             let mut err = std::io::stderr().lock();
             let _ = write!(err, "\r\x1b[2K");
@@ -166,6 +169,7 @@ enum WindowEvent {
     Close,
 }
 
+#[cfg(any(windows, test))]
 fn result_window_text(end: End, count: usize, details: &[String]) -> String {
     let result = match end {
         End::Findings => "Review completed with findings",
@@ -188,6 +192,7 @@ fn result_window_text(end: End, count: usize, details: &[String]) -> String {
     text
 }
 
+#[cfg(any(windows, test))]
 fn encode_handover(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     if bytes.is_empty() || bytes.len() > MAX_HANDOVER_BYTES {
@@ -200,6 +205,7 @@ fn encode_handover(text: &str) -> Option<String> {
     Some(out)
 }
 
+#[cfg(any(windows, test))]
 fn queue_result_handover(
     end: End,
     text: &str,
@@ -378,6 +384,7 @@ fn spawn_detached_process(executable: &std::path::Path, args: &[&str]) -> std::i
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn spawn_result_window(_payload: &str) -> std::io::Result<()> {
     Ok(())
 }

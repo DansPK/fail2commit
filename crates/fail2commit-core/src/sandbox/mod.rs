@@ -326,17 +326,23 @@ pub struct Unavailable;
 
 impl SandboxBackend for Unavailable {
     fn probe(&self) -> ProbeReport {
+        #[cfg(target_os = "macos")]
+        let detail = "no sandbox backend on macOS yet".into();
+        #[cfg(not(target_os = "macos"))]
+        let detail = "no sandbox backend for this platform".into();
         ProbeReport {
             backend: "unavailable",
             available: false,
-            detail: "no sandbox backend for this platform".into(),
+            detail,
             controls: vec![],
         }
     }
     fn run(&self, _job: &JobSpec) -> crate::Result<JobOutcome> {
-        Err(crate::Error::isolation_unavailable(
-            "no sandbox backend for this platform",
-        ))
+        #[cfg(target_os = "macos")]
+        let detail = "no sandbox backend on macOS yet";
+        #[cfg(not(target_os = "macos"))]
+        let detail = "no sandbox backend for this platform";
+        Err(crate::Error::isolation_unavailable(detail))
     }
 }
 

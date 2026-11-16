@@ -68,12 +68,16 @@ fn no_scratch(project: &std::path::Path) {
 /// a plain container has none, and the guard correctly fails closed there.
 /// Skip with a pending-evidence note unless `F2C_REQUIRE_SANDBOX` demands it.
 fn require_sandbox(test: &str) -> bool {
-    if !cfg!(target_os = "linux") {
-        return true;
-    }
     let probe = fail2commit_core::sandbox::platform_backend().probe();
     if probe.available {
         return true;
+    }
+    if !cfg!(target_os = "linux") && !cfg!(target_os = "windows") {
+        eprintln!(
+            "SKIPPED {test}: no sandbox backend on this platform ({}); fail closed",
+            probe.detail
+        );
+        return false;
     }
     assert!(
         std::env::var_os("F2C_REQUIRE_SANDBOX").is_none(),
