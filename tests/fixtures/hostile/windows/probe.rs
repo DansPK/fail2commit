@@ -144,7 +144,12 @@ fn main() {
             "udp" => {
                 let a = take(1);
                 let address = if let Some(scope_id) = a[0].strip_prefix("ff02::1%") {
-                    scope_id.parse::<u32>().ok().map(|scope_id| {
+                    scope_id
+                        .strip_suffix(":9")
+                        .unwrap_or(scope_id)
+                        .parse::<u32>()
+                        .ok()
+                        .map(|scope_id| {
                         SocketAddr::V6(SocketAddrV6::new(
                             "ff02::1".parse::<Ipv6Addr>().expect("constant IPv6 group"),
                             9,
