@@ -125,13 +125,13 @@ Commands ran elevated (`ADMIN=True`) in the Win11 guest using an isolated `FAIL2
 |---|---|---|
 | TC-027-1 install/status | FAIL / UNAVAILABLE | `hardened install` exit 0 created service/account/state; readiness was false. `hardened status` exited 14 with `isolation_unavailable`; it named the absent hardened service pipe, unresolved Windows launcher/watchdog and platform controls, and the unaccepted FirewallAPI writer requirement. |
 | TC-027-2, 4–8, 10–12 | UNAVAILABLE | Windows hardened backend is not available; no hardened jobs or service-kill scenarios were run. Probe fails closed. Linux-only TC-027-3 and TC-027-17 were not run in Windows. |
-| TC-027-9 uninstall twice | PARTIAL / FAIL | First uninstall exited 70 (`The directory is not empty`, OS error 145); second uninstall exited 0. Final status exited 10 (`hardened mode is not installed`). A post-uninstall query found no `f2c*` services, `f2c-sandbox` local account, installed program directory, or ProgramData residue. |
+| TC-027-9 uninstall twice | PASS after follow-up fix | Initial pre-fix uninstall exited 70 (`The directory is not empty`, OS error 145), and the retry returned 0 without removing the leftover machine-data directory. Follow-up testing after the fix: first uninstall exit 0; second uninstall exit 0; final status exit 10. No service/account, `Program Files\fail2commit-hardened`, or `ProgramData\fail2commit-hardened` residue remained. |
 | TC-027-13 backend selection | PASS (unit) | Full workspace suite passed selection tests; Windows status confirms unavailable backend is refused. |
 | TC-027-14 probe fails closed | PASS (runtime refusal) | Installed status exited 14 with `isolation_unavailable`; no launch was allowed. |
 | TC-027-15 malformed outcome | PASS (suite coverage) | Workspace suite passed; no separate hardened Windows service fixture was available. |
 | TC-027-16 concurrent launch | UNAVAILABLE | No hardened service launch can be accepted while readiness is false. |
 
-The first uninstall's directory-not-empty failure is a cleanup defect despite successful idempotent retry; it remains open. The external administrative FirewallAPI whole-list writer race is unaccepted; mutex/readback is not atomic CAS. A concurrent external `NetworkIsolationSetAppContainerConfig` writer can be overwritten without the readback detecting the lost entry. Normal Internet jobs remain gated.
+The first uninstall's directory-not-empty failure was from `C:\ProgramData\fail2commit-hardened`: the old path removed `install.json` and then tried to remove its parent while `sandbox.secret` and the service-created empty `jobs` directory still existed. The idempotent retry saw no install marker and did not clean that residue. Follow-up code removes stale snapshot jobs after stopping the service and removes the plain secret/state files before the state directory; the first uninstall now succeeds, and a second invocation remains idempotent. The external administrative FirewallAPI whole-list writer race is unaccepted; mutex/readback is not atomic CAS. A concurrent external `NetworkIsolationSetAppContainerConfig` writer can be overwritten without the readback detecting the lost entry. Normal Internet jobs remain gated.
 
 ## FR-029 — Windows VM backend
 
@@ -150,3 +150,30 @@ The first uninstall's directory-not-empty failure is a cleanup defect despite su
 - TC-029-2 remains blocked by unavailable nested virtualization.
 - Win10 cross-check was not run due VM resource constraints.
 - Snapshot `f2c-014-wingates-pre` was restored on both Win11 and Win10.
+
+## Follow-up — HB-030/HB-036/HB-037 and TC-027-9
+
+### 0.1.3 baseline versus `a3932ee`
+
+The exact requested target does not exist at release tag `v0.1.3` (`6e28cff5ebb10f6cb5f4c830c92a8731564fd6b1`): `cargo test -p fail2commit --test sandbox_hostile_windows --locked -j 2 -- hb030` and the corresponding `hb036` invocation both exited 101 with `no test target named sandbox_hostile_windows`. The available 0.1.3 Windows matrix has no HB-030 or HB-036 test. Its ignored equivalent `cargo test -p fail2commit --test sandbox_windows_matrix --locked -j 2 -- external_tcp_is_denied --ignored --nocapture` passed (1 passed, exit 0).
+
+For a direct UDP baseline, a temporary guest-only diagnostic was added to the 0.1.3 matrix helper and then discarded with the VM snapshot. Its no-capability AppContainer returned `UDP_SEND_RESULT=Ok(14)` for both `224.0.0.251:5353` and `255.255.255.255:9` (diagnostic test exit 0). At `a3932ee`, the original Internet-first test failed on multicast, before it reached None mode or either broadcast case. This is an existing Windows AppContainer policy gap, not a regression introduced after 0.1.3.
+
+After reordering/splitting `hb036_hb037_listen_multicast_and_broadcast_are_refused` in `2ce4fda`, guest command `cargo test -p fail2commit --test sandbox_hostile_windows --locked -j 2 -- hb036 --nocapture` exited 101 after recording every case: None multicast `Some("ok")`, None broadcast `Some("ok")`, Internet multicast `Some("ok")`, Internet broadcast `Some("ok")`; the TCP listener was killed in both modes. Guest `pktmon` captured outbound Ethernet frames for `224.0.0.251:5353` and `255.255.255.255:9` on the VM NIC while the None-first matrix was running, confirming this is not just `send_to` reporting local queue acceptance. The active Windows Firewall profile was Public, enabled, with default outbound action Allow. AppContainer token verification still shows zero capabilities in None mode, but that is insufficient to block these UDP egress packets; the default backend has no per-job packet filter, so adding equivalent enforcement requires privileged per-job networking state and is not a small safe default-mode change. TC-023-6 explicitly requires these sends to fail, so the spec deviation remains open for the owner.
+
+At `a3932ee`, `cargo test -p fail2commit --test sandbox_hostile_windows --locked -j 2 -- hb030 --nocapture` exited 101 only because there was no `net_allowed` event; the HTTPS helper returned `ok`. This matches the documented 25 ms TCP-table tick-reporting limit (see above), not a new network reachability regression.
+
+### TC-027-9 retest and code
+
+At source `ddc6731f911cac67dfc1179935d280a881099863`, guest elevated commands produced:
+
+```text
+hardened status before install: exit 10 (rejected, not installed)
+hardened install:               exit 0
+hardened status after install:  exit 14 (isolation_unavailable; readiness false)
+hardened uninstall #1:          exit 0
+hardened uninstall #2:          exit 0
+hardened status after removal:  exit 10 (rejected, not installed)
+```
+
+The first uninstall now removes the SYSTEM-owned stale `jobs` snapshot store before deleting the service, removes the sandbox account secret and install marker as regular non-reparse files, then removes the empty state directory. The revised owner-liveness regression test also passed in the guest at this source SHA (`cargo test -p fail2commit-core --locked -j 2 terminated_child_is_not_considered_live_while_parent_holds_its_handle -- --nocapture`: exit 0, 1 passed, 298 filtered out). `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` passed on the host (build/static checks only).
