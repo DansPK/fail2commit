@@ -17,14 +17,15 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_IO_PENDING, FILETIME, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    OPEN_EXISTING, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 
@@ -465,6 +466,14 @@ fn open_query(pid: u32) -> Option<OwnedHandle> {
 }
 
 #[allow(unsafe_code)]
+fn open_query_and_synchronize(pid: u32) -> Option<OwnedHandle> {
+    // SAFETY: requesting query and wait access to the process identified by
+    // its system-assigned PID; the returned handle is owned below.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    (!h.is_null()).then(|| unsafe { OwnedHandle::from_raw_handle(h as _) })
+}
+
+#[allow(unsafe_code)]
 fn creation_time_of(h: HANDLE) -> Option<u64> {
     let zero = FILETIME {
         dwLowDateTime: 0,
@@ -477,8 +486,18 @@ fn creation_time_of(h: HANDLE) -> Option<u64> {
 }
 
 /// Creation time of `pid`, or `None` when no such process exists.
+#[allow(unsafe_code)]
 pub(super) fn process_creation_time(pid: u32) -> Option<u64> {
-    let h = open_query(pid)?;
+    let h = open_query_and_synchronize(pid)?;
+    // A terminated process object can still be opened while another handle
+    // keeps it alive (for example, a parent that just waited on its child).
+    // Its creation time still matches the recovery record, but it no longer
+    // owns an AppContainer profile. Treat only a nonsignaled process handle
+    // as live so the next launch can sweep that profile.
+    // SAFETY: `h` is a valid process handle and a zero timeout does not block.
+    if unsafe { WaitForSingleObject(h.as_raw_handle() as HANDLE, 0) } != WAIT_TIMEOUT {
+        return None;
+    }
     creation_time_of(h.as_raw_handle() as HANDLE)
 }
 
@@ -607,4 +626,30 @@ pub(super) fn bounded(text: &str, max: usize) -> String {
 /// `OsStr` helper kept here so `windows.rs` stays free of UTF-16 detail.
 pub(super) fn lossy(s: &OsStr) -> String {
     s.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_creation_time;
+    use std::process::Command;
+
+    #[test]
+    fn terminated_child_is_not_considered_live_while_parent_holds_its_handle() {
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let cmd = std::path::PathBuf::from(system_root)
+            .join("System32")
+            .join("cmd.exe");
+        let mut child = Command::new(cmd)
+            .args(["/C", "ping -n 4 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("start child process");
+        assert!(process_creation_time(child.id()).is_some());
+        child.kill().expect("terminate child process");
+        child.wait().expect("reap child process");
+
+        // The Child object still owns a process handle, so OpenProcess can
+        // query the exited process object's creation time. It must not make a
+        // crashed sandbox profile look live to the stale-profile sweep.
+        assert!(process_creation_time(child.id()).is_none());
+    }
 }
