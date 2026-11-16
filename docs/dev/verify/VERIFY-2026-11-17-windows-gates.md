@@ -151,7 +151,7 @@ The first uninstall's directory-not-empty failure was from `C:\ProgramData\fail2
 - Win10 cross-check was not run due VM resource constraints.
 - Snapshot `f2c-014-wingates-pre` was restored on both Win11 and Win10.
 
-## Follow-up — HB-030/HB-036/HB-037 and TC-027-9
+## Follow-up - HB-030/HB-036/HB-037 and TC-027-9
 
 ### 0.1.3 baseline versus `a3932ee`
 
@@ -176,4 +176,4 @@ hardened uninstall #2:          exit 0
 hardened status after removal:  exit 10 (rejected, not installed)
 ```
 
-The first uninstall now removes the SYSTEM-owned stale `jobs` snapshot store before deleting the service, removes the sandbox account secret and install marker as regular non-reparse files, then removes the empty state directory. The revised owner-liveness regression test also passed in the guest at this source SHA (`cargo test -p fail2commit-core --locked -j 2 terminated_child_is_not_considered_live_while_parent_holds_its_handle -- --nocapture`: exit 0, 1 passed, 298 filtered out). `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` passed on the host (build/static checks only).
+The first uninstall now removes the SYSTEM-owned stale `jobs` snapshot store before deleting the service, removes the sandbox account secret and install marker as regular non-reparse files, then removes the empty state directory. The revised owner-liveness regression test also passed in the guest at this source SHA (`cargo test -p fail2commit-core --locked -j 2 terminated_child_is_not_considered_live_while_parent_holds_its_handle -- --nocapture`: exit 0, 1 passed, 298 filtered out). `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` passed on the host (build/static checks only). Follow-up runtime work used snapshot `f2c-014-wingates-autologon`, which was restored after all runs; Win10 remained off.
