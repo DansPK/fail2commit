@@ -55,7 +55,7 @@ cargo test --workspace --locked
     - `policy::tests`: 3 passed
     - `tests/approval.rs`: 2 passed
     - `tests/doctor.rs`: 2 passed
-    - `tests/e2e_npm_sandbox.rs`: 1 passed
+    - `tests/e2e_npm_sandbox.rs`: 1 passed at cdf9e43 (superseded: see "Coordinator re-run at 2d6eb2b" below)
     - `tests/e2e_pip_sandbox.rs`: 1 passed
     - `tests/git_commit.rs`: 13 passed
     - `tests/git_push.rs`: 17 passed
@@ -152,3 +152,11 @@ Integration merge of `origin/DansPK/f2c-0.1.4` (moving base from `b0deb7b` to `c
   22c8cbc5b194dccf05514e44b14c7fdb70a1454109bc19fc31d1c6d6a5008043
   ```
 
+
+## Coordinator re-run at 2d6eb2b (review r2 gap)
+
+Run by the coordinator on the Mac mini (macOS 26.6, arm64) in worktree `f2c-014-macos` at `2d6eb2b` (tree identical to integration merge `bf2e2a0`):
+
+- `cargo test -p fail2commit --test e2e_npm_sandbox --locked` — exit 0, 7 passed, 0 failed, including `macos_install_script_fails_closed_with_isolation_unavailable` (asserts exit 14, JSON code `isolation_unavailable`, install-script marker absent). The six Linux/Windows sandbox tests return early on macOS by design.
+
+Same merged tree `bf2e2a0`: Windows host `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` exit 0, `cargo fmt --all -- --check` exit 0; Linux `debian-f2c` clippy `-D warnings` exit 0. Opus review r2: ACCEPT-WITH-FIXES, required fix (a) satisfied by this run. Clippy/tests on macOS cover macOS only.
