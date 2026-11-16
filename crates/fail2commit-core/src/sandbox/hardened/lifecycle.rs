@@ -208,13 +208,26 @@ fn recorded_sid_matches(recorded: Option<&str>, current: Option<&str>) -> crate:
 fn system_uid_range(login_defs: &str) -> crate::Result<(u32, u32)> {
     let mut min = None;
     let mut max = None;
+    let mut uid_min: Option<u32> = None;
     for line in login_defs.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let mut fields = line.split_whitespace();
         match fields.next() {
             Some("SYS_UID_MIN") => min = fields.next().and_then(|v| v.parse().ok()),
             Some("SYS_UID_MAX") => max = fields.next().and_then(|v| v.parse().ok()),
+            Some("UID_MIN") => uid_min = fields.next().and_then(|v| v.parse().ok()),
             _ => {}
+        }
+    }
+    // Explicit shadow ranges win. Debian 13 (shadow >= 4.17) ships them only
+    // as commented defaults and useradd derives the system range from
+    // [101, UID_MIN - 1]; mirror that documented default instead of refusing
+    // every install on a stock login.defs.
+    if min.is_none() && max.is_none() {
+        if let Some(uid_min) = uid_min {
+            if uid_min > 101 {
+                return Ok((101, uid_min - 1));
+            }
         }
     }
     match (min, max) {
@@ -409,6 +422,32 @@ mod tests {
         );
         assert!(system_uid_candidate("a:x:100:1::/:/bin/sh", 100, 100).is_err());
         assert!(system_uid_range("SYS_UID_MIN 500\nSYS_UID_MAX 100\n").is_err());
+    }
+
+    /// Regression (linux-gates 2026-11-17): Debian 13 ships SYS_UID_MIN/MAX
+    /// only as commented defaults; the installer must derive the same system
+    /// range useradd uses ([101, UID_MIN - 1]) instead of refusing install.
+    #[test]
+    fn linux_system_uid_range_falls_back_to_shadow_default() {
+        let stock_debian13 = concat!(
+            "UID_MIN\t\t\t 1000\n",
+            "UID_MAX\t\t\t60000\n",
+            "#SYS_UID_MIN\t\t  101\n",
+            "#SYS_UID_MAX\t\t  999\n",
+            "SUB_UID_MIN\t\t   100000\n",
+        );
+        assert_eq!(system_uid_range(stock_debian13).unwrap(), (101, 999));
+        // Explicit ranges still win over the derived default.
+        assert_eq!(
+            system_uid_range("UID_MIN 1000\nSYS_UID_MIN 200\nSYS_UID_MAX 400\n").unwrap(),
+            (200, 400)
+        );
+        // A single explicit bound stays strict (no silent half-default).
+        assert!(system_uid_range("UID_MIN 1000\nSYS_UID_MIN 200\n").is_err());
+        // No usable UID_MIN and no explicit range still fails closed.
+        assert!(system_uid_range("# nothing here\n").is_err());
+        assert!(system_uid_range("UID_MIN 100\n").is_err());
+        assert!(system_uid_range("UID_MIN 101\n").is_err());
     }
 
     #[test]

@@ -719,7 +719,7 @@ fn scope_command(scope: &Scope, limits: &JobLimits) -> Command {
 /// `host_env` is extra environment for the bwrap process itself (probe
 /// canary); `--clearenv` must keep it out of the sandbox.
 fn execute(tools: &Tools, job: &JobSpec, host_env: &[(&str, &str)]) -> crate::Result<JobOutcome> {
-    execute_controlled(tools, job, host_env, None)
+    execute_controlled(tools, job, host_env, None, None)
 }
 
 fn execute_controlled(
@@ -727,6 +727,7 @@ fn execute_controlled(
     job: &JobSpec,
     host_env: &[(&str, &str)],
     watchdog_closed: Option<&AtomicBool>,
+    on_launched: Option<Box<dyn FnOnce() + Send>>,
 ) -> crate::Result<JobOutcome> {
     let ctl = JobCtl::create(job)?;
     let args = policy_args(tools, job, &ctl)?;
@@ -776,8 +777,17 @@ fn execute_controlled(
         thread::spawn(move || read_status(status_r, &pid))
     };
     let mark_t = thread::spawn(move || {
+        let mut mark_r = mark_r;
         let mut b = Vec::new();
-        let _ = mark_r.take(16).read_to_end(&mut b);
+        let mut first = [0u8; 1];
+        if matches!(mark_r.read(&mut first), Ok(1)) {
+            b.push(first[0]);
+            // The marker is written only once the payload is about to exec.
+            if let Some(callback) = on_launched {
+                callback();
+            }
+        }
+        let _ = mark_r.take(15).read_to_end(&mut b);
         b
     });
 
@@ -863,7 +873,7 @@ pub(crate) fn run_hardened(job: &JobSpec, watchdog_fd: i32) -> crate::Result<Job
 pub(crate) fn run_hardened_with_ready(
     job: &JobSpec,
     watchdog_fd: i32,
-    ready: impl FnOnce() -> crate::Result<()>,
+    ready: impl FnOnce() -> crate::Result<()> + Send + 'static,
 ) -> crate::Result<JobOutcome> {
     use std::os::fd::FromRawFd;
 
@@ -938,7 +948,17 @@ pub(crate) fn run_hardened_with_ready(
     let probed = backend.probe_now();
     let result = match probed.tools {
         Some(tools) if !watchdog_closed.load(Ordering::SeqCst) => {
-            ready().and_then(|()| execute_controlled(&tools, job, &[], Some(&watchdog_closed)))
+            // `ready` fires after the payload has launched, so a watchdog EOF that the
+            // caller sends in response always meets a running process tree.
+            execute_controlled(
+                &tools,
+                job,
+                &[],
+                Some(&watchdog_closed),
+                Some(Box::new(move || {
+                    let _ = ready();
+                })),
+            )
         }
         Some(_) => Err(crate::Error::isolation_unavailable(
             "service watchdog closed during hardened control probes",

@@ -5,8 +5,9 @@ After=fail2commit-hardened.socket
 
 [Service]
 Type=simple
-User=root
-Group=root
+# No User=/Group=: system services already run as root, and systemd drops CAP_SETUID/
+# CAP_SETGID when User= is combined with NoNewPrivileges=yes, which breaks the launcher
+# (setpriv to the sandbox account fails with EPERM; verified Debian 13, systemd 257).
 ExecStart=@EXECUTABLE@ sandbox serve
 Restart=on-failure
 RestartSec=1s
@@ -19,7 +20,9 @@ PrivateTmp=yes
 # read-only while allowing those exact service data roots and the account's
 # home tree to be updated for the duration of a job.
 ReadWritePaths=/home /run/fail2commit-hardened /var/lib/fail2commit-hardened /var/lib/fail2commit-hardened-acl
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK: bubblewrap configures loopback in its new network namespace over rtnetlink;
+# without it every job and probe fails closed (verified on Debian 13, systemd 257).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 

@@ -554,16 +554,26 @@ fn verify_qemu_support(qemu: &Path, quarantine: &Path) -> crate::Result<String> 
     }
     let devices = run_bounded(qemu, &["-device", "help"], Some(quarantine))?;
     for device in ["virtio-9p-device", "virtio-net-device"] {
-        if !devices
-            .lines()
-            .any(|l| l.split_whitespace().any(|w| w == device))
-        {
+        if !qemu_device_listed(&devices, device) {
             return Err(Error::isolation_unavailable(format!(
                 "qemu-system-x86_64 lacks the {device} MMIO device (CR-025)"
             )));
         }
     }
     Ok(version)
+}
+
+/// Whether a `-device help` listing names `device`. QEMU <= 9 printed bare
+/// names; QEMU 10 prints `name "virtio-9p-device", bus virtio-bus`, so the
+/// quoted name token must match exactly (a substring would also accept a
+/// different device that merely embeds the name).
+fn qemu_device_listed(devices: &str, device: &str) -> bool {
+    let quoted = format!("\"{device}\"");
+    devices.lines().any(|l| {
+        l.split_whitespace().any(|w| w == device)
+            || l.split_whitespace()
+                .any(|w| w.trim_end_matches(',') == quoted)
+    })
 }
 
 /// Outcome of trying to contain an owned process group by the deadline.
@@ -2828,6 +2838,76 @@ exit 0
         // never deleting an arbitrary file planted in the state path.
         assert!(remove_inner(&state_path, &lib_dir).is_err());
         assert!(state_path.exists());
+    }
+
+    /// TC-029-12 (SPEC-019): a kernel update after prepare makes the recorded
+    /// hash stale; verification fails closed and names `vm prepare`.
+    #[test]
+    fn stale_prepare_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = dir.path().join("vmlinuz-test");
+        let initramfs = dir.path().join("initramfs.cpio");
+        let qemu = dir.path().join("qemu-system-x86_64");
+        fs::write(&kernel, b"kernel image v1").unwrap();
+        fs::write(&initramfs, b"initramfs bytes").unwrap();
+        fs::write(&qemu, b"qemu bytes").unwrap();
+        let mut st = VmState {
+            version: 1,
+            kernel_release: "6.12.0-test".into(),
+            kernel: kernel.to_string_lossy().into_owned(),
+            kernel_sha256: hash_file(&kernel).unwrap(),
+            initramfs: initramfs.to_string_lossy().into_owned(),
+            initramfs_sha256: hash_file(&initramfs).unwrap(),
+            qemu: qemu.to_string_lossy().into_owned(),
+            qemu_sha256: hash_file(&qemu).unwrap(),
+            qemu_version: "QEMU test".into(),
+            system_shares: vec![],
+            module_names: vec![],
+            max_inputs: 1,
+            created_unix: 0,
+        };
+        assert!(verify_hashes(&st).is_ok());
+        // The distro updates the kernel in place: same path, new content.
+        fs::write(&kernel, b"kernel image v2 (updated)").unwrap();
+        let err = verify_hashes(&st).expect_err("updated kernel must fail closed");
+        assert_eq!(err.code, crate::ResultCode::IntegrityFailure);
+        assert!(
+            err.message.contains("kernel hash mismatch") && err.message.contains("vm prepare"),
+            "{}",
+            err.message
+        );
+        // A missing prepared file also names vm prepare, never silently passes.
+        st.kernel_sha256 = hash_file(&kernel).unwrap();
+        fs::remove_file(&initramfs).unwrap();
+        let err = verify_hashes(&st).expect_err("missing initramfs must fail closed");
+        assert!(err.message.contains("vm prepare"), "{}", err.message);
+    }
+
+    /// Regression (linux-gates 2026-11-17): QEMU 10 `-device help` prints
+    /// `name "virtio-9p-device", bus virtio-bus`; the bare-word matcher used
+    /// by `verify_qemu_support` refused every prepare on Debian 13 even though
+    /// the device exists. Both listing formats must match, and a name that is
+    /// only a substring of another device must not.
+    #[test]
+    fn qemu_device_listing_matches_bare_and_quoted_names() {
+        let old = "Storage devices:\nvirtio-9p-device\nvirtio-net-device\n";
+        assert!(qemu_device_listed(old, "virtio-9p-device"));
+        assert!(qemu_device_listed(old, "virtio-net-device"));
+        let new = concat!(
+            "Storage devices:\n",
+            "name \"virtio-9p-device\", bus virtio-bus\n",
+            "name \"virtio-9p-pci\", bus PCI, alias \"virtio-9p\"\n",
+            "name \"virtio-net-device\", bus virtio-bus\n",
+        );
+        assert!(qemu_device_listed(new, "virtio-9p-device"));
+        assert!(qemu_device_listed(new, "virtio-net-device"));
+        // Absent devices and embedded-name lookalikes stay refused.
+        assert!(!qemu_device_listed(new, "virtio-balloon-device"));
+        assert!(!qemu_device_listed(
+            "name \"x-virtio-9p-device-extra\", bus virtio-bus\n",
+            "virtio-9p-device"
+        ));
+        assert!(!qemu_device_listed("", "virtio-9p-device"));
     }
 
     #[test]
