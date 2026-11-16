@@ -6002,6 +6002,18 @@ pub(super) fn launch_hidden(
 mod tests {
     use super::*;
 
+    #[test]
+    fn linux_unit_allows_netlink_for_bubblewrap_loopback() {
+        let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("RestrictAddressFamilies="))
+            .expect("RestrictAddressFamilies");
+        for family in ["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"] {
+            assert!(line.contains(family), "{family} missing: {line}");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_scope_flags_are_valid_for_systemd_257() {

@@ -19,7 +19,9 @@ PrivateTmp=yes
 # read-only while allowing those exact service data roots and the account's
 # home tree to be updated for the duration of a job.
 ReadWritePaths=/home /run/fail2commit-hardened /var/lib/fail2commit-hardened /var/lib/fail2commit-hardened-acl
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK: bubblewrap configures loopback in its new network namespace over rtnetlink;
+# without it every job and probe fails closed (verified on Debian 13, systemd 257).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 
