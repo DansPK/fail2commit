@@ -58,6 +58,14 @@ fn run_spec(
     network: NetworkMode,
     bait: bool,
 ) -> JobOutcome {
+    // Cargo >= 1.100 keeps test binaries under `target/debug/build/<pkg>/<hash>/out`, so the
+    // relay is no longer a parent-directory sibling of `current_exe`; point at the cargo binary.
+    static RELAY: std::sync::Once = std::sync::Once::new();
+    RELAY.call_once(|| {
+        if std::env::var_os("F2C_SANDBOX_RELAY").is_none() {
+            std::env::set_var("F2C_SANDBOX_RELAY", env!("CARGO_BIN_EXE_f2c-sandbox-relay"));
+        }
+    });
     let (stage, exe) = stage_self();
     let (_work, mut spec) = job(exe.to_str().unwrap(), &PAYLOAD_ARGS);
     spec.read_only = vec![stage.path().canonicalize().unwrap()];
