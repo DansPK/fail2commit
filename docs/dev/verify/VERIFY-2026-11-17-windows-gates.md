@@ -146,7 +146,7 @@ The first uninstall's directory-not-empty failure was from `C:\ProgramData\fail2
 
 - FR-013 native successful npm/pip phase-window screenshots, hidden-window toggle, terminal line, and successful JSON silence remain unverified.
 - Default Windows sandbox catalogue still fails HB-030 and HB-036/HB-037 as detailed above.
-- FR-027 readiness remains unavailable; the first-uninstall cleanup bug was fixed at `ddc6731`. Follow-up residual cases: U1 (service already deleted, but its protected snapshot store remains) is now handled after either SCM branch; U2 (`loopback-exemption.json` remains) is reconciled before deleting machine state; U3 (unsafe reparse point or unexpected stale-job object) now has a documented manual recovery procedure. Windows hardened runtime effects and the external FirewallAPI writer condition remain open.
+- FR-027 readiness remains unavailable; the first-uninstall cleanup bug was fixed at `ddc6731`. Follow-up code addresses U1 (service already deleted, but its protected snapshot store remains) after either SCM branch and U2 (`loopback-exemption.json` reconciliation before machine-state removal); U3 (unsafe reparse point or unexpected stale-job object) has a documented manual recovery procedure. Runtime retesting of U1/U2 in this follow-up could not proceed: after the test VM rebooted, its interactive autologon session stopped at a password prompt, while VMware Tools launched commands with a filtered administrator token (`hardened install` returned 10, “requires an elevated administrator token”). Windows hardened runtime effects and the external FirewallAPI writer condition remain open.
 - TC-029-2 remains blocked by unavailable nested virtualization.
 - Win10 cross-check was not run due VM resource constraints.
 - Snapshot `f2c-014-wingates-pre` was restored on both Win11 and Win10.
@@ -163,6 +163,18 @@ After reordering/splitting `hb036_hb037_listen_multicast_and_broadcast_are_refus
 
 At `a3932ee`, `cargo test -p fail2commit --test sandbox_hostile_windows --locked -j 2 -- hb030 --nocapture` exited 101 only because there was no `net_allowed` event; the HTTPS helper returned `ok`. This matches the documented 25 ms TCP-table tick-reporting limit (see above), not a new network reachability regression.
 
+At follow-up source `47f6c4e1c8a088a3715882d34f254da804e6f1ef`, the expanded `hb036` guest command `cargo test -p fail2commit --test sandbox_hostile_windows --locked -j 2 -- hb036 --nocapture` exited 101 (1 test failed) without relaxing the assertions. It records the following send results in both None and Internet modes:
+
+| UDP destination | None | Internet |
+| --- | --- | --- |
+| mDNS multicast `224.0.0.251:5353` | `Some("ok")` | `Some("ok")` |
+| limited broadcast `255.255.255.255:9` | `Some("ok")` | `Some("ok")` |
+| guest subnet-directed broadcast `192.168.191.255:9` (`192.168.191.130/24`, NIC index 4) | `Some("ok")` | `Some("ok")` |
+| routable multicast `239.255.255.250:1900` | `Some("ok")` | `Some("ok")` |
+| IPv6 link-local all-nodes multicast `ff02::1%4:9` | `Some("ok")` | `Some("ok")` |
+
+Both TCP listeners were killed. All ten UDP cells violate the unchanged refusal assertions; this confirms the gap spans limited and routable IPv4 multicast, both broadcast forms, and IPv6 link-local multicast in the current guest network/firewall profile. The earlier 0.1.3 direct UDP results came from a temporary diagnostic added only inside the guest, not a committed repository test; only its two original destinations were covered. LPAC mode was not tested.
+
 ### TC-027-9 retest and code
 
 At source `ddc6731f911cac67dfc1179935d280a881099863`, guest elevated commands produced:
@@ -177,3 +189,7 @@ hardened status after removal:  exit 10 (rejected, not installed)
 ```
 
 The first uninstall now removes the SYSTEM-owned stale `jobs` snapshot store before deleting the service, removes the sandbox account secret and install marker as regular non-reparse files, then removes the empty state directory. The revised owner-liveness regression test also passed in the guest at this source SHA (`cargo test -p fail2commit-core --locked -j 2 terminated_child_is_not_considered_live_while_parent_holds_its_handle -- --nocapture`: exit 0, 1 passed, 298 filtered out). `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` passed on the host (build/static checks only). Follow-up runtime work used snapshot `f2c-014-wingates-autologon`, which was restored after all runs; Win10 remained off.
+
+### Opus review r2 follow-up
+
+The report wording now says the watch is dead only on `WAIT_OBJECT_0`, and that `ERROR_ACCESS_DENIED` uses the query-only owner fallback. The prior TC-027-9 run at `ddc6731` already demonstrated first uninstall exit 0, second uninstall exit 0, and final status exit 10; this follow-up's source also moves snapshot-store cleanup after either SCM-service branch and reconciles the exemption journal before machine-state deletion. However, its attempted elevated install exited 10 because the Win11 interactive desktop was at a password prompt and the VMware Tools command token was filtered, so there is no runtime evidence yet for the new U1 service-missing path or U2 stale-journal path. U3 recovery instructions are in `docs/sandbox-windows.md`. Host `cargo fmt --all -- --check`, `git diff --check`, and `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` pass at `47f6c4e`; the final test VM snapshot is to be restored after this report is committed.
