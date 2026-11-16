@@ -5,8 +5,9 @@ After=fail2commit-hardened.socket
 
 [Service]
 Type=simple
-User=root
-Group=root
+# No User=/Group=: system services already run as root, and systemd drops CAP_SETUID/
+# CAP_SETGID when User= is combined with NoNewPrivileges=yes, which breaks the launcher
+# (setpriv to the sandbox account fails with EPERM; verified Debian 13, systemd 257).
 ExecStart=@EXECUTABLE@ sandbox serve
 Restart=on-failure
 RestartSec=1s

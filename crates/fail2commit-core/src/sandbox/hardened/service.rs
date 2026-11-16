@@ -6003,6 +6003,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linux_unit_keeps_cap_setuid_for_the_launcher() {
+        let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
+        assert!(
+            !unit.lines().any(|l| l.starts_with("User=")),
+            "User= with NoNewPrivileges= drops CAP_SETUID and breaks setpriv"
+        );
+    }
+
+    #[test]
     fn linux_unit_allows_netlink_for_bubblewrap_loopback() {
         let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
         let line = unit
