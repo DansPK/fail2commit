@@ -5,7 +5,7 @@
 - Branch: `DansPK/f2c-014-win-gates`.
 - Tested source SHA: `316c4949f31712f9ac4a1492282e1032e1c87040` (after coordinator merge `cdf9e4352efcd04b6242ab22f9eab9a643616b03`).
 - Runtime: VMware `win11`, Windows 11, active interactive `win11` console session; guest checkout `C:\Users\win11\f2c-014-wingates\repo`.
-- Snapshot `f2c-014-wingates-pre` was taken before installs and restored on both Win11 and Win10 after the run. No runtime commands were run on the Windows host. Win10 was not started due the host's VM resource limit.
+- Snapshot `f2c-014-wingates-pre` was taken before installs and restored on both Win11 and Win10 after the run. Win10 was not powered on or tested; its snapshot was restored as cleanup. No runtime commands were run on the Windows host.
 - `CreateAppContainerProfile` previously returned `HRESULT 0x80070002` when the guest had no signed-in console user. After the coordinator enabled autologon, the active interactive session allowed profile creation and the targeted sandbox integration test passed; no source change was needed for that error.
 
 ## Host build-only gates
@@ -97,7 +97,7 @@ Per-target results (Windows-inapplicable Linux-only targets correctly contain ze
 | `appcontainer` | 1 | 0 | 0 | PASS |
 | fail2commit-core doc tests | 0 | 0 | 0 | PASS |
 
-The two remaining default-mode sandbox failures are `hb030_internet_mode_reaches_the_public_registry` (no `net_allowed` event was reported) and `hb036_hb037_listen_multicast_and_broadcast_are_refused` (the multicast datagram send succeeded). A guest user-context `Test-NetConnection registry.npmjs.org -Port 443` and HTTPS request both succeeded, so general guest connectivity is present; the AppContainer integration result still does not satisfy the expected row. The cleanup regression test `hb070_a_killed_owner_leaves_nothing_behind` now passes.
+The two remaining default-mode sandbox failures are `hb030_internet_mode_reaches_the_public_registry` (the HTTPS request succeeded but no `net_allowed` event was reported) and `hb036_hb037_listen_multicast_and_broadcast_are_refused` (the test failed on its first UDP assertion: Internet-mode multicast `224.0.0.251:5353` succeeded). At the original test order, Internet mode ran first, so None-mode multicast/broadcast and Internet-mode broadcast were not reached. A guest user-context `Test-NetConnection registry.npmjs.org -Port 443` and HTTPS request both succeeded, so general guest connectivity is present. HB-030 matches SPEC-014 section 1's known 25 ms TCP-table reporting limit: a short-lived successful connection can close between ticks and be absent from `net_allowed`; this is a reporting limitation, not evidence of a network security bypass. By contrast, TC-023-6 explicitly requires multicast/broadcast datagram sends to fail; the observed Internet-mode multicast send is a SPEC-014 deviation, not a documented limit. The cleanup regression test `hb070_a_killed_owner_leaves_nothing_behind` now passes.
 
 ### Regression fix
 

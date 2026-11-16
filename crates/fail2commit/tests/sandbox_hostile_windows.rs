@@ -804,7 +804,10 @@ fn hb033_hb034_non_local_private_ranges_are_stopped() {
 #[test]
 fn hb036_hb037_listen_multicast_and_broadcast_are_refused() {
     let st = stage();
-    for mode in [NetworkMode::Internet, NetworkMode::None] {
+    let mut failures = Vec::new();
+    // Test the no-network contract first; then check both datagram targets
+    // independently in each mode so one failure never hides another result.
+    for mode in [NetworkMode::None, NetworkMode::Internet] {
         let out = run(&spec(&st, &["listen"], mode, false));
         let listen = answers(&out).get("listen").cloned().unwrap_or_default();
         let survived = answers(&out).contains_key("listen-survived");
@@ -813,27 +816,32 @@ fn hb036_hb037_listen_multicast_and_broadcast_are_refused() {
             "listen {mode:?}: {listen} status={:?} {refused:?}",
             out.status
         );
-        assert!(!survived, "a listener stayed up in {mode:?}");
-        assert!(
-            denied(&listen)
-                || (out.status == JobStatus::Killed
-                    && refused.iter().any(|d| d.starts_with("listen "))),
-            "listen not refused in {mode:?}"
-        );
+        if survived {
+            failures.push(format!("listener stayed up in {mode:?}"));
+        }
+        if !(denied(&listen)
+            || (out.status == JobStatus::Killed
+                && refused.iter().any(|d| d.starts_with("listen "))))
+        {
+            failures.push(format!("listener not refused in {mode:?}"));
+        }
 
-        let out = run(&spec(
-            &st,
-            &["udp", "224.0.0.251:5353", "udp", "255.255.255.255:9"],
-            mode,
-            false,
-        ));
-        for t in ["224.0.0.251:5353", "255.255.255.255:9"] {
-            assert!(
-                denied(&answer(&out, &format!("udp:{t}"))),
-                "udp {t} sent in {mode:?}"
+        for target in ["224.0.0.251:5353", "255.255.255.255:9"] {
+            let out = run(&spec(&st, &["udp", target], mode, false));
+            let response = answers(&out).get(&format!("udp:{target}")).cloned();
+            let refused = response.as_deref().is_some_and(denied);
+            println!(
+                "udp {target} {mode:?}: answer={response:?} status={:?} report={:?}",
+                out.status, out.report.events
             );
+            if !refused {
+                failures.push(format!(
+                    "udp {target} was not refused in {mode:?}: {response:?}"
+                ));
+            }
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
 }
 
 // ---- FR-024: bait -------------------------------------------------------
