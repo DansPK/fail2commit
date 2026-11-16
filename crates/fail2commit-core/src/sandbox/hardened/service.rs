@@ -1732,7 +1732,7 @@ fn linux_watchdog_probe_in_scope(
             "--unit",
             unit,
             "--property",
-            "TasksMax=8",
+            "TasksMax=32",
             "--property",
             "MemoryMax=134217728",
             "--property",

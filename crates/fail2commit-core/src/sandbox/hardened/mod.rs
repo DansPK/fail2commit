@@ -267,7 +267,7 @@ pub fn run_linux_watchdog_probe(watchdog: Option<u64>) -> crate::Result<()> {
         limits: JobLimits {
             timeout: std::time::Duration::from_secs(15),
             memory_bytes: Some(128 * 1024 * 1024),
-            max_processes: Some(8),
+            max_processes: Some(32),
             max_output_bytes: 1024,
             disk_bytes: Some(1024 * 1024),
         },
