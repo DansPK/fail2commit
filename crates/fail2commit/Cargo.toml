@@ -17,6 +17,9 @@ serde_json = "1.0.154"
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_StationsAndDesktops", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
+[target."cfg(unix)".dev-dependencies]
+libc = "0.2.191"
+
 [dev-dependencies]
 base64 = "=0.23.1"
 flate2 = "=1.1.11"

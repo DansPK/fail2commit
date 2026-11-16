@@ -1,5 +1,7 @@
 //! Hardened-mode wire contract and backends (FR-027, SPEC-018).
 
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+
 pub mod lifecycle;
 #[cfg(target_os = "linux")]
 mod linux_acl;
@@ -80,6 +82,7 @@ fn linux_readiness(
     }
 }
 
+#[cfg(any(windows, test))]
 fn windows_readiness(
     service_running: bool,
     peer_authenticated: bool,
@@ -97,6 +100,7 @@ fn windows_readiness(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn windows_readiness_detail(detail: &str) -> String {
     format!(
         "{detail}; Windows launcher/watchdog and platform controls are unresolved, and the external FirewallAPI writer requirement is not accepted"

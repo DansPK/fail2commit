@@ -253,7 +253,7 @@ fn bounds_report_incomplete_scan() {
     assert_blocked(&env.push(&work, &["origin", "main"]), "IncompleteScan");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_and_newline_filenames_are_handled() {
     use std::os::unix::ffi::OsStrExt;

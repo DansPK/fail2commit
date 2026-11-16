@@ -4,9 +4,9 @@
 
 #[cfg(any(target_os = "linux", windows, test))]
 use serde::{Deserialize, Serialize};
-#[cfg(any(target_os = "linux", windows, test))]
-use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(any(target_os = "linux", windows))]
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(any(target_os = "linux", windows, test))]
 use std::path::Path;
 
 #[cfg(any(target_os = "linux", windows, test))]
@@ -631,6 +631,8 @@ fn decode_request(line: &[u8]) -> crate::Result<Request> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+// Superseded by serve_one/run_linux_service_job; kept only for its unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn dispatch(req: Request, peer_uid: u32, installer_uid: u32, sandbox_uid: u32) -> Response {
     if !peer_uid_allowed(peer_uid, installer_uid, sandbox_uid) {
         return response(false, "peer uid is not authorized");
@@ -670,6 +672,8 @@ fn peer_uid_allowed(peer_uid: u32, installer_uid: u32, sandbox_uid: u32) -> bool
 }
 
 #[cfg(target_os = "linux")]
+// Superseded by serve_one/run_linux_service_job; kept only for its unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_job_dir(path: &Path, peer_uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     if !path.is_absolute() || path.canonicalize()? != path {
@@ -1588,7 +1592,7 @@ fn linux_mount_is_read_only(path: &Path) -> crate::Result<bool> {
     if unsafe { libc::statvfs(path.as_ptr(), &mut info) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(info.f_flag & libc::ST_RDONLY as u64 != 0)
+    Ok(info.f_flag & libc::ST_RDONLY != 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -1832,12 +1836,12 @@ fn linux_watchdog_probe_in_scope(
 }
 
 #[cfg(target_os = "linux")]
+type ProbeOutputThread = std::thread::JoinHandle<std::io::Result<(Vec<u8>, Vec<u8>)>>;
+
+#[cfg(target_os = "linux")]
 fn linux_probe_output_thread(
     stdout: std::process::ChildStdout,
-) -> (
-    std::thread::JoinHandle<std::io::Result<(Vec<u8>, Vec<u8>)>>,
-    std::sync::mpsc::Receiver<Vec<u8>>,
-) {
+) -> (ProbeOutputThread, std::sync::mpsc::Receiver<Vec<u8>>) {
     use std::io::Read;
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let output_thread = std::thread::spawn(move || -> std::io::Result<(Vec<u8>, Vec<u8>)> {
@@ -1877,7 +1881,7 @@ fn stop_linux_probe_child(
     unit: &str,
     child: &mut std::process::Child,
     watchdog: Option<std::process::ChildStdin>,
-    output_thread: Option<std::thread::JoinHandle<std::io::Result<(Vec<u8>, Vec<u8>)>>>,
+    output_thread: Option<ProbeOutputThread>,
 ) -> crate::Result<()> {
     drop(watchdog);
     let scope_result = stop_and_confirm_linux_scope(unit);
@@ -6554,6 +6558,7 @@ mod tests {
         assert!(marker_blocks_cleanup::<()>(&Err(())));
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn windows_path_comparison_handles_case_and_verbatim_prefix_only() {
         assert!(same_windows_path(

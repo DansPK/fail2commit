@@ -242,6 +242,7 @@ fn dot_slash_package_json_overlay_matches_npm_tar_and_is_denied() {
         r#"const path = require('path');
 const roots = [
   path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'node_modules'),
+  path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'node_modules'),
   '/usr/share/nodejs', '/usr/lib/node_modules/npm/node_modules',
   '/usr/local/lib/node_modules/npm/node_modules',
 ];

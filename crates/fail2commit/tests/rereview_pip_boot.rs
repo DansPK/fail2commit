@@ -46,7 +46,11 @@ fn purelib_rel(python: &Path, root: &Path) -> String {
         .output()
         .unwrap();
     let abs = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
-    abs.strip_prefix(root)
+    let abs_canon = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    abs_canon
+        .strip_prefix(&root_canon)
+        .or_else(|_| abs.strip_prefix(root))
         .unwrap_or_else(|_| panic!("{} not under {}", abs.display(), root.display()))
         .to_string_lossy()
         .replace('\\', "/")

@@ -306,9 +306,7 @@ fn hardened_scope_cgroup_path(kind: &str) -> Option<String> {
         return None;
     };
     cgroup.lines().find_map(|line| {
-        let Some(path) = line.strip_prefix("0::/") else {
-            return None;
-        };
+        let path = line.strip_prefix("0::/")?;
         let component = path.strip_prefix("system.slice/")?;
         if valid_hardened_scope_name(component, kind) {
             Some(component.to_owned())

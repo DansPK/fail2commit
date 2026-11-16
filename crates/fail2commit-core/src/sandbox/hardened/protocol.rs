@@ -181,6 +181,7 @@ pub fn decode_job(bytes: &[u8]) -> crate::Result<JobSpec> {
 /// Validate that every filesystem path in a decoded VM guest request refers
 /// only to the guest's assigned mounts. The outer VM may share read-only input
 /// mounts and one writable work mount; arbitrary host paths are forbidden.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn validate_vm_guest_job(
     job: &JobSpec,
     guest_work: &Path,

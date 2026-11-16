@@ -77,6 +77,11 @@ fail2commit uninstall-integrations
 sudo pacman -R fail2commit
 ```
 
+## macOS Apple Silicon (arm64)
+
+See [docs/macos.md](macos.md) for full details, installation instructions, and sandbox limitations.
+Binary archive: `fail2commit-<version>-aarch64-apple-darwin.tar.gz`. Note that the build is unsigned and macOS has no sandbox backend yet (fails closed for any jobs requiring sandbox isolation).
+
 ## Linux source archive
 
 ### Optional hardened Linux service

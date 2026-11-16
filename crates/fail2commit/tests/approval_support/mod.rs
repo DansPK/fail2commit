@@ -50,12 +50,20 @@ impl Home {
     pub fn cmd(&self, args: &[&str]) -> Command {
         let bin = env!("CARGO_BIN_EXE_fail2commit");
         #[cfg(unix)]
-        let mut c = if std::fs::File::open("/dev/tty").is_ok() {
-            let mut c = Command::new("setsid");
-            c.arg(bin);
+        let mut c = {
+            use std::os::unix::process::CommandExt;
+            let mut c = Command::new(bin);
+            if std::fs::File::open("/dev/tty").is_ok() {
+                unsafe {
+                    c.pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
             c
-        } else {
-            Command::new(bin)
         };
         #[cfg(windows)]
         let mut c = {

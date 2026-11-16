@@ -2,6 +2,8 @@
 //! Transport modules may differ; parsing, destination checks, bait inspection
 //! and the job stop/report state must remain one implementation (SPEC-018 §5).
 
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+
 use crate::isolation::{ActivityKind, ActivityReport};
 use crate::sandbox::{bait::BaitSet, netpolicy};
 use std::net::{SocketAddr, ToSocketAddrs};

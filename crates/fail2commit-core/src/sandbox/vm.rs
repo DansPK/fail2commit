@@ -1,5 +1,7 @@
 //! Optional disposable VM backend selection (FR-029, SPEC-019).
 
+#![cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+
 use crate::isolation::{JobOutcome, JobSpec, ProbeReport, SandboxBackend};
 
 #[cfg(target_os = "linux")]
