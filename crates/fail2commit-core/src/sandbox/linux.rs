@@ -861,6 +861,44 @@ fn execute_controlled(
     })
 }
 
+/// Watches the service's watchdog pipe. The service never writes to it, so EOF, an error and any
+/// byte (including a single 0x00) all mean "closed" and cancel the job.
+fn spawn_watchdog_monitor(
+    watchdog: std::fs::File,
+    closed: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("f2c-hardened-watchdog".into())
+        .spawn(move || {
+            use std::os::fd::AsRawFd;
+            let fd = watchdog.as_raw_fd();
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+            while !stop.load(Ordering::Acquire) {
+                // SAFETY: pollfd points to one live descriptor and has the
+                // correct count for the duration of this bounded wait.
+                let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
+                if result < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    closed.store(true, Ordering::SeqCst);
+                    return;
+                }
+                if result == 0 {
+                    continue;
+                }
+                // POLLIN (any data), POLLHUP, POLLERR and POLLNVAL all end the job.
+                closed.store(true, Ordering::SeqCst);
+                return;
+            }
+        })
+}
+
 /// Run an immutable service snapshot under the dedicated system account. The
 /// caller supplies the inherited watchdog read descriptor; this path never
 /// creates the user-scope wrapper used by the ordinary per-user backend.
@@ -902,47 +940,11 @@ pub(crate) fn run_hardened_with_ready(
     let watchdog = unsafe { std::fs::File::from_raw_fd(watchdog_fd) };
     let watchdog_closed = Arc::new(AtomicBool::new(false));
     let monitor_stop = Arc::new(AtomicBool::new(false));
-    let monitor_closed = Arc::clone(&watchdog_closed);
-    let monitor_stop_thread = Arc::clone(&monitor_stop);
-    let monitor = thread::Builder::new()
-        .name("f2c-hardened-watchdog".into())
-        .spawn(move || {
-            use std::os::fd::AsRawFd;
-            let fd = watchdog.as_raw_fd();
-            let mut pollfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                revents: 0,
-            };
-            while !monitor_stop_thread.load(Ordering::Acquire) {
-                // SAFETY: pollfd points to one live descriptor and has the
-                // correct count for the duration of this bounded wait.
-                let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
-                if result < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    monitor_closed.store(true, Ordering::SeqCst);
-                    return;
-                }
-                if result == 0 {
-                    continue;
-                }
-                if pollfd.revents & libc::POLLIN != 0 {
-                    let mut byte = 0u8;
-                    // SAFETY: byte is a writable one-byte destination.
-                    let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
-                    if read != 1 || byte != 0 {
-                        monitor_closed.store(true, Ordering::SeqCst);
-                    }
-                    return;
-                }
-                if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                    monitor_closed.store(true, Ordering::SeqCst);
-                    return;
-                }
-            }
-        })?;
+    let monitor = spawn_watchdog_monitor(
+        watchdog,
+        Arc::clone(&watchdog_closed),
+        Arc::clone(&monitor_stop),
+    )?;
 
     let backend = Bubblewrap::default().under_hardened_cgroup();
     let probed = backend.probe_now();
@@ -1260,6 +1262,26 @@ fn self_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watchdog_monitor_treats_any_byte_as_closed() {
+        use std::io::Write;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let (r, w) = std::io::pipe().unwrap();
+        // SAFETY: the raw fd comes from a pipe end this test owns and gives up.
+        let file = unsafe { std::fs::File::from_raw_fd(r.into_raw_fd()) };
+        let closed = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_watchdog_monitor(file, closed.clone(), stop.clone()).unwrap();
+        thread::sleep(Duration::from_millis(120));
+        assert!(!closed.load(Ordering::SeqCst), "an idle open pipe is alive");
+        (&w).write_all(&[0]).unwrap();
+        handle.join().unwrap();
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "a 0x00 byte must close the job"
+        );
+    }
 
     #[test]
     fn bindable_refuses_home_root_and_sockets() {

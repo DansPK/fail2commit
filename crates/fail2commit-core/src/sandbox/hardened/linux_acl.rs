@@ -295,6 +295,30 @@ impl Drop for GrantGuard {
     }
 }
 
+/// Probe stages live outside the private 0700 journal: the installer and the sandbox account must
+/// traverse this root-owned 0711 directory (no read, so stage names are not listable).
+pub(crate) const PROBE_STAGES_DIR: &str = "/run/fail2commit-hardened/probe-stages";
+const PROBE_STAGES_MODE: u32 = 0o711;
+const PRIVATE_TEMP_PARENT_MODE: u32 = 0o700;
+
+fn probe_stages_root() -> PathBuf {
+    PathBuf::from(PROBE_STAGES_DIR)
+}
+
+/// The current probe-stages root, or the legacy 0.1.4-dev one inside the journal (cleanup only).
+fn is_probe_stages_parent(parent: &Path, journal_dir: &Path) -> bool {
+    parent == probe_stages_root() || parent == journal_dir.join("probe-stages")
+}
+
+/// Required mode of a managed temporary parent: only probe-stages is traversable by others.
+fn managed_parent_mode(parent: &Path) -> u32 {
+    if parent == Path::new(PROBE_STAGES_DIR) {
+        PROBE_STAGES_MODE
+    } else {
+        PRIVATE_TEMP_PARENT_MODE
+    }
+}
+
 fn cleanup_roots_from_targets(
     targets: &[Target],
     journal_dir: &Path,
@@ -302,7 +326,6 @@ fn cleanup_roots_from_targets(
 ) -> crate::Result<Vec<CleanupRoot>> {
     use std::os::unix::fs::MetadataExt;
     let jobs = Path::new("/run/fail2commit-hardened/jobs");
-    let probe_stages = journal_dir.join("probe-stages");
     let mut roots = BTreeMap::<PathBuf, CleanupRoot>::new();
     for target in targets {
         let path = &target.path;
@@ -314,7 +337,7 @@ fn cleanup_roots_from_targets(
             .and_then(|name| name.to_str())
             .unwrap_or("");
         let known_temp = (parent == jobs && name.starts_with("job-"))
-            || (parent == probe_stages && name.starts_with("probe-"));
+            || (is_probe_stages_parent(parent, journal_dir) && name.starts_with("probe-"));
         if !known_temp || !target.file.metadata()?.is_dir() {
             continue;
         }
@@ -322,7 +345,7 @@ fn cleanup_roots_from_targets(
         if !parent_meta.is_dir()
             || parent_meta.file_type().is_symlink()
             || parent_meta.uid() != 0
-            || parent_meta.mode() & 0o777 != 0o700
+            || parent_meta.mode() & 0o777 != managed_parent_mode(parent)
         {
             return Err(crate::Error::integrity(
                 "hardened temporary target parent is not a private root-owned directory",
@@ -355,7 +378,6 @@ fn legacy_cleanup_roots_from_records(
 ) -> crate::Result<Vec<CleanupRoot>> {
     use std::os::unix::fs::MetadataExt;
     let jobs = Path::new("/run/fail2commit-hardened/jobs");
-    let probe_stages = journal_dir.join("probe-stages");
     let mut roots = BTreeMap::<PathBuf, CleanupRoot>::new();
     for record in records {
         let path = PathBuf::from(&record.path);
@@ -367,7 +389,7 @@ fn legacy_cleanup_roots_from_records(
             .and_then(|name| name.to_str())
             .unwrap_or("");
         if !((parent == jobs && name.starts_with("job-"))
-            || (parent == probe_stages && name.starts_with("probe-")))
+            || (is_probe_stages_parent(parent, journal_dir) && name.starts_with("probe-")))
         {
             continue;
         }
@@ -378,7 +400,7 @@ fn legacy_cleanup_roots_from_records(
                 if meta.is_dir()
                     && !meta.file_type().is_symlink()
                     && meta.uid() == 0
-                    && meta.mode() & 0o777 == 0o700 =>
+                    && meta.mode() & 0o777 == managed_parent_mode(parent) =>
             {
                 (meta.dev(), meta.ino())
             }
@@ -418,9 +440,8 @@ fn validate_cleanup_root(
         .and_then(|name| name.to_str())
         .unwrap_or("");
     let jobs = Path::new("/run/fail2commit-hardened/jobs");
-    let probe_stages = journal_dir.join("probe-stages");
     let managed_parent = (parent == jobs && name.starts_with("job-"))
-        || (parent == probe_stages && name.starts_with("probe-"));
+        || (is_probe_stages_parent(parent, journal_dir) && name.starts_with("probe-"));
     let test_parent_match =
         test_parent.is_some_and(|test_parent| parent == test_parent) && name.starts_with("probe-");
     if !managed_parent && !test_parent_match {
@@ -436,7 +457,7 @@ fn validate_cleanup_root(
     if !parent_meta.is_dir()
         || parent_meta.file_type().is_symlink()
         || (parent_meta.uid() != 0 && !test_parent_match)
-        || parent_meta.mode() & 0o777 != 0o700
+        || parent_meta.mode() & 0o777 != managed_parent_mode(parent)
         || (root.parent_dev != 0 && parent_meta.dev() != root.parent_dev)
         || (root.parent_ino != 0 && parent_meta.ino() != root.parent_ino)
     {
@@ -512,6 +533,7 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name == "probe-stages" {
+            // Legacy 0.1.4-dev location; removed by `remove_legacy_probe_stages` below.
             continue;
         }
         if name.starts_with("grant-") && name.ends_with(".pending") {
@@ -614,11 +636,13 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
             || remove_journal(&path),
         )?;
     }
-    sweep_probe_stages(journal_dir)?;
+    remove_legacy_probe_stages(journal_dir)?;
+    sweep_probe_stages()?;
     Ok(())
 }
 
-fn sweep_probe_stages(journal_dir: &Path) -> crate::Result<()> {
+/// Removes the pre-B1 `<journal>/probe-stages` directory left by 0.1.4-dev installs.
+fn remove_legacy_probe_stages(journal_dir: &Path) -> crate::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let root = journal_dir.join("probe-stages");
     let metadata = match fs::symlink_metadata(&root) {
@@ -626,16 +650,45 @@ fn sweep_probe_stages(journal_dir: &Path) -> crate::Result<()> {
         Err(error) => return Err(error.into()),
         Ok(metadata) => metadata,
     };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != 0 {
+        return Err(crate::Error::integrity(
+            "legacy Linux probe staging root is not a root-owned directory",
+        ));
+    }
+    sweep_stage_children(&root)?;
+    fs::remove_dir(&root)?;
+    File::open(journal_dir)?.sync_all()?;
+    Ok(())
+}
+
+fn sweep_probe_stages() -> crate::Result<()> {
+    let root = probe_stages_root();
+    match fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    verify_probe_stages_root(&root)?;
+    sweep_stage_children(&root)
+}
+
+fn verify_probe_stages_root(root: &Path) -> crate::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != 0
-        || metadata.mode() & 0o077 != 0
+        || metadata.mode() & 0o777 != PROBE_STAGES_MODE
     {
         return Err(crate::Error::integrity(
-            "Linux service probe staging root is not private and root-owned",
+            "Linux service probe staging root has unsafe ownership or mode",
         ));
     }
-    for entry in fs::read_dir(&root)? {
+    Ok(())
+}
+
+fn sweep_stage_children(root: &Path) -> crate::Result<()> {
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name();
         if !name.to_string_lossy().starts_with("probe-") {
@@ -652,29 +705,20 @@ fn sweep_probe_stages(journal_dir: &Path) -> crate::Result<()> {
         }
         fs::remove_dir_all(&child)?;
     }
-    File::open(&root)?.sync_all()?;
+    File::open(root)?.sync_all()?;
     Ok(())
 }
 
 pub(crate) fn probe_stage_dir(journal_dir: &Path) -> crate::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     verify_journal_dir(journal_dir)?;
-    let root = journal_dir.join("probe-stages");
+    let root = probe_stages_root();
     match fs::create_dir(&root) {
-        Ok(()) => fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?,
+        Ok(()) => fs::set_permissions(&root, fs::Permissions::from_mode(PROBE_STAGES_MODE))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
-    let metadata = fs::symlink_metadata(&root)?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.mode() & 0o777 != 0o700
-    {
-        return Err(crate::Error::integrity(
-            "Linux service probe staging root has unsafe ownership or mode",
-        ));
-    }
+    verify_probe_stages_root(&root)?;
     Ok(root)
 }
 
@@ -1878,6 +1922,37 @@ mod tests {
         cleanup_pending(&pending, uid).unwrap();
         assert!(!pending.exists());
         assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn probe_stages_are_the_only_traversable_managed_parent() {
+        assert_eq!(PROBE_STAGES_DIR, "/run/fail2commit-hardened/probe-stages");
+        assert_eq!(managed_parent_mode(Path::new(PROBE_STAGES_DIR)), 0o711);
+        assert_eq!(
+            managed_parent_mode(Path::new("/run/fail2commit-hardened/jobs")),
+            0o700
+        );
+        let journal = Path::new("/var/lib/fail2commit-hardened-acl");
+        assert!(is_probe_stages_parent(Path::new(PROBE_STAGES_DIR), journal));
+        assert!(is_probe_stages_parent(
+            &journal.join("probe-stages"),
+            journal
+        ));
+        assert!(!is_probe_stages_parent(
+            Path::new("/tmp/probe-stages"),
+            journal
+        ));
+    }
+
+    #[test]
+    fn stage_sweep_removes_probe_dirs_and_rejects_strangers() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("probe-aaa/work")).unwrap();
+        std::fs::create_dir(root.path().join("probe-bbb")).unwrap();
+        sweep_stage_children(root.path()).unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        std::fs::write(root.path().join("stranger"), b"x").unwrap();
+        assert!(sweep_stage_children(root.path()).is_err());
     }
 
     #[test]
