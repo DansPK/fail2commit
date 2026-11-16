@@ -631,7 +631,7 @@ fn decode_request(line: &[u8]) -> crate::Result<Request> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-// Not yet wired into serve_linux; exercised by tests.
+// Superseded by serve_one/run_linux_service_job; kept only for its unit tests.
 #[cfg_attr(not(test), allow(dead_code))]
 fn dispatch(req: Request, peer_uid: u32, installer_uid: u32, sandbox_uid: u32) -> Response {
     if !peer_uid_allowed(peer_uid, installer_uid, sandbox_uid) {
@@ -672,7 +672,7 @@ fn peer_uid_allowed(peer_uid: u32, installer_uid: u32, sandbox_uid: u32) -> bool
 }
 
 #[cfg(target_os = "linux")]
-// Not yet wired into serve_linux; exercised by tests.
+// Superseded by serve_one/run_linux_service_job; kept only for its unit tests.
 #[cfg_attr(not(test), allow(dead_code))]
 fn validate_job_dir(path: &Path, peer_uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
