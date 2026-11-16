@@ -7,7 +7,7 @@ use crate::isolation::{
 };
 use crate::sandbox::hardened::protocol::{self, MAX_OUTCOME_BYTES};
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -731,6 +731,7 @@ mod lifecycle_gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn job() -> JobSpec {
         JobSpec {
