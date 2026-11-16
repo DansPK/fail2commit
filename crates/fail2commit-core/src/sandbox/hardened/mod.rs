@@ -80,6 +80,7 @@ fn linux_readiness(
     }
 }
 
+#[cfg(any(windows, test))]
 fn windows_readiness(
     service_running: bool,
     peer_authenticated: bool,
@@ -97,6 +98,7 @@ fn windows_readiness(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn windows_readiness_detail(detail: &str) -> String {
     format!(
         "{detail}; Windows launcher/watchdog and platform controls are unresolved, and the external FirewallAPI writer requirement is not accepted"
