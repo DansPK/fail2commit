@@ -1365,6 +1365,7 @@ mod windows {
             // not authority to touch SCM or the local account.
             return Ok(serde_json::json!({"installed":false,"removed":true}));
         };
+        let state_path = crate::sandbox::hardened::machine_state_path()?;
         let recorded_sid = state.sandbox_sid.as_deref().ok_or_else(|| {
             crate::Error::integrity(
                 "legacy hardened state cannot authorize deletion of the sandbox account",
@@ -1472,6 +1473,17 @@ mod windows {
                 }
                 return Err(error);
             }
+            let jobs = state_path
+                .parent()
+                .ok_or_else(|| crate::Error::integrity("install state has no parent"))?
+                .join("jobs");
+            if let Err(error) = crate::sandbox::hardened::service::remove_snapshot_store(&jobs) {
+                unsafe {
+                    CloseServiceHandle(svc);
+                    CloseServiceHandle(manager);
+                }
+                return Err(error);
+            }
             if unsafe { DeleteService(svc) } == 0 {
                 let e = std::io::Error::last_os_error();
                 unsafe {
@@ -1502,13 +1514,18 @@ mod windows {
             ));
         }
         std::fs::remove_dir_all(expected.parent().unwrap())?;
-        let p = crate::sandbox::hardened::machine_state_path()?;
+        let p = state_path;
         if p.exists() {
             std::fs::remove_file(&p)?;
         }
         if let Some(d) = p.parent() {
             if d.exists() {
-                std::fs::remove_dir(d)?;
+                std::fs::remove_dir(d).map_err(|error| {
+                    crate::Error::internal(format!(
+                        "cannot remove hardened state directory {}: {error}",
+                        d.display()
+                    ))
+                })?;
             }
         }
         Ok(serde_json::json!({"installed":false,"removed":true}))
