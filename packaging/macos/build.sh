@@ -5,6 +5,18 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 commit=${1:-HEAD}
 out=${2:-target/dist}
 commit=$(git -C "$repo" rev-parse --verify "${commit}^{commit}")
+head_commit=$(git -C "$repo" rev-parse --verify HEAD)
+
+if [[ "$commit" != "$head_commit" ]]; then
+  echo "commit $commit does not match HEAD ($head_commit)" >&2
+  exit 2
+fi
+
+if [[ -n $(git -C "$repo" status --porcelain) ]]; then
+  echo "working tree is dirty; cannot build release package" >&2
+  exit 2
+fi
+
 version=$(git -C "$repo" show "${commit}:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n 1)
 
 if [[ -z "$version" ]]; then
@@ -17,7 +29,11 @@ echo "Building fail2commit $version for aarch64-apple-darwin at $commit"
 cd "$repo"
 cargo build --release --locked --target aarch64-apple-darwin
 
-dist_dir="$repo/$out"
+if [[ "$out" = /* ]]; then
+  dist_dir="$out"
+else
+  dist_dir="$repo/$out"
+fi
 mkdir -p "$dist_dir"
 
 archive_name="fail2commit-${version}-aarch64-apple-darwin"
@@ -54,9 +70,11 @@ clear the quarantine attribute from the extracted binaries using:
 
     xattr -d com.apple.quarantine fail2commit*
 
-SANDBOX LIMITATION:
+SANDBOX LIMITATION & FAIL-CLOSED BEHAVIOR:
 There is currently no sandbox backend for macOS (a Seatbelt backend is planned in P-211).
-Installs or jobs requiring sandbox isolation fail closed by design ("no sandbox backend on macOS yet").
+Fail-closed holds while sandbox.enabled = true (the default). With the sandbox enabled,
+any package that has install scripts is denied, as is fail2commit run ("no sandbox backend on macOS yet").
+Turning the sandbox off allows "Run on host once" approvals that run scripts on the host with full user access.
 Git push protection, scan checks, and offline scriptless installs remain fully supported.
 NOTE
 

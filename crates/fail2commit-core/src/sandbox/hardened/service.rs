@@ -6558,7 +6558,7 @@ mod tests {
         assert!(marker_blocks_cleanup::<()>(&Err(())));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn windows_path_comparison_handles_case_and_verbatim_prefix_only() {
         assert!(same_windows_path(

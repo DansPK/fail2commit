@@ -17,9 +17,9 @@ On macOS, fail2commit provides:
 > macOS does not yet have an active sandbox backend implementation. A Seatbelt-based sandbox backend is planned under roadmap item **P-211**.
 > 
 > Because fail2commit adheres strictly to a **fail-closed** security model:
-> - Any operation that requires sandbox isolation (such as running build/lifecycle scripts via `fail2commit run` or installing packages with lifecycle scripts) is **refused**.
+> - Fail-closed holds while `sandbox.enabled = true` (the default). With the sandbox enabled, any package that has install/lifecycle scripts is denied (refused rather than running untrusted code unsandboxed), as is `fail2commit run`.
 > - Running `fail2commit sandbox status` reports the backend as `unavailable` with the reason: `no sandbox backend on macOS yet`.
-> - If an npm or pip package requires install/lifecycle scripts, the installation will fail closed rather than running untrusted code unsandboxed.
+> - Turning the sandbox off (`sandbox.enabled = false` in settings) allows "Run on host once" approvals that run approved scripts on the host with full user access, while optional scripts are skipped without asking.
 
 ## Installation
 

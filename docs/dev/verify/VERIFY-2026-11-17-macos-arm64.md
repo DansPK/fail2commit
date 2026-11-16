@@ -39,13 +39,13 @@ cargo fmt --all -- --check
 ```sh
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
-- **Exit code**: `0`
+- **Exit code**: `0` (macOS-only; verified on `aarch64-apple-darwin`)
 
 ### Workspace Test Suite
 ```sh
 cargo test --workspace --locked
 ```
-- **Exit code**: `0`
+- **Exit code**: `0` (macOS-only; verified on `aarch64-apple-darwin`)
 - **Output summary**:
   - `fail2commit-core`: 248 tests passed; 0 failed
   - `fail2commit` unit & integration tests:
@@ -110,7 +110,10 @@ Conducted in temporary root `/tmp/f2c-smoke-XXXXXX` with isolated `HOME`:
    - Package installed without lifecycle scripts (exit code: `0`)
 7. npm offline fixture with install script (`npm install`):
    - Blocked and failed closed due to unavailable sandbox:
-     `thread 'main' panicked at crates/fail2commit/src/cmd/shim.rs:...: sandbox unavailable: no sandbox backend on macOS yet` (exit code: `101`)
+     Structured isolation_unavailable error with exit code 14:
+     `{"version":1,"code":"isolation_unavailable","message":"sandbox is on but isolation is unavailable","findings":[]}` (exit code: `14`)
+     Text mode stderr:
+     `fail2commit: sandbox is on but isolation is unavailable (isolation_unavailable)` (exit code: `14`)
 
 ---
 
