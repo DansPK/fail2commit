@@ -26,11 +26,13 @@ Integration branch: `main` (one PR per change). Latest release `v0.1.3` (pre-rel
 
 | ID | Task | Req IDs | Owner | Status | Depends on |
 |---|---|---|---|---|---|
-| T-013 | Implement SPEC-018 (hardened sandbox mode) | FR-027 | Orca Luna worker | source accepted by Sol and integrated from 155e823; root/Windows runtime gates and external-writer limit open; not fully verified | T-007 |
-| T-014 | Implement the FR-013 progress window and terminal line (SPEC-015 hooks are in place; `ui.progress_window` setting exists, no sink yet) | FR-013 | Orca Luna worker; Sol review | source accepted by Sol r4 and integrated from f928a45; Linux PTY flows passed; Windows GUI/current package gates pending | - |
-| T-015 | Implement SPEC-019 (VM sandbox backend) | FR-029 | Claude/Qwen Linux; Luna Windows; Sol review | Linux source accepted and integrated from f0541db; Windows27378f2 refusal preserved; combined check passed, lint cleanup in progress; boot/root gates pending | T-013 |
+| T-013 | Implement SPEC-018 (hardened sandbox mode) | FR-027 | Orca Luna worker | Linux hardened runtime gates pass in debian-f2c (TC-027-1/3/4/7/9, hostile via service, reboot recovery), Opus-reviewed, integrated 8b6ed34; Windows hardened readiness still unavailable (fails closed); see VERIFY-2026-11-17-0.1.4-integration.md | T-007 |
+| T-014 | Implement the FR-013 progress window and terminal line (SPEC-015 hooks are in place; `ui.progress_window` setting exists, no sink yet) | FR-013 | Orca Luna worker; Sol review | source integrated; Linux PTY flows passed; Windows native-window screenshots still missing (unattended installs stop at approval) | - |
+| T-015 | Implement SPEC-019 (VM sandbox backend) | FR-029 | Claude/Qwen Linux; Luna Windows; Sol review | Linux non-KVM gates TC-029-1/10/11/12 pass, Windows fallback TC-029-1 passes, integrated 8b6ed34; TC-029-2..9 blocked (no nested virtualisation on this host) | T-013 |
 
 FR-029 (VM backend, Could) stays in 0.1.4 by owner decision (2026-11-13); it lands last, after T-013 and T-014.
+
+CR-028 (macOS arm64 build, fails closed) is integrated (bf2e2a0) and builds/tests on the Mac mini at 8b6ed34. Owner decision pending before 0.1.4 sign-off: Windows default-mode UDP multicast/broadcast (HB-036/HB-037), see VERIFY-2026-11-17-0.1.4-integration.md.
 
 ## Production roadmap (proposed, not yet approved)
 

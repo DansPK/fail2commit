@@ -1,5 +1,12 @@
 # Completed work
 
+## 2026-11-17 - 0.1.4 gates round (integrated at `8b6ed34`, version 0.1.4)
+- macOS arm64 build (CR-028) fails closed; builds and passes `cargo test --workspace` on the Mac mini; artifact `fail2commit-0.1.4-aarch64-apple-darwin.tar.gz` (SHA-256 `86e645be…f08b`).
+- Windows: the stale AppContainer profile sweep no longer treats an exited-but-referenced owner as live (`hb070` passes); hardened uninstall now removes the job snapshot store and state files, so the first uninstall succeeds.
+- Linux: hardened mode ran end to end for the first time on Debian 13 after fixing setfacl argument order (no ACL grant had ever applied), grants to the sandbox uid, the probe-stage location (B1), systemd-run/setpriv, the watchdog READY race, and crash recovery; x32 syscalls are now rejected by the seccomp filter. VM prepare accepts QEMU 10.
+- Correction to the 2026-11-12 entry: `hb036` multicast is not a documented SPEC-014 limit; TC-023-6/CR-022 require multicast to be refused. It is now an open owner decision (also affects `none` mode, present since v0.1.3).
+- Evidence: `docs/dev/verify/VERIFY-2026-11-17-0.1.4-integration.md`, `-linux-gates.md`, `-windows-gates.md`, `-macos-arm64.md`.
+
 ## 2026-11-12 - 0.1.4 integration hand-over
 - The Linux sandbox, Windows sandbox and scan branches for 0.1.4 are merged into
   `DansPK/f2c-0.1.4`; the tip at hand-over was `6c864bd` with a clean tree and 14 local
