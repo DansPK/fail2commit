@@ -44,7 +44,7 @@ fn hostile_payload() {
 ///
 /// `F2C_HARDENED_E2E=1` runs the same rows through the installed hardened service instead (FR-027,
 /// TC-027); an unavailable service is then always a failure, never a skip.
-fn one(test: &str) -> Option<Box<dyn SandboxBackend>> {
+fn one(test: &str) -> Option<Rows> {
     if hardened_e2e() {
         let b = fail2commit_core::sandbox::select_backend(
             &fail2commit_core::settings::Settings::default(),
@@ -56,9 +56,22 @@ fn one(test: &str) -> Option<Box<dyn SandboxBackend>> {
             p.detail,
             p.controls
         );
-        return Some(b);
+        return Some(Rows(b));
     }
-    backend(Bubblewrap::default(), test).map(|b| Box::new(b) as Box<dyn SandboxBackend>)
+    backend(Bubblewrap::default(), test).map(|b| Rows(Box::new(b)))
+}
+
+/// Either backend behind one type, so `&b` coerces to `&dyn SandboxBackend` at every call site.
+struct Rows(Box<dyn SandboxBackend>);
+
+impl SandboxBackend for Rows {
+    fn probe(&self) -> fail2commit_core::isolation::ProbeReport {
+        self.0.probe()
+    }
+
+    fn run(&self, job: &JobSpec) -> fail2commit_core::Result<JobOutcome> {
+        self.0.run(job)
+    }
 }
 
 fn hardened_e2e() -> bool {
