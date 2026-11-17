@@ -1387,6 +1387,17 @@ fn linux_bait_probe_outcome_passed(outcome: &crate::isolation::JobOutcome) -> bo
         && outcome.exported.is_empty()
 }
 
+/// Off-host UDP destinations that must be unreachable from the sandbox. Loopback is excluded on
+/// purpose: bubblewrap brings `lo` up inside the job's private netns, so a UDP `send_to` to
+/// 127.0.0.1 succeeds locally (no listener can exist; `listen` is denied) and reaches nothing.
+#[cfg(target_os = "linux")]
+const LINUX_PROBE_UDP_DESTINATIONS: [(&str, &str); 4] = [
+    ("0.0.0.0:0", "1.1.1.1:53"),
+    ("0.0.0.0:0", "169.254.169.254:53"),
+    ("[::]:0", "[2606:4700:4700::1111]:53"),
+    ("[::]:0", "[fd00:ec2::254]:53"),
+];
+
 #[cfg(target_os = "linux")]
 pub(super) fn run_linux_egress_probe_child(
     expected_uid: u32,
@@ -1508,13 +1519,7 @@ pub(super) fn run_linux_egress_probe_child(
         }
     }
 
-    for (bind, destination) in [
-        ("0.0.0.0:0", "1.1.1.1:53"),
-        ("0.0.0.0:0", "169.254.169.254:53"),
-        ("0.0.0.0:0", "127.0.0.1:53"),
-        ("[::]:0", "[2606:4700:4700::1111]:53"),
-        ("[::]:0", "[fd00:ec2::254]:53"),
-    ] {
+    for (bind, destination) in LINUX_PROBE_UDP_DESTINATIONS {
         let socket = UdpSocket::bind(bind).map_err(|_| {
             crate::Error::isolation_unavailable("cannot create the fixed UDP probe socket")
         })?;
@@ -1530,9 +1535,9 @@ pub(super) fn run_linux_egress_probe_child(
             )
             .is_ok()
         {
-            return Err(crate::Error::isolation_unavailable(
-                "direct sandbox DNS/UDP send unexpectedly succeeded",
-            ));
+            return Err(crate::Error::isolation_unavailable(format!(
+                "direct sandbox DNS/UDP send to {destination} unexpectedly succeeded"
+            )));
         }
     }
 
@@ -6024,6 +6029,17 @@ mod tests {
         assert!(!private_acl_dir_mode(0, 0, 0o755));
         assert!(!private_acl_dir_mode(1000, 0, 0o700));
         assert!(!private_acl_dir_mode(0, 1000, 0o700));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn udp_probe_destinations_are_off_host() {
+        for (_, destination) in LINUX_PROBE_UDP_DESTINATIONS {
+            assert!(
+                !destination.starts_with("127.") && !destination.starts_with("[::1]"),
+                "{destination}: loopback UDP sends succeed inside the job netns"
+            );
+        }
     }
 
     #[test]
