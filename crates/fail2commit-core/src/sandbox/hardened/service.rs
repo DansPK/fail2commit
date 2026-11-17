@@ -6063,6 +6063,16 @@ mod tests {
     }
 
     #[test]
+    fn linux_unit_leaves_home_writable_for_stage_acl_grants() {
+        let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
+        assert!(unit.lines().any(|l| l.starts_with("ReadWritePaths=/home ")));
+        assert!(
+            !unit.lines().any(|l| l.starts_with("ProtectHome=")),
+            "ProtectHome=read-only overrides ReadWritePaths=/home"
+        );
+    }
+
+    #[test]
     fn linux_unit_keeps_cap_setuid_for_the_launcher() {
         let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
         assert!(
