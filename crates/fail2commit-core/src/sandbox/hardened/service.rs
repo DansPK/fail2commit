@@ -288,6 +288,14 @@ pub(super) fn launch_linux_hidden(jobfile: &Path, watchdog: Option<u64>) -> crat
     Ok(())
 }
 
+/// Root-owned, root-group, closed to "other". Once the service grants `u:<sandbox>:--x` the
+/// kernel reports the ACL mask in the group bits (0710), so group bits cannot be required zero;
+/// the group class itself (`group::---`, gid 0) still carries no access.
+#[cfg(any(target_os = "linux", test))]
+fn private_acl_dir_mode(uid: u32, gid: u32, mode: u32) -> bool {
+    uid == 0 && gid == 0 && mode & 0o007 == 0
+}
+
 #[cfg(target_os = "linux")]
 fn validate_linux_snapshot_paths(jobfile: &Path) -> crate::Result<std::path::PathBuf> {
     use std::os::unix::fs::MetadataExt;
@@ -318,8 +326,7 @@ fn validate_linux_snapshot_paths(jobfile: &Path) -> crate::Result<std::path::Pat
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.mode() & 0o077 != 0
+            || !private_acl_dir_mode(metadata.uid(), metadata.gid(), metadata.mode())
         {
             return Err(crate::Error::integrity(
                 "hardened Linux snapshot ancestor is not a private root-owned directory",
@@ -330,8 +337,11 @@ fn validate_linux_snapshot_paths(jobfile: &Path) -> crate::Result<std::path::Pat
     let output_metadata = std::fs::symlink_metadata(&output)?;
     if !output_metadata.is_dir()
         || output_metadata.file_type().is_symlink()
-        || output_metadata.uid() != 0
-        || output_metadata.mode() & 0o077 != 0
+        || !private_acl_dir_mode(
+            output_metadata.uid(),
+            output_metadata.gid(),
+            output_metadata.mode(),
+        )
     {
         return Err(crate::Error::integrity(
             "hardened Linux outcome directory is not a private root-owned ACL grant directory",
@@ -6001,6 +6011,20 @@ pub(super) fn launch_hidden(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_dirs_may_show_the_acl_mask_but_never_open_to_others() {
+        assert!(private_acl_dir_mode(0, 0, 0o700));
+        assert!(
+            private_acl_dir_mode(0, 0, 0o710),
+            "mask after u:sandbox:--x"
+        );
+        assert!(private_acl_dir_mode(0, 0, 0o770), "mask after rwx grant");
+        assert!(!private_acl_dir_mode(0, 0, 0o701));
+        assert!(!private_acl_dir_mode(0, 0, 0o755));
+        assert!(!private_acl_dir_mode(1000, 0, 0o700));
+        assert!(!private_acl_dir_mode(0, 1000, 0o700));
+    }
 
     #[test]
     fn linux_unit_keeps_cap_setuid_for_the_launcher() {
