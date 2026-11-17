@@ -12,6 +12,7 @@
 
 mod sandbox_support;
 
+use fail2commit_core::isolation::SandboxBackend;
 use fail2commit_core::isolation::{
     ActivityKind, JobLimits, JobOutcome, JobSpec, JobStatus, NetworkMode,
 };
@@ -40,18 +41,53 @@ fn hostile_payload() {
 }
 
 /// A verified backend, or a printed skip (F2C_REQUIRE_SANDBOX=1 turns the skip into a failure).
-fn one(test: &str) -> Option<Bubblewrap> {
-    backend(Bubblewrap::default(), test)
+///
+/// `F2C_HARDENED_E2E=1` runs the same rows through the installed hardened service instead (FR-027,
+/// TC-027); an unavailable service is then always a failure, never a skip.
+fn one(test: &str) -> Option<Box<dyn SandboxBackend>> {
+    if hardened_e2e() {
+        let b = fail2commit_core::sandbox::select_backend(
+            &fail2commit_core::settings::Settings::default(),
+        );
+        let p = b.probe();
+        assert!(
+            p.available && p.backend == "hardened-bubblewrap",
+            "hardened backend required: {} {:?}",
+            p.detail,
+            p.controls
+        );
+        return Some(b);
+    }
+    backend(Bubblewrap::default(), test).map(|b| Box::new(b) as Box<dyn SandboxBackend>)
+}
+
+fn hardened_e2e() -> bool {
+    required("F2C_HARDENED_E2E")
+}
+
+/// Rows that need the Internet or the bait proxy: hardened Linux reserves Internet execution for
+/// the service's own authenticated egress probes, so these are not applicable there.
+fn needs_internet(test: &str) -> bool {
+    if hardened_e2e() {
+        eprintln!("N/A in hardened mode (Internet reserved to service probes): {test}");
+        return true;
+    }
+    false
 }
 
 /// Run this binary as the payload with `F2C_ROWS=<mode>` inside the sandbox.
-fn run_rows(b: &Bubblewrap, mode: &str, env: &[(&str, &str)], limits: JobLimits) -> JobOutcome {
+fn run_rows(
+    b: &dyn SandboxBackend,
+    mode: &str,
+    env: &[(&str, &str)],
+    limits: JobLimits,
+) -> JobOutcome {
     run_spec(b, mode, env, limits, NetworkMode::None, false)
 }
 
 /// The same, with an explicit network mode and bait flag (FR-023, FR-024).
 fn run_spec(
-    b: &Bubblewrap,
+    b: &dyn SandboxBackend,
     mode: &str,
     env: &[(&str, &str)],
     limits: JobLimits,
@@ -128,7 +164,12 @@ fn shell_job(
     (work, spec)
 }
 
-fn run_shell(b: &Bubblewrap, script: &str, env: &[(&str, &str)], limits: JobLimits) -> JobOutcome {
+fn run_shell(
+    b: &dyn SandboxBackend,
+    script: &str,
+    env: &[(&str, &str)],
+    limits: JobLimits,
+) -> JobOutcome {
     let (_w, spec) = shell_job(script, env, limits);
     fail2commit_core::sandbox::run_job(b, &spec).unwrap()
 }
@@ -775,6 +816,9 @@ fn internet_mode_reaches_a_public_host() {
     let Some(b) = one("internet_mode_reaches_a_public_host") else {
         return;
     };
+    if needs_internet("internet_mode_reaches_a_public_host") {
+        return;
+    }
     let out = run_spec(
         &b,
         "proxy",
@@ -845,6 +889,9 @@ fn private_and_loopback_destinations_are_refused() {
     let Some(b) = one("private_and_loopback_destinations_are_refused") else {
         return;
     };
+    if needs_internet("private_and_loopback_destinations_are_refused") {
+        return;
+    }
     // A listener the test runs on the host: unreachable from the sandbox's own loopback.
     let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = host.local_addr().unwrap().port();
@@ -898,6 +945,9 @@ fn listening_sockets_are_blocked() {
     let Some(b) = one("listening_sockets_are_blocked") else {
         return;
     };
+    if needs_internet("listening_sockets_are_blocked") {
+        return;
+    }
     let out = run_spec(&b, "listen", &[], limits(), NetworkMode::Internet, false);
     eprintln!("{}", text(&out.stdout));
     assert_eq!(
@@ -913,6 +963,9 @@ fn udp_multicast_and_broadcast_are_refused() {
     let Some(b) = one("udp_multicast_and_broadcast_are_refused") else {
         return;
     };
+    if needs_internet("udp_multicast_and_broadcast_are_refused") {
+        return;
+    }
     let out = run_spec(&b, "udp", &[], limits(), NetworkMode::Internet, false);
     eprintln!("{}", text(&out.stdout));
     assert_rows(
@@ -928,6 +981,9 @@ fn local_sockets_are_unreachable() {
     let Some(b) = one("local_sockets_are_unreachable") else {
         return;
     };
+    if needs_internet("local_sockets_are_unreachable") {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let approval = dir.path().join("approval.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&approval).unwrap();
@@ -1029,6 +1085,9 @@ fn bait_value_in_a_host_name_is_detected() {
     let Some(b) = one("bait_value_in_a_host_name_is_detected") else {
         return;
     };
+    if needs_internet("bait_value_in_a_host_name_is_detected") {
+        return;
+    }
     let out = run_spec(&b, "baitproxy", &[], limits(), NetworkMode::Internet, true);
     eprintln!("{} {:?}", text(&out.stdout), out.report.events);
     assert_eq!(out.status, JobStatus::Killed, "the job must be stopped");
@@ -1042,6 +1101,9 @@ fn bait_value_in_plain_http_is_detected() {
     let Some(b) = one("bait_value_in_plain_http_is_detected") else {
         return;
     };
+    if needs_internet("bait_value_in_plain_http_is_detected") {
+        return;
+    }
     let out = run_spec(&b, "baitpost", &[], limits(), NetworkMode::Internet, true);
     eprintln!("{} {:?}", text(&out.stdout), out.report.events);
     assert_eq!(out.status, JobStatus::Killed, "the job must be stopped");
@@ -1054,6 +1116,9 @@ fn clean_build_touches_no_bait() {
     let Some(b) = one("clean_build_touches_no_bait") else {
         return;
     };
+    if needs_internet("clean_build_touches_no_bait") {
+        return;
+    }
     let out = run_spec(&b, "cleanbuild", &[], limits(), NetworkMode::Internet, true);
     eprintln!("{}\n{}", text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status, JobStatus::Exited(0), "{}", text(&out.stderr));
