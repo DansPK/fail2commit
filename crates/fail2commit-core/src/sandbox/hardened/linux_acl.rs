@@ -324,6 +324,16 @@ fn parent_mode_matches(parent: &Path, mode: u32, restored: bool) -> bool {
     }
 }
 
+/// Mode of a disposable stage root: closed to group and other once restored. Before restore a
+/// crashed job's ACL mask shows in the group bits (e.g. 0710), so only "other" must be closed.
+fn root_mode_private(mode: u32, restored: bool) -> bool {
+    if restored {
+        mode & 0o077 == 0
+    } else {
+        mode & 0o007 == 0
+    }
+}
+
 /// Required mode of a managed temporary parent: only probe-stages is traversable by others.
 fn managed_parent_mode(parent: &Path) -> u32 {
     if parent == Path::new(PROBE_STAGES_DIR) {
@@ -489,7 +499,7 @@ fn validate_cleanup_root(
                 && meta.dev() == root.dev
                 && meta.ino() == root.ino
                 && meta.uid() == root.uid
-                && meta.mode() & 0o077 == 0 =>
+                && root_mode_private(meta.mode(), restored) =>
         {
             Ok(true)
         }
@@ -1966,6 +1976,16 @@ mod tests {
         let at = args.iter().position(|a| *a == "--modify").unwrap();
         assert_eq!(args[at + 1], "u:101:--x,m::r-x");
         assert_eq!(args[3], "--");
+    }
+
+    #[test]
+    fn recovery_validates_a_stage_root_showing_the_acl_mask_before_restore() {
+        assert!(root_mode_private(0o700, true));
+        assert!(!root_mode_private(0o710, true));
+        assert!(root_mode_private(0o710, false));
+        assert!(root_mode_private(0o770, false));
+        assert!(!root_mode_private(0o701, false));
+        assert!(!root_mode_private(0o705, false));
     }
 
     #[test]
