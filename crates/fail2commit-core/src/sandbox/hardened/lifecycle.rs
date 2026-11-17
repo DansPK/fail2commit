@@ -482,7 +482,8 @@ mod tests {
     fn linux_service_unit_keeps_system_hardening_and_opens_only_required_job_roots() {
         let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
         assert!(unit.contains("ProtectSystem=strict"));
-        assert!(unit.contains("ProtectHome=read-only"));
+        // ProtectHome=read-only would override ReadWritePaths=/home and block stage ACL grants.
+        assert!(!unit.lines().any(|l| l.starts_with("ProtectHome=")));
         assert!(unit.contains("NoNewPrivileges=yes"));
         assert!(unit.contains(
             "ReadWritePaths=/home /run/fail2commit-hardened /var/lib/fail2commit-hardened /var/lib/fail2commit-hardened-acl"
