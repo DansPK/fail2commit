@@ -311,6 +311,19 @@ fn is_probe_stages_parent(parent: &Path, journal_dir: &Path) -> bool {
     parent == probe_stages_root() || parent == journal_dir.join("probe-stages")
 }
 
+/// Whether `mode` is the managed parent's mode. Before recovery has restored the ACLs, a crashed
+/// job leaves `u:<sandbox>:--x` on `jobs`, and the kernel then reports the ACL mask in the group
+/// bits (0710): that state must still validate so recovery can run, so owner and "other" bits are
+/// compared exactly and group bits are ignored. After restore the full mode must match.
+fn parent_mode_matches(parent: &Path, mode: u32, restored: bool) -> bool {
+    let expected = managed_parent_mode(parent);
+    if restored {
+        mode & 0o777 == expected
+    } else {
+        mode & 0o707 == expected & 0o707
+    }
+}
+
 /// Required mode of a managed temporary parent: only probe-stages is traversable by others.
 fn managed_parent_mode(parent: &Path) -> u32 {
     if parent == Path::new(PROBE_STAGES_DIR) {
@@ -346,7 +359,7 @@ fn cleanup_roots_from_targets(
         if !parent_meta.is_dir()
             || parent_meta.file_type().is_symlink()
             || parent_meta.uid() != 0
-            || parent_meta.mode() & 0o777 != managed_parent_mode(parent)
+            || !parent_mode_matches(parent, parent_meta.mode(), true)
         {
             return Err(crate::Error::integrity(
                 "hardened temporary target parent is not a private root-owned directory",
@@ -401,7 +414,7 @@ fn legacy_cleanup_roots_from_records(
                 if meta.is_dir()
                     && !meta.file_type().is_symlink()
                     && meta.uid() == 0
-                    && meta.mode() & 0o777 == managed_parent_mode(parent) =>
+                    && parent_mode_matches(parent, meta.mode(), false) =>
             {
                 (meta.dev(), meta.ino())
             }
@@ -430,6 +443,7 @@ fn validate_cleanup_root(
     root: &CleanupRoot,
     journal_dir: &Path,
     test_parent: Option<&Path>,
+    restored: bool,
 ) -> crate::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let path = Path::new(&root.path);
@@ -458,7 +472,7 @@ fn validate_cleanup_root(
     if !parent_meta.is_dir()
         || parent_meta.file_type().is_symlink()
         || (parent_meta.uid() != 0 && !test_parent_match)
-        || parent_meta.mode() & 0o777 != managed_parent_mode(parent)
+        || !parent_mode_matches(parent, parent_meta.mode(), restored)
         || (root.parent_dev != 0 && parent_meta.dev() != root.parent_dev)
         || (root.parent_ino != 0 && parent_meta.ino() != root.parent_ino)
     {
@@ -501,7 +515,7 @@ fn cleanup_recovered_roots(
         if !existed {
             continue;
         }
-        if !validate_cleanup_root(root, journal_dir, test_parent)? {
+        if !validate_cleanup_root(root, journal_dir, test_parent, true)? {
             continue;
         }
         fs::remove_dir_all(&root.path)?;
@@ -602,7 +616,7 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
                         "cleanup root is not bound to an exact ACL journal target",
                     ));
                 }
-                let exists = validate_cleanup_root(&root, journal_dir, None)?;
+                let exists = validate_cleanup_root(&root, journal_dir, None, false)?;
                 Ok((root, exists))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -1955,6 +1969,30 @@ mod tests {
     }
 
     #[test]
+    fn recovery_validates_a_jobs_parent_showing_the_acl_mask_before_restore() {
+        let jobs = Path::new("/run/fail2commit-hardened/jobs");
+        assert!(parent_mode_matches(jobs, 0o700, true));
+        assert!(
+            !parent_mode_matches(jobs, 0o710, true),
+            "strict after restore"
+        );
+        assert!(
+            parent_mode_matches(jobs, 0o710, false),
+            "mask visible after a crash"
+        );
+        assert!(parent_mode_matches(jobs, 0o770, false));
+        assert!(
+            !parent_mode_matches(jobs, 0o701, false),
+            "other bits stay closed"
+        );
+        assert!(!parent_mode_matches(jobs, 0o600, false), "owner bits exact");
+        let stages = Path::new(PROBE_STAGES_DIR);
+        assert!(parent_mode_matches(stages, 0o711, true));
+        assert!(!parent_mode_matches(stages, 0o710, false));
+        assert!(!parent_mode_matches(stages, 0o700, false));
+    }
+
+    #[test]
     fn probe_stages_are_the_only_traversable_managed_parent() {
         assert_eq!(PROBE_STAGES_DIR, "/run/fail2commit-hardened/probe-stages");
         assert_eq!(managed_parent_mode(Path::new(PROBE_STAGES_DIR)), 0o711);
@@ -2097,7 +2135,7 @@ mod tests {
             roots[0].uid, uid,
             "legacy cleanup identity comes from the journaled root object"
         );
-        assert!(!validate_cleanup_root(&roots[0], journal_dir.path(), None).unwrap());
+        assert!(!validate_cleanup_root(&roots[0], journal_dir.path(), None, true).unwrap());
     }
 
     #[cfg(target_os = "linux")]
