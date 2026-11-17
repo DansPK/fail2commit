@@ -56,7 +56,7 @@ It is free, written in Rust, and needs no account or cloud service.
 
 ## Project status
 
-**0.1.3 is a preview** for technical users and testers.
+**0.1.4 is a preview** for technical users and testers.
 
 **What has been tested:**
 - Clean Windows 10 and 11, Debian, and Arch Linux VMs.
@@ -78,13 +78,13 @@ Download the file for your platform and `SHA256SUMS` from [GitHub Releases](http
 
 | Platform | File | Install |
 |---|---|---|
-| Windows 10/11 x64 | `fail2commit-0.1.3-setup.exe` | Run it as your normal user. It asks for administrator rights to guard the machine-wide npm and pip |
-| Debian / Ubuntu amd64 | `fail2commit_0.1.3_amd64.deb` | `sudo dpkg -i fail2commit_0.1.3_amd64.deb` |
-| Arch and Arch-based x86_64 | `fail2commit-0.1.3-1-x86_64.pkg.tar.zst` | `sudo pacman -U fail2commit-0.1.3-1-x86_64.pkg.tar.zst`, or `makepkg -si` with [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) |
-| macOS Apple Silicon (arm64) | `fail2commit-0.1.3-aarch64-apple-darwin.tar.gz` | Copy to PATH; see [docs/macos.md](docs/macos.md) (fail-closed sandbox limitation) |
-| Other Linux x86_64 | `fail2commit-0.1.3-linux-amd64` | Copy it onto your PATH |
-| From source | `fail2commit-0.1.3-src.tar.gz` | Offline build, with the crates vendored. See [docs/install.md](docs/install.md) |
-| VS Code | `fail2commit-0.1.3.vsix` | `code --install-extension fail2commit-0.1.3.vsix` |
+| Windows 10/11 x64 | `fail2commit-0.1.4-setup.exe` | Run it as your normal user. It asks for administrator rights to guard the machine-wide npm and pip |
+| Debian / Ubuntu amd64 | `fail2commit_0.1.4_amd64.deb` | `sudo dpkg -i fail2commit_0.1.4_amd64.deb` |
+| Arch and Arch-based x86_64 | `fail2commit-0.1.4-1-x86_64.pkg.tar.zst` | `sudo pacman -U fail2commit-0.1.4-1-x86_64.pkg.tar.zst`, or `makepkg -si` with [packaging/arch/PKGBUILD](packaging/arch/PKGBUILD) |
+| macOS Apple Silicon (arm64) | `fail2commit-0.1.4-aarch64-apple-darwin.tar.gz` | Copy to PATH; see [docs/macos.md](docs/macos.md) (fail-closed sandbox limitation) |
+| Other Linux x86_64 | `fail2commit-0.1.4-linux-amd64` | Copy it onto your PATH |
+| From source | `fail2commit-0.1.4-src.tar.gz` | Offline build, with the crates vendored. See [docs/install.md](docs/install.md) |
+| VS Code | `fail2commit-0.1.4.vsix` | `code --install-extension fail2commit-0.1.4.vsix` |
 
 On Linux the sandbox needs `bubblewrap`. Node.js/npm and Python are needed only for their own guards. Full instructions, including removal, are in [docs/install.md](docs/install.md).
 
