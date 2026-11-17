@@ -1064,6 +1064,22 @@ fn local_sockets_are_unreachable() {
         &["unix0", "unix1", "unix2", "unix3", "unix4"],
     );
 }
+/// Evidence harness (FR-027, review R2): hold one hardened job open for `F2C_R2_HOLD_SECS` so a
+/// root shell can read the ancestor ACL grants while it runs, after it, and after a crash.
+#[test]
+#[ignore = "evidence harness: F2C_HARDENED_E2E=1 and an installed hardened service"]
+fn hardened_job_held_open_for_acl_inspection() {
+    assert!(hardened_e2e(), "run with F2C_HARDENED_E2E=1");
+    let Some(b) = one("hardened_job_held_open_for_acl_inspection") else {
+        return;
+    };
+    let secs = std::env::var("F2C_R2_HOLD_SECS").unwrap_or_else(|_| "8".into());
+    let (_work, mut spec) = job("/bin/sleep", &[&secs]);
+    spec.limits = limits();
+    let result = fail2commit_core::sandbox::run_job(&b, &spec);
+    eprintln!("R2-HELD-JOB-RESULT {:?}", result.map(|o| o.status));
+}
+
 // ---------------------------------------------------------------- TC-024 rows
 
 /// The bait files a job gets in its fake home.
