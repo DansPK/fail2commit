@@ -393,6 +393,14 @@ fn home_dir() -> Option<PathBuf> {
     h.is_absolute().then(|| h.canonicalize().unwrap_or(h))
 }
 
+/// Whether `c` sits inside the denied directory `d`. The service's own probe stages (strictly
+/// below `/run/fail2commit-hardened/probe-stages`) are the one exception to the `/run` rule: they
+/// are created, owned and removed by the hardened service for its mandatory effect probes.
+fn denied_inside(c: &Path, d: &str) -> bool {
+    let stages = Path::new(crate::sandbox::hardened::PROBE_STAGES_DIR);
+    c.starts_with(d) && !(c != stages && c.starts_with(stages))
+}
+
 /// Canonical form of a job path that may be bound into the sandbox.
 fn bindable(p: &Path, home: Option<&Path>) -> crate::Result<PathBuf> {
     if !p.is_absolute() {
@@ -409,7 +417,7 @@ fn bindable(p: &Path, home: Option<&Path>) -> crate::Result<PathBuf> {
         .map(Path::new)
         .chain(home)
         .find(|d| d.starts_with(&c));
-    let inside = DENY_INSIDE.iter().find(|d| c.starts_with(d));
+    let inside = DENY_INSIDE.iter().find(|d| denied_inside(&c, d));
     if let Some(d) = exposes.map(Path::to_path_buf).or(inside.map(PathBuf::from)) {
         return Err(crate::Error::rejected(format!(
             "refusing to expose {} to the sandbox (covers {})",
@@ -1281,6 +1289,24 @@ mod tests {
             closed.load(Ordering::SeqCst),
             "a 0x00 byte must close the job"
         );
+    }
+
+    #[test]
+    fn only_service_probe_stages_escape_the_run_deny_rule() {
+        let stage = "/run/fail2commit-hardened/probe-stages/probe-abc/work";
+        assert!(!denied_inside(Path::new(stage), "/run"));
+        for still_denied in [
+            "/run/fail2commit-hardened/probe-stages",
+            "/run/fail2commit-hardened/probe-stagesX/work",
+            "/run/fail2commit-hardened/jobs/job-abc/input",
+            "/run/fail2commit-hardened/sock",
+            "/run/docker.sock",
+        ] {
+            assert!(
+                denied_inside(Path::new(still_denied), "/run"),
+                "{still_denied}"
+            );
+        }
     }
 
     #[test]
