@@ -883,6 +883,12 @@ pub(crate) fn clear_probe_scope_marker(path: &Path, scope_unit: &str) -> crate::
     remove_journal(path)
 }
 
+/// Ancestors that already allow "other" traversal (`/`, `/run`, `/var`, ...) need no ACL entry; the
+/// service mounts most of them read-only (`ProtectSystem=strict`), so granting there would fail.
+fn needs_traverse_grant(owner_uid: u32, mode: u32, sandbox_uid: u32) -> bool {
+    owner_uid != sandbox_uid && mode & 0o001 == 0
+}
+
 fn collect_requests(
     job: &JobSpec,
     peer: &PeerIdentity,
@@ -922,7 +928,7 @@ fn collect_requests(
         let mut parent = root.parent();
         while let Some(path) = parent {
             let metadata = fs::symlink_metadata(path)?;
-            if metadata.uid() != sandbox_uid {
+            if needs_traverse_grant(metadata.uid(), metadata.mode(), sandbox_uid) {
                 merge_permission(&mut requests, path.to_path_buf(), "--x");
             }
             if path == Path::new("/") {
@@ -940,7 +946,7 @@ fn collect_requests(
         let mut parent = canonical.parent();
         while let Some(path) = parent {
             let metadata = fs::symlink_metadata(path)?;
-            if metadata.uid() != sandbox_uid {
+            if needs_traverse_grant(metadata.uid(), metadata.mode(), sandbox_uid) {
                 merge_permission(&mut requests, path.to_path_buf(), "--x");
             }
             if path == Path::new("/") {
@@ -1928,6 +1934,15 @@ mod tests {
         cleanup_pending(&pending, uid).unwrap();
         assert!(!pending.exists());
         assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn world_traversable_ancestors_get_no_acl_grant() {
+        assert!(!needs_traverse_grant(0, 0o755, 101), "/ or /run");
+        assert!(!needs_traverse_grant(0, 0o711, 101), "probe-stages");
+        assert!(needs_traverse_grant(1000, 0o700, 101), "private home");
+        assert!(needs_traverse_grant(0, 0o750, 101));
+        assert!(!needs_traverse_grant(101, 0o700, 101), "sandbox-owned");
     }
 
     #[test]
