@@ -324,6 +324,13 @@ fn parent_mode_matches(parent: &Path, mode: u32, restored: bool) -> bool {
     }
 }
 
+/// A recorded target that no longer exists has no ACL left to restore. That is expected for the
+/// service's disposable roots and for objects the peer owns and has since deleted (a client
+/// cleans up its own temp stage after a mid-job crash); a missing root-owned ancestor is not.
+fn missing_target_is_tolerable(managed_temp: bool, record_uid: u32, journal_uid: u32) -> bool {
+    managed_temp || (journal_uid != 0 && record_uid == journal_uid)
+}
+
 /// Mode of a disposable stage root: closed to group and other once restored. Before restore a
 /// crashed job's ACL mask shows in the group bits (e.g. 0710), so only "other" must be closed.
 fn root_mode_private(mode: u32, restored: bool) -> bool {
@@ -638,10 +645,16 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
             });
             match fs::symlink_metadata(target_path) {
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound && is_managed_temp_target =>
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && missing_target_is_tolerable(
+                            is_managed_temp_target,
+                            record.uid,
+                            journal.uid,
+                        ) =>
                 {
                     // A previous cleanup may have removed part of this exact
-                    // recorded disposable tree, or /run may have reset at boot.
+                    // recorded disposable tree, /run may have reset at boot, or the
+                    // peer deleted its own stage after the crash (the ACL died with the inode).
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -1976,6 +1989,21 @@ mod tests {
         let at = args.iter().position(|a| *a == "--modify").unwrap();
         assert_eq!(args[at + 1], "u:101:--x,m::r-x");
         assert_eq!(args[3], "--");
+    }
+
+    #[test]
+    fn recovery_tolerates_only_missing_peer_or_managed_targets() {
+        assert!(missing_target_is_tolerable(true, 0, 1000));
+        assert!(
+            missing_target_is_tolerable(false, 1000, 1000),
+            "peer stage deleted"
+        );
+        assert!(
+            !missing_target_is_tolerable(false, 0, 1000),
+            "root-owned ancestor"
+        );
+        assert!(!missing_target_is_tolerable(false, 2000, 1000));
+        assert!(!missing_target_is_tolerable(false, 0, 0));
     }
 
     #[test]
