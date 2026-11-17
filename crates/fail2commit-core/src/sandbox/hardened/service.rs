@@ -190,9 +190,7 @@ pub(super) fn run_linux(
 
     let paths = crate::paths::TrustedPaths::resolve()?;
     crate::fsutil::ensure_private_dir(&paths.cache_dir)?;
-    let job_dir = tempfile::Builder::new()
-        .prefix("hardened-job-")
-        .tempdir_in(&paths.cache_dir)?;
+    let job_dir = private_job_dir(&paths.cache_dir)?;
     let stage_root = paths.cache_dir.join("sandbox-stage");
     let encoded = super::protocol::encode_hardened_job(job, &stage_root)?;
     let job_path = job_dir.path().join("job.json");
@@ -1727,6 +1725,18 @@ fn linux_watchdog_probe(
 /// or `--pipe` ("--pty/--pipe is not compatible in timer or --scope mode").
 #[cfg(target_os = "linux")]
 const LINUX_SCOPE_FLAGS: [&str; 4] = ["--scope", "--quiet", "--collect", "--expand-environment=no"];
+
+/// The service accepts only a peer-owned directory with no group/other bits, but tempfile 3.27
+/// creates `tempdir_in` directories with the umask-reduced default (0755), so set 0700 explicitly.
+#[cfg(target_os = "linux")]
+fn private_job_dir(parent: &Path) -> crate::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::Builder::new()
+        .prefix("hardened-job-")
+        .tempdir_in(parent)?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
 
 #[cfg(target_os = "linux")]
 fn linux_watchdog_probe_in_scope(
@@ -6029,6 +6039,16 @@ mod tests {
         assert!(!private_acl_dir_mode(0, 0, 0o755));
         assert!(!private_acl_dir_mode(1000, 0, 0o700));
         assert!(!private_acl_dir_mode(0, 1000, 0o700));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_job_dir_is_private_even_under_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let dir = private_job_dir(parent.path()).unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[cfg(target_os = "linux")]
