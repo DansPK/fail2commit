@@ -13,7 +13,7 @@
   recorded SHA-256).
 #>
 param(
-  [string]$Version = "0.1.3",
+  [string]$Version = "0.1.4",
   [string]$Makensis = "",
   [switch]$SkipCargo
 )
