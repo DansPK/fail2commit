@@ -236,13 +236,14 @@ impl GrantGuard {
         let mut guard = Self {
             journal_path,
             targets,
+            // Owner of the staged objects (restore/identity checks); grants go to `sandbox_uid`.
             uid: peer_uid,
             scope_unit: scope_unit.map(str::to_owned),
             retain_temporary_roots,
             active: true,
         };
         for target in &guard.targets {
-            if let Err(error) = set_acl(&setfacl, target, peer_uid, &target.permissions) {
+            if let Err(error) = set_acl(&setfacl, target, sandbox_uid, &target.permissions) {
                 return match guard.release() {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(crate::Error::isolation_unavailable(format!(
