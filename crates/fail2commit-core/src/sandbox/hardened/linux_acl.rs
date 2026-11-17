@@ -236,13 +236,14 @@ impl GrantGuard {
         let mut guard = Self {
             journal_path,
             targets,
+            // Owner of the staged objects (restore/identity checks); grants go to `sandbox_uid`.
             uid: peer_uid,
             scope_unit: scope_unit.map(str::to_owned),
             retain_temporary_roots,
             active: true,
         };
         for target in &guard.targets {
-            if let Err(error) = set_acl(&setfacl, target, peer_uid, &target.permissions) {
+            if let Err(error) = set_acl(&setfacl, target, sandbox_uid, &target.permissions) {
                 return match guard.release() {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(crate::Error::isolation_unavailable(format!(
@@ -295,6 +296,60 @@ impl Drop for GrantGuard {
     }
 }
 
+/// Probe stages live outside the private 0700 journal: the installer and the sandbox account must
+/// traverse this root-owned 0711 directory (no read, so stage names are not listable).
+pub(crate) const PROBE_STAGES_DIR: &str = "/run/fail2commit-hardened/probe-stages";
+const PROBE_STAGES_MODE: u32 = 0o711;
+const PRIVATE_TEMP_PARENT_MODE: u32 = 0o700;
+
+fn probe_stages_root() -> PathBuf {
+    PathBuf::from(PROBE_STAGES_DIR)
+}
+
+/// The current probe-stages root, or the legacy 0.1.4-dev one inside the journal (cleanup only).
+fn is_probe_stages_parent(parent: &Path, journal_dir: &Path) -> bool {
+    parent == probe_stages_root() || parent == journal_dir.join("probe-stages")
+}
+
+/// Whether `mode` is the managed parent's mode. Before recovery has restored the ACLs, a crashed
+/// job leaves `u:<sandbox>:--x` on `jobs`, and the kernel then reports the ACL mask in the group
+/// bits (0710): that state must still validate so recovery can run, so owner and "other" bits are
+/// compared exactly and group bits are ignored. After restore the full mode must match.
+fn parent_mode_matches(parent: &Path, mode: u32, restored: bool) -> bool {
+    let expected = managed_parent_mode(parent);
+    if restored {
+        mode & 0o777 == expected
+    } else {
+        mode & 0o707 == expected & 0o707
+    }
+}
+
+/// A recorded target that no longer exists has no ACL left to restore. That is expected for the
+/// service's disposable roots and for objects the peer owns and has since deleted (a client
+/// cleans up its own temp stage after a mid-job crash); a missing root-owned ancestor is not.
+fn missing_target_is_tolerable(managed_temp: bool, record_uid: u32, journal_uid: u32) -> bool {
+    managed_temp || (journal_uid != 0 && record_uid == journal_uid)
+}
+
+/// Mode of a disposable stage root: closed to group and other once restored. Before restore a
+/// crashed job's ACL mask shows in the group bits (e.g. 0710), so only "other" must be closed.
+fn root_mode_private(mode: u32, restored: bool) -> bool {
+    if restored {
+        mode & 0o077 == 0
+    } else {
+        mode & 0o007 == 0
+    }
+}
+
+/// Required mode of a managed temporary parent: only probe-stages is traversable by others.
+fn managed_parent_mode(parent: &Path) -> u32 {
+    if parent == Path::new(PROBE_STAGES_DIR) {
+        PROBE_STAGES_MODE
+    } else {
+        PRIVATE_TEMP_PARENT_MODE
+    }
+}
+
 fn cleanup_roots_from_targets(
     targets: &[Target],
     journal_dir: &Path,
@@ -302,7 +357,6 @@ fn cleanup_roots_from_targets(
 ) -> crate::Result<Vec<CleanupRoot>> {
     use std::os::unix::fs::MetadataExt;
     let jobs = Path::new("/run/fail2commit-hardened/jobs");
-    let probe_stages = journal_dir.join("probe-stages");
     let mut roots = BTreeMap::<PathBuf, CleanupRoot>::new();
     for target in targets {
         let path = &target.path;
@@ -314,7 +368,7 @@ fn cleanup_roots_from_targets(
             .and_then(|name| name.to_str())
             .unwrap_or("");
         let known_temp = (parent == jobs && name.starts_with("job-"))
-            || (parent == probe_stages && name.starts_with("probe-"));
+            || (is_probe_stages_parent(parent, journal_dir) && name.starts_with("probe-"));
         if !known_temp || !target.file.metadata()?.is_dir() {
             continue;
         }
@@ -322,7 +376,7 @@ fn cleanup_roots_from_targets(
         if !parent_meta.is_dir()
             || parent_meta.file_type().is_symlink()
             || parent_meta.uid() != 0
-            || parent_meta.mode() & 0o777 != 0o700
+            || !parent_mode_matches(parent, parent_meta.mode(), true)
         {
             return Err(crate::Error::integrity(
                 "hardened temporary target parent is not a private root-owned directory",
@@ -355,7 +409,6 @@ fn legacy_cleanup_roots_from_records(
 ) -> crate::Result<Vec<CleanupRoot>> {
     use std::os::unix::fs::MetadataExt;
     let jobs = Path::new("/run/fail2commit-hardened/jobs");
-    let probe_stages = journal_dir.join("probe-stages");
     let mut roots = BTreeMap::<PathBuf, CleanupRoot>::new();
     for record in records {
         let path = PathBuf::from(&record.path);
@@ -367,7 +420,7 @@ fn legacy_cleanup_roots_from_records(
             .and_then(|name| name.to_str())
             .unwrap_or("");
         if !((parent == jobs && name.starts_with("job-"))
-            || (parent == probe_stages && name.starts_with("probe-")))
+            || (is_probe_stages_parent(parent, journal_dir) && name.starts_with("probe-")))
         {
             continue;
         }
@@ -378,7 +431,7 @@ fn legacy_cleanup_roots_from_records(
                 if meta.is_dir()
                     && !meta.file_type().is_symlink()
                     && meta.uid() == 0
-                    && meta.mode() & 0o777 == 0o700 =>
+                    && parent_mode_matches(parent, meta.mode(), false) =>
             {
                 (meta.dev(), meta.ino())
             }
@@ -407,6 +460,7 @@ fn validate_cleanup_root(
     root: &CleanupRoot,
     journal_dir: &Path,
     test_parent: Option<&Path>,
+    restored: bool,
 ) -> crate::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let path = Path::new(&root.path);
@@ -418,9 +472,8 @@ fn validate_cleanup_root(
         .and_then(|name| name.to_str())
         .unwrap_or("");
     let jobs = Path::new("/run/fail2commit-hardened/jobs");
-    let probe_stages = journal_dir.join("probe-stages");
     let managed_parent = (parent == jobs && name.starts_with("job-"))
-        || (parent == probe_stages && name.starts_with("probe-"));
+        || (is_probe_stages_parent(parent, journal_dir) && name.starts_with("probe-"));
     let test_parent_match =
         test_parent.is_some_and(|test_parent| parent == test_parent) && name.starts_with("probe-");
     if !managed_parent && !test_parent_match {
@@ -436,7 +489,7 @@ fn validate_cleanup_root(
     if !parent_meta.is_dir()
         || parent_meta.file_type().is_symlink()
         || (parent_meta.uid() != 0 && !test_parent_match)
-        || parent_meta.mode() & 0o777 != 0o700
+        || !parent_mode_matches(parent, parent_meta.mode(), restored)
         || (root.parent_dev != 0 && parent_meta.dev() != root.parent_dev)
         || (root.parent_ino != 0 && parent_meta.ino() != root.parent_ino)
     {
@@ -453,7 +506,7 @@ fn validate_cleanup_root(
                 && meta.dev() == root.dev
                 && meta.ino() == root.ino
                 && meta.uid() == root.uid
-                && meta.mode() & 0o077 == 0 =>
+                && root_mode_private(meta.mode(), restored) =>
         {
             Ok(true)
         }
@@ -479,7 +532,7 @@ fn cleanup_recovered_roots(
         if !existed {
             continue;
         }
-        if !validate_cleanup_root(root, journal_dir, test_parent)? {
+        if !validate_cleanup_root(root, journal_dir, test_parent, true)? {
             continue;
         }
         fs::remove_dir_all(&root.path)?;
@@ -512,6 +565,7 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name == "probe-stages" {
+            // Legacy 0.1.4-dev location; removed by `remove_legacy_probe_stages` below.
             continue;
         }
         if name.starts_with("grant-") && name.ends_with(".pending") {
@@ -579,7 +633,7 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
                         "cleanup root is not bound to an exact ACL journal target",
                     ));
                 }
-                let exists = validate_cleanup_root(&root, journal_dir, None)?;
+                let exists = validate_cleanup_root(&root, journal_dir, None, false)?;
                 Ok((root, exists))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -591,10 +645,16 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
             });
             match fs::symlink_metadata(target_path) {
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound && is_managed_temp_target =>
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && missing_target_is_tolerable(
+                            is_managed_temp_target,
+                            record.uid,
+                            journal.uid,
+                        ) =>
                 {
                     // A previous cleanup may have removed part of this exact
-                    // recorded disposable tree, or /run may have reset at boot.
+                    // recorded disposable tree, /run may have reset at boot, or the
+                    // peer deleted its own stage after the crash (the ACL died with the inode).
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -614,11 +674,13 @@ pub(crate) fn recover(journal_dir: &Path) -> crate::Result<()> {
             || remove_journal(&path),
         )?;
     }
-    sweep_probe_stages(journal_dir)?;
+    remove_legacy_probe_stages(journal_dir)?;
+    sweep_probe_stages()?;
     Ok(())
 }
 
-fn sweep_probe_stages(journal_dir: &Path) -> crate::Result<()> {
+/// Removes the pre-B1 `<journal>/probe-stages` directory left by 0.1.4-dev installs.
+fn remove_legacy_probe_stages(journal_dir: &Path) -> crate::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let root = journal_dir.join("probe-stages");
     let metadata = match fs::symlink_metadata(&root) {
@@ -626,16 +688,45 @@ fn sweep_probe_stages(journal_dir: &Path) -> crate::Result<()> {
         Err(error) => return Err(error.into()),
         Ok(metadata) => metadata,
     };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != 0 {
+        return Err(crate::Error::integrity(
+            "legacy Linux probe staging root is not a root-owned directory",
+        ));
+    }
+    sweep_stage_children(&root)?;
+    fs::remove_dir(&root)?;
+    File::open(journal_dir)?.sync_all()?;
+    Ok(())
+}
+
+fn sweep_probe_stages() -> crate::Result<()> {
+    let root = probe_stages_root();
+    match fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    verify_probe_stages_root(&root)?;
+    sweep_stage_children(&root)
+}
+
+fn verify_probe_stages_root(root: &Path) -> crate::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != 0
-        || metadata.mode() & 0o077 != 0
+        || metadata.mode() & 0o777 != PROBE_STAGES_MODE
     {
         return Err(crate::Error::integrity(
-            "Linux service probe staging root is not private and root-owned",
+            "Linux service probe staging root has unsafe ownership or mode",
         ));
     }
-    for entry in fs::read_dir(&root)? {
+    Ok(())
+}
+
+fn sweep_stage_children(root: &Path) -> crate::Result<()> {
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name();
         if !name.to_string_lossy().starts_with("probe-") {
@@ -652,29 +743,20 @@ fn sweep_probe_stages(journal_dir: &Path) -> crate::Result<()> {
         }
         fs::remove_dir_all(&child)?;
     }
-    File::open(&root)?.sync_all()?;
+    File::open(root)?.sync_all()?;
     Ok(())
 }
 
 pub(crate) fn probe_stage_dir(journal_dir: &Path) -> crate::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     verify_journal_dir(journal_dir)?;
-    let root = journal_dir.join("probe-stages");
+    let root = probe_stages_root();
     match fs::create_dir(&root) {
-        Ok(()) => fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?,
+        Ok(()) => fs::set_permissions(&root, fs::Permissions::from_mode(PROBE_STAGES_MODE))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
-    let metadata = fs::symlink_metadata(&root)?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.mode() & 0o777 != 0o700
-    {
-        return Err(crate::Error::integrity(
-            "Linux service probe staging root has unsafe ownership or mode",
-        ));
-    }
+    verify_probe_stages_root(&root)?;
     Ok(root)
 }
 
@@ -839,6 +921,12 @@ pub(crate) fn clear_probe_scope_marker(path: &Path, scope_unit: &str) -> crate::
     remove_journal(path)
 }
 
+/// Ancestors that already allow "other" traversal (`/`, `/run`, `/var`, ...) need no ACL entry; the
+/// service mounts most of them read-only (`ProtectSystem=strict`), so granting there would fail.
+fn needs_traverse_grant(owner_uid: u32, mode: u32, sandbox_uid: u32) -> bool {
+    owner_uid != sandbox_uid && mode & 0o001 == 0
+}
+
 fn collect_requests(
     job: &JobSpec,
     peer: &PeerIdentity,
@@ -878,7 +966,7 @@ fn collect_requests(
         let mut parent = root.parent();
         while let Some(path) = parent {
             let metadata = fs::symlink_metadata(path)?;
-            if metadata.uid() != sandbox_uid {
+            if needs_traverse_grant(metadata.uid(), metadata.mode(), sandbox_uid) {
                 merge_permission(&mut requests, path.to_path_buf(), "--x");
             }
             if path == Path::new("/") {
@@ -896,7 +984,7 @@ fn collect_requests(
         let mut parent = canonical.parent();
         while let Some(path) = parent {
             let metadata = fs::symlink_metadata(path)?;
-            if metadata.uid() != sandbox_uid {
+            if needs_traverse_grant(metadata.uid(), metadata.mode(), sandbox_uid) {
                 merge_permission(&mut requests, path.to_path_buf(), "--x");
             }
             if path == Path::new("/") {
@@ -1224,6 +1312,12 @@ fn open_acl_target(path: &Path, peer_uid: u32) -> crate::Result<File> {
     Ok(file)
 }
 
+/// `--modify` takes the next word as its ACL spec, so `--no-mask` must come first
+/// (`--modify --no-mask spec` made setfacl parse "--no-mask" as the spec and fail on Debian 13).
+fn setfacl_grant_args(spec: &str) -> [&str; 4] {
+    ["--no-mask", "--modify", spec, "--"]
+}
+
 fn set_acl(tool: &Path, target: &Target, uid: u32, permissions: &str) -> crate::Result<()> {
     let proc_path = proc_fd_path(std::process::id(), target.file.as_raw_fd());
     let metadata = target.file.metadata()?;
@@ -1236,7 +1330,7 @@ fn set_acl(tool: &Path, target: &Target, uid: u32, permissions: &str) -> crate::
     )?;
     if !spec.is_empty() {
         let output = Command::new(tool)
-            .args(["--modify", "--no-mask", &spec, "--"])
+            .args(setfacl_grant_args(&spec))
             .arg(&proc_path)
             .output()?;
         if !output.status.success() {
@@ -1881,6 +1975,103 @@ mod tests {
     }
 
     #[test]
+    fn world_traversable_ancestors_get_no_acl_grant() {
+        assert!(!needs_traverse_grant(0, 0o755, 101), "/ or /run");
+        assert!(!needs_traverse_grant(0, 0o711, 101), "probe-stages");
+        assert!(needs_traverse_grant(1000, 0o700, 101), "private home");
+        assert!(needs_traverse_grant(0, 0o750, 101));
+        assert!(!needs_traverse_grant(101, 0o700, 101), "sandbox-owned");
+    }
+
+    #[test]
+    fn setfacl_modify_is_immediately_followed_by_its_spec() {
+        let args = setfacl_grant_args("u:101:--x,m::r-x");
+        let at = args.iter().position(|a| *a == "--modify").unwrap();
+        assert_eq!(args[at + 1], "u:101:--x,m::r-x");
+        assert_eq!(args[3], "--");
+    }
+
+    #[test]
+    fn recovery_tolerates_only_missing_peer_or_managed_targets() {
+        assert!(missing_target_is_tolerable(true, 0, 1000));
+        assert!(
+            missing_target_is_tolerable(false, 1000, 1000),
+            "peer stage deleted"
+        );
+        assert!(
+            !missing_target_is_tolerable(false, 0, 1000),
+            "root-owned ancestor"
+        );
+        assert!(!missing_target_is_tolerable(false, 2000, 1000));
+        assert!(!missing_target_is_tolerable(false, 0, 0));
+    }
+
+    #[test]
+    fn recovery_validates_a_stage_root_showing_the_acl_mask_before_restore() {
+        assert!(root_mode_private(0o700, true));
+        assert!(!root_mode_private(0o710, true));
+        assert!(root_mode_private(0o710, false));
+        assert!(root_mode_private(0o770, false));
+        assert!(!root_mode_private(0o701, false));
+        assert!(!root_mode_private(0o705, false));
+    }
+
+    #[test]
+    fn recovery_validates_a_jobs_parent_showing_the_acl_mask_before_restore() {
+        let jobs = Path::new("/run/fail2commit-hardened/jobs");
+        assert!(parent_mode_matches(jobs, 0o700, true));
+        assert!(
+            !parent_mode_matches(jobs, 0o710, true),
+            "strict after restore"
+        );
+        assert!(
+            parent_mode_matches(jobs, 0o710, false),
+            "mask visible after a crash"
+        );
+        assert!(parent_mode_matches(jobs, 0o770, false));
+        assert!(
+            !parent_mode_matches(jobs, 0o701, false),
+            "other bits stay closed"
+        );
+        assert!(!parent_mode_matches(jobs, 0o600, false), "owner bits exact");
+        let stages = Path::new(PROBE_STAGES_DIR);
+        assert!(parent_mode_matches(stages, 0o711, true));
+        assert!(!parent_mode_matches(stages, 0o710, false));
+        assert!(!parent_mode_matches(stages, 0o700, false));
+    }
+
+    #[test]
+    fn probe_stages_are_the_only_traversable_managed_parent() {
+        assert_eq!(PROBE_STAGES_DIR, "/run/fail2commit-hardened/probe-stages");
+        assert_eq!(managed_parent_mode(Path::new(PROBE_STAGES_DIR)), 0o711);
+        assert_eq!(
+            managed_parent_mode(Path::new("/run/fail2commit-hardened/jobs")),
+            0o700
+        );
+        let journal = Path::new("/var/lib/fail2commit-hardened-acl");
+        assert!(is_probe_stages_parent(Path::new(PROBE_STAGES_DIR), journal));
+        assert!(is_probe_stages_parent(
+            &journal.join("probe-stages"),
+            journal
+        ));
+        assert!(!is_probe_stages_parent(
+            Path::new("/tmp/probe-stages"),
+            journal
+        ));
+    }
+
+    #[test]
+    fn stage_sweep_removes_probe_dirs_and_rejects_strangers() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("probe-aaa/work")).unwrap();
+        std::fs::create_dir(root.path().join("probe-bbb")).unwrap();
+        sweep_stage_children(root.path()).unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        std::fs::write(root.path().join("stranger"), b"x").unwrap();
+        assert!(sweep_stage_children(root.path()).is_err());
+    }
+
+    #[test]
     fn journal_name_collision_never_removes_preexisting_recovery_record() {
         let tree = tempfile::tempdir().unwrap();
         let path = tree.path().join("grant-collision.json");
@@ -1992,7 +2183,7 @@ mod tests {
             roots[0].uid, uid,
             "legacy cleanup identity comes from the journaled root object"
         );
-        assert!(!validate_cleanup_root(&roots[0], journal_dir.path(), None).unwrap());
+        assert!(!validate_cleanup_root(&roots[0], journal_dir.path(), None, true).unwrap());
     }
 
     #[cfg(target_os = "linux")]

@@ -12,6 +12,10 @@
 const LD_ABS: u16 = 0x20;
 /// `BPF_JMP | BPF_JEQ | BPF_K`
 const JEQ: u16 = 0x15;
+/// `BPF_JMP | BPF_JSET | BPF_K`
+const JSET: u16 = 0x45;
+/// `__X32_SYSCALL_BIT`: x32 syscall numbers must never reach the number-based deny list.
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 /// `BPF_ALU | BPF_AND | BPF_K`
 const AND: u16 = 0x54;
 /// `BPF_RET | BPF_K`
@@ -172,14 +176,18 @@ fn insn(code: u16, jt: u8, jf: u8, k: u32) -> Insn {
 /// The deny-list program as BPF instructions.
 fn program() -> Vec<Insn> {
     let denied = denied();
-    // arch check (3) + `ld nr` (1) + two instructions per denied call + clone gate and block (5)
+    // arch check (3) + `ld nr` (1) + x32 reject (2) + two instructions per denied call + clone gate and block (5)
     // + socket gate and block (6) + final allow (1).
-    let total = 4 + denied.len() * 2 + 5 + 6 + 1;
+    let total = 6 + denied.len() * 2 + 5 + 6 + 1;
     let mut p: Vec<Insn> = Vec::with_capacity(total);
     p.push(insn(LD_ABS, 0, 0, OFF_ARCH));
     p.push(insn(JEQ, 1, 0, AUDIT_ARCH));
     p.push(insn(RET, 0, 0, RET_KILL));
     p.push(insn(LD_ABS, 0, 0, OFF_NR));
+    // x86_64 also serves x32 numbers (nr | 0x40000000) under the same AUDIT_ARCH; they would
+    // bypass every `JEQ nr` below, so kill them before the deny list.
+    p.push(insn(JSET, 0, 1, X32_SYSCALL_BIT));
+    p.push(insn(RET, 0, 0, RET_KILL));
     for (_, nr) in &denied {
         p.push(insn(JEQ, 0, 1, *nr));
         p.push(insn(RET, 0, 0, RET_EPERM));
@@ -246,7 +254,26 @@ mod tests {
         assert_eq!(p[1], insn(JEQ, 1, 0, AUDIT_ARCH));
         assert_eq!(p[2], insn(RET, 0, 0, RET_KILL));
         assert_eq!(p[3], insn(LD_ABS, 0, 0, OFF_NR));
+        assert_eq!(p[4], insn(JSET, 0, 1, X32_SYSCALL_BIT));
+        assert_eq!(p[5], insn(RET, 0, 0, RET_KILL));
         assert_eq!(p[p.len() - 1], insn(RET, 0, 0, RET_ALLOW));
+    }
+
+    /// An x32-numbered syscall (nr | 0x40000000) is killed before any `JEQ nr` can be skipped.
+    #[test]
+    fn x32_syscall_numbers_are_killed_before_the_deny_list() {
+        let p = program();
+        let jset = p
+            .iter()
+            .position(|i| i.code == JSET && i.k == X32_SYSCALL_BIT)
+            .expect("x32 check");
+        let first_nr_match = p
+            .iter()
+            .position(|i| i.code == JEQ && i.k != AUDIT_ARCH && i.k != 0);
+        assert!(jset < first_nr_match.expect("deny list"));
+        // jt = 0 falls into the KILL; jf = 1 skips it.
+        assert_eq!((p[jset].jt, p[jset].jf), (0, 1));
+        assert_eq!(p[jset + 1], insn(RET, 0, 0, RET_KILL));
     }
 
     #[test]
@@ -254,7 +281,7 @@ mod tests {
         let p = program();
         for (at, i) in p.iter().enumerate() {
             // Only conditional jumps carry a target; RET has jt/jf = 0.
-            if i.code != JEQ {
+            if i.code != JEQ && i.code != JSET {
                 continue;
             }
             for off in [i.jt, i.jf] {

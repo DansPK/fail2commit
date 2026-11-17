@@ -6,6 +6,17 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 const LINUX_STATE: &str = "/etc/fail2commit-hardened.json";
+/// The install state names no secret (installer uid, account, executable path) and every
+/// unprivileged client must read it to find the service, so it is world-readable but root-only
+/// writable. 0600 made `hardened status`/`run` fail with EACCES for the installing user.
+#[cfg(any(target_os = "linux", test))]
+const LINUX_STATE_MODE: u32 = 0o644;
+
+/// Root-owned, regular, not writable by group/other.
+#[cfg(any(target_os = "linux", test))]
+fn trusted_state_file(is_file: bool, uid: u32, mode: u32) -> bool {
+    is_file && uid == 0 && mode & 0o022 == 0
+}
 #[cfg(target_os = "linux")]
 const LINUX_UNIT_DIR: &str = "/etc/systemd/system";
 #[cfg(target_os = "linux")]
@@ -97,7 +108,7 @@ fn read_state() -> crate::Result<Option<InstallState>> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        if !md.is_file() || md.uid() != 0 || md.mode() & 0o077 != 0 {
+        if !trusted_state_file(md.is_file(), md.uid(), md.mode()) {
             return Err(crate::Error::integrity(
                 "hardened install state owner or mode is unsafe",
             ));
@@ -266,6 +277,23 @@ fn persist_uid_before_create(
 
 #[cfg(test)]
 mod tests {
+    use super::{trusted_state_file, LINUX_STATE_MODE};
+
+    #[test]
+    fn install_state_is_world_readable_but_root_only_writable() {
+        assert_eq!(LINUX_STATE_MODE & 0o044, 0o044, "clients must read it");
+        assert_eq!(LINUX_STATE_MODE & 0o022, 0);
+        assert!(trusted_state_file(true, 0, LINUX_STATE_MODE));
+        assert!(
+            trusted_state_file(true, 0, 0o600),
+            "legacy installs stay valid"
+        );
+        assert!(!trusted_state_file(true, 0, 0o664));
+        assert!(!trusted_state_file(true, 0, 0o646));
+        assert!(!trusted_state_file(true, 1000, 0o644));
+        assert!(!trusted_state_file(false, 0, 0o644));
+    }
+
     #[cfg(windows)]
     use super::recorded_sid_matches;
     use super::{
@@ -454,7 +482,8 @@ mod tests {
     fn linux_service_unit_keeps_system_hardening_and_opens_only_required_job_roots() {
         let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
         assert!(unit.contains("ProtectSystem=strict"));
-        assert!(unit.contains("ProtectHome=read-only"));
+        // ProtectHome=read-only would override ReadWritePaths=/home and block stage ACL grants.
+        assert!(!unit.lines().any(|l| l.starts_with("ProtectHome=")));
         assert!(unit.contains("NoNewPrivileges=yes"));
         assert!(unit.contains(
             "ReadWritePaths=/home /run/fail2commit-hardened /var/lib/fail2commit-hardened /var/lib/fail2commit-hardened-acl"
@@ -471,6 +500,7 @@ mod tests {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::process::{Command, Output};
 
@@ -685,11 +715,13 @@ mod linux {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(LINUX_STATE_MODE)
             .open(&tmp)?;
         f.write_all(
             &serde_json::to_vec(state).map_err(|e| crate::Error::internal(e.to_string()))?,
         )?;
+        // Not subject to the process umask.
+        f.set_permissions(std::fs::Permissions::from_mode(LINUX_STATE_MODE))?;
         f.sync_all()?;
         std::fs::rename(tmp, path)?;
         Ok(())
@@ -861,8 +893,7 @@ mod linux {
             Ok(md)
                 if md.is_file()
                     && !md.file_type().is_symlink()
-                    && md.uid() == 0
-                    && md.mode() & 0o077 == 0 =>
+                    && trusted_state_file(true, md.uid(), md.mode()) =>
             {
                 std::fs::remove_file(path)?;
                 Ok(())

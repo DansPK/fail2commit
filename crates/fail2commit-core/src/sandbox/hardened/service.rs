@@ -190,9 +190,7 @@ pub(super) fn run_linux(
 
     let paths = crate::paths::TrustedPaths::resolve()?;
     crate::fsutil::ensure_private_dir(&paths.cache_dir)?;
-    let job_dir = tempfile::Builder::new()
-        .prefix("hardened-job-")
-        .tempdir_in(&paths.cache_dir)?;
+    let job_dir = private_job_dir(&paths.cache_dir)?;
     let stage_root = paths.cache_dir.join("sandbox-stage");
     let encoded = super::protocol::encode_hardened_job(job, &stage_root)?;
     let job_path = job_dir.path().join("job.json");
@@ -288,6 +286,14 @@ pub(super) fn launch_linux_hidden(jobfile: &Path, watchdog: Option<u64>) -> crat
     Ok(())
 }
 
+/// Root-owned, root-group, closed to "other". Once the service grants `u:<sandbox>:--x` the
+/// kernel reports the ACL mask in the group bits (0710), so group bits cannot be required zero;
+/// the group class itself (`group::---`, gid 0) still carries no access.
+#[cfg(any(target_os = "linux", test))]
+fn private_acl_dir_mode(uid: u32, gid: u32, mode: u32) -> bool {
+    uid == 0 && gid == 0 && mode & 0o007 == 0
+}
+
 #[cfg(target_os = "linux")]
 fn validate_linux_snapshot_paths(jobfile: &Path) -> crate::Result<std::path::PathBuf> {
     use std::os::unix::fs::MetadataExt;
@@ -318,8 +324,7 @@ fn validate_linux_snapshot_paths(jobfile: &Path) -> crate::Result<std::path::Pat
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.mode() & 0o077 != 0
+            || !private_acl_dir_mode(metadata.uid(), metadata.gid(), metadata.mode())
         {
             return Err(crate::Error::integrity(
                 "hardened Linux snapshot ancestor is not a private root-owned directory",
@@ -330,8 +335,11 @@ fn validate_linux_snapshot_paths(jobfile: &Path) -> crate::Result<std::path::Pat
     let output_metadata = std::fs::symlink_metadata(&output)?;
     if !output_metadata.is_dir()
         || output_metadata.file_type().is_symlink()
-        || output_metadata.uid() != 0
-        || output_metadata.mode() & 0o077 != 0
+        || !private_acl_dir_mode(
+            output_metadata.uid(),
+            output_metadata.gid(),
+            output_metadata.mode(),
+        )
     {
         return Err(crate::Error::integrity(
             "hardened Linux outcome directory is not a private root-owned ACL grant directory",
@@ -722,6 +730,9 @@ pub fn serve_linux() -> crate::Result<()> {
             "installer uid collides with root or f2c-sandbox",
         ));
     }
+    // Jobs MUST stay serialized: this loop handles one connection at a time on purpose. ACL
+    // grant/restore of ancestors and the shared `jobs` directory is read-modify-write on the
+    // filesystem ACLs, so two concurrent jobs would restore each other's "original" entries.
     for conn in listener.incoming() {
         let Ok(mut stream) = conn else { continue };
         if stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()
@@ -1377,6 +1388,17 @@ fn linux_bait_probe_outcome_passed(outcome: &crate::isolation::JobOutcome) -> bo
         && outcome.exported.is_empty()
 }
 
+/// Off-host UDP destinations that must be unreachable from the sandbox. Loopback is excluded on
+/// purpose: bubblewrap brings `lo` up inside the job's private netns, so a UDP `send_to` to
+/// 127.0.0.1 succeeds locally (no listener can exist; `listen` is denied) and reaches nothing.
+#[cfg(target_os = "linux")]
+const LINUX_PROBE_UDP_DESTINATIONS: [(&str, &str); 4] = [
+    ("0.0.0.0:0", "1.1.1.1:53"),
+    ("0.0.0.0:0", "169.254.169.254:53"),
+    ("[::]:0", "[2606:4700:4700::1111]:53"),
+    ("[::]:0", "[fd00:ec2::254]:53"),
+];
+
 #[cfg(target_os = "linux")]
 pub(super) fn run_linux_egress_probe_child(
     expected_uid: u32,
@@ -1498,13 +1520,7 @@ pub(super) fn run_linux_egress_probe_child(
         }
     }
 
-    for (bind, destination) in [
-        ("0.0.0.0:0", "1.1.1.1:53"),
-        ("0.0.0.0:0", "169.254.169.254:53"),
-        ("0.0.0.0:0", "127.0.0.1:53"),
-        ("[::]:0", "[2606:4700:4700::1111]:53"),
-        ("[::]:0", "[fd00:ec2::254]:53"),
-    ] {
+    for (bind, destination) in LINUX_PROBE_UDP_DESTINATIONS {
         let socket = UdpSocket::bind(bind).map_err(|_| {
             crate::Error::isolation_unavailable("cannot create the fixed UDP probe socket")
         })?;
@@ -1520,9 +1536,9 @@ pub(super) fn run_linux_egress_probe_child(
             )
             .is_ok()
         {
-            return Err(crate::Error::isolation_unavailable(
-                "direct sandbox DNS/UDP send unexpectedly succeeded",
-            ));
+            return Err(crate::Error::isolation_unavailable(format!(
+                "direct sandbox DNS/UDP send to {destination} unexpectedly succeeded"
+            )));
         }
     }
 
@@ -1712,6 +1728,18 @@ fn linux_watchdog_probe(
 /// or `--pipe` ("--pty/--pipe is not compatible in timer or --scope mode").
 #[cfg(target_os = "linux")]
 const LINUX_SCOPE_FLAGS: [&str; 4] = ["--scope", "--quiet", "--collect", "--expand-environment=no"];
+
+/// The service accepts only a peer-owned directory with no group/other bits, but tempfile 3.27
+/// creates `tempdir_in` directories with the umask-reduced default (0755), so set 0700 explicitly.
+#[cfg(target_os = "linux")]
+fn private_job_dir(parent: &Path) -> crate::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::Builder::new()
+        .prefix("hardened-job-")
+        .tempdir_in(parent)?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
 
 #[cfg(target_os = "linux")]
 fn linux_watchdog_probe_in_scope(
@@ -6001,6 +6029,51 @@ pub(super) fn launch_hidden(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_dirs_may_show_the_acl_mask_but_never_open_to_others() {
+        assert!(private_acl_dir_mode(0, 0, 0o700));
+        assert!(
+            private_acl_dir_mode(0, 0, 0o710),
+            "mask after u:sandbox:--x"
+        );
+        assert!(private_acl_dir_mode(0, 0, 0o770), "mask after rwx grant");
+        assert!(!private_acl_dir_mode(0, 0, 0o701));
+        assert!(!private_acl_dir_mode(0, 0, 0o755));
+        assert!(!private_acl_dir_mode(1000, 0, 0o700));
+        assert!(!private_acl_dir_mode(0, 1000, 0o700));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_job_dir_is_private_even_under_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let dir = private_job_dir(parent.path()).unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn udp_probe_destinations_are_off_host() {
+        for (_, destination) in LINUX_PROBE_UDP_DESTINATIONS {
+            assert!(
+                !destination.starts_with("127.") && !destination.starts_with("[::1]"),
+                "{destination}: loopback UDP sends succeed inside the job netns"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_unit_leaves_home_writable_for_stage_acl_grants() {
+        let unit = include_str!("../../../../../packaging/linux/fail2commit-hardened.service");
+        assert!(unit.lines().any(|l| l.starts_with("ReadWritePaths=/home ")));
+        assert!(
+            !unit.lines().any(|l| l.starts_with("ProtectHome=")),
+            "ProtectHome=read-only overrides ReadWritePaths=/home"
+        );
+    }
 
     #[test]
     fn linux_unit_keeps_cap_setuid_for_the_launcher() {

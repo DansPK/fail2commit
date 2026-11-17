@@ -156,6 +156,8 @@ struct Tools {
     /// Applies the seccomp deny-list inside the sandbox (SPEC-013 §6).
     setpriv: PathBuf,
     scope: Option<Scope>,
+    /// Running under the hardened service (system scope, service-owned stages).
+    hardened: bool,
 }
 
 /// Delegated cgroup v2 limits through a transient systemd user scope.
@@ -233,6 +235,7 @@ impl Bubblewrap {
             bash,
             setpriv,
             scope,
+            hardened: self.parent_cgroup_limits,
         };
         let mut unexpected = String::new();
         match self_test(&tools, self.parent_cgroup_limits, &mut unexpected) {
@@ -393,8 +396,16 @@ fn home_dir() -> Option<PathBuf> {
     h.is_absolute().then(|| h.canonicalize().unwrap_or(h))
 }
 
+/// Whether `c` sits inside the denied directory `d`. The service's own probe stages (strictly
+/// below `/run/fail2commit-hardened/probe-stages`) are the one exception to the `/run` rule: they
+/// are created, owned and removed by the hardened service for its mandatory effect probes.
+fn denied_inside(c: &Path, d: &str, hardened: bool) -> bool {
+    let stages = Path::new(crate::sandbox::hardened::PROBE_STAGES_DIR);
+    c.starts_with(d) && !(hardened && c != stages && c.starts_with(stages))
+}
+
 /// Canonical form of a job path that may be bound into the sandbox.
-fn bindable(p: &Path, home: Option<&Path>) -> crate::Result<PathBuf> {
+fn bindable(p: &Path, home: Option<&Path>, hardened: bool) -> crate::Result<PathBuf> {
     if !p.is_absolute() {
         return Err(crate::Error::invalid(format!(
             "sandbox path {} is not absolute",
@@ -409,7 +420,7 @@ fn bindable(p: &Path, home: Option<&Path>) -> crate::Result<PathBuf> {
         .map(Path::new)
         .chain(home)
         .find(|d| d.starts_with(&c));
-    let inside = DENY_INSIDE.iter().find(|d| c.starts_with(d));
+    let inside = DENY_INSIDE.iter().find(|d| denied_inside(&c, d, hardened));
     if let Some(d) = exposes.map(Path::to_path_buf).or(inside.map(PathBuf::from)) {
         return Err(crate::Error::rejected(format!(
             "refusing to expose {} to the sandbox (covers {})",
@@ -566,11 +577,11 @@ fn tree_bytes(root: &Path) -> u64 {
 /// before anything is launched.
 fn policy_args(tools: &Tools, job: &JobSpec, ctl: &JobCtl) -> crate::Result<Vec<OsString>> {
     let home = home_dir();
-    let work = bindable(&job.work_dir, home.as_deref())?;
+    let work = bindable(&job.work_dir, home.as_deref(), tools.hardened)?;
     let ro = job
         .read_only
         .iter()
-        .map(|p| bindable(p, home.as_deref()))
+        .map(|p| bindable(p, home.as_deref(), tools.hardened))
         .collect::<crate::Result<Vec<_>>>()?;
     let cwd = job
         .cwd
@@ -861,6 +872,44 @@ fn execute_controlled(
     })
 }
 
+/// Watches the service's watchdog pipe. The service never writes to it, so EOF, an error and any
+/// byte (including a single 0x00) all mean "closed" and cancel the job.
+fn spawn_watchdog_monitor(
+    watchdog: std::fs::File,
+    closed: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("f2c-hardened-watchdog".into())
+        .spawn(move || {
+            use std::os::fd::AsRawFd;
+            let fd = watchdog.as_raw_fd();
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+            while !stop.load(Ordering::Acquire) {
+                // SAFETY: pollfd points to one live descriptor and has the
+                // correct count for the duration of this bounded wait.
+                let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
+                if result < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    closed.store(true, Ordering::SeqCst);
+                    return;
+                }
+                if result == 0 {
+                    continue;
+                }
+                // POLLIN (any data), POLLHUP, POLLERR and POLLNVAL all end the job.
+                closed.store(true, Ordering::SeqCst);
+                return;
+            }
+        })
+}
+
 /// Run an immutable service snapshot under the dedicated system account. The
 /// caller supplies the inherited watchdog read descriptor; this path never
 /// creates the user-scope wrapper used by the ordinary per-user backend.
@@ -902,47 +951,11 @@ pub(crate) fn run_hardened_with_ready(
     let watchdog = unsafe { std::fs::File::from_raw_fd(watchdog_fd) };
     let watchdog_closed = Arc::new(AtomicBool::new(false));
     let monitor_stop = Arc::new(AtomicBool::new(false));
-    let monitor_closed = Arc::clone(&watchdog_closed);
-    let monitor_stop_thread = Arc::clone(&monitor_stop);
-    let monitor = thread::Builder::new()
-        .name("f2c-hardened-watchdog".into())
-        .spawn(move || {
-            use std::os::fd::AsRawFd;
-            let fd = watchdog.as_raw_fd();
-            let mut pollfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-                revents: 0,
-            };
-            while !monitor_stop_thread.load(Ordering::Acquire) {
-                // SAFETY: pollfd points to one live descriptor and has the
-                // correct count for the duration of this bounded wait.
-                let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
-                if result < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    monitor_closed.store(true, Ordering::SeqCst);
-                    return;
-                }
-                if result == 0 {
-                    continue;
-                }
-                if pollfd.revents & libc::POLLIN != 0 {
-                    let mut byte = 0u8;
-                    // SAFETY: byte is a writable one-byte destination.
-                    let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
-                    if read != 1 || byte != 0 {
-                        monitor_closed.store(true, Ordering::SeqCst);
-                    }
-                    return;
-                }
-                if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                    monitor_closed.store(true, Ordering::SeqCst);
-                    return;
-                }
-            }
-        })?;
+    let monitor = spawn_watchdog_monitor(
+        watchdog,
+        Arc::clone(&watchdog_closed),
+        Arc::clone(&monitor_stop),
+    )?;
 
     let backend = Bubblewrap::default().under_hardened_cgroup();
     let probed = backend.probe_now();
@@ -1262,17 +1275,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn watchdog_monitor_treats_any_byte_as_closed() {
+        use std::io::Write;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let (r, w) = std::io::pipe().unwrap();
+        // SAFETY: the raw fd comes from a pipe end this test owns and gives up.
+        let file = unsafe { std::fs::File::from_raw_fd(r.into_raw_fd()) };
+        let closed = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_watchdog_monitor(file, closed.clone(), stop.clone()).unwrap();
+        thread::sleep(Duration::from_millis(120));
+        assert!(!closed.load(Ordering::SeqCst), "an idle open pipe is alive");
+        (&w).write_all(&[0]).unwrap();
+        handle.join().unwrap();
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "a 0x00 byte must close the job"
+        );
+    }
+
+    #[test]
+    fn only_service_probe_stages_escape_the_run_deny_rule() {
+        let stage = "/run/fail2commit-hardened/probe-stages/probe-abc/work";
+        assert!(!denied_inside(Path::new(stage), "/run", true));
+        assert!(
+            denied_inside(Path::new(stage), "/run", false),
+            "the carve-out is hardened-only"
+        );
+        for still_denied in [
+            "/run/fail2commit-hardened/probe-stages",
+            "/run/fail2commit-hardened/probe-stagesX/work",
+            "/run/fail2commit-hardened/jobs/job-abc/input",
+            "/run/fail2commit-hardened/sock",
+            "/run/docker.sock",
+        ] {
+            assert!(
+                denied_inside(Path::new(still_denied), "/run", true),
+                "{still_denied}"
+            );
+        }
+    }
+
+    #[test]
     fn bindable_refuses_home_root_and_sockets() {
         let home = Path::new("/home/someone");
         for bad in ["/", "/home", "/run", "/proc/self", "/dev", "/etc", "/tmp"] {
-            assert!(bindable(Path::new(bad), Some(home)).is_err(), "{bad}");
+            assert!(
+                bindable(Path::new(bad), Some(home), false).is_err(),
+                "{bad}"
+            );
         }
-        assert!(bindable(Path::new("relative"), None).is_err());
+        assert!(bindable(Path::new("relative"), None, false).is_err());
         let d = tempfile::tempdir().unwrap();
-        let ok = bindable(d.path(), Some(home)).unwrap();
-        assert!(bindable(&ok, Some(&ok)).is_err(), "the host home itself");
+        let ok = bindable(d.path(), Some(home), false).unwrap();
         assert!(
-            bindable(&ok, Some(&ok.join("child"))).is_err(),
+            bindable(&ok, Some(&ok), false).is_err(),
+            "the host home itself"
+        );
+        assert!(
+            bindable(&ok, Some(&ok.join("child")), false).is_err(),
             "an ancestor of home"
         );
     }

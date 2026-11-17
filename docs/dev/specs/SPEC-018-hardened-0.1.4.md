@@ -242,6 +242,9 @@ equal the peer uid; must be a directory. One job at a time per installer.
   (`--die-with-parent` already covers launcher death) → exit.
 - Network: **no host firewall changes** (FR-020 host-safety; SPEC-013 §4.1).
   The egress proxy is the boundary, exactly as in default mode.
+- Hardened Linux refuses `NetworkMode::Internet` for every caller job
+  (`isolation_unavailable`, exit 14, nothing launched); only the service's own
+  authenticated egress probe may use Internet. Caller jobs run `None` only.
 
 ### 4.4 Grants
 

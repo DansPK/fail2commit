@@ -5,6 +5,8 @@
 pub mod lifecycle;
 #[cfg(target_os = "linux")]
 mod linux_acl;
+#[cfg(target_os = "linux")]
+pub(crate) use linux_acl::PROBE_STAGES_DIR;
 pub mod protocol;
 pub mod service;
 #[cfg(windows)]
