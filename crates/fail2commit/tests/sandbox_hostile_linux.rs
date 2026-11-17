@@ -78,14 +78,29 @@ fn hardened_e2e() -> bool {
     required("F2C_HARDENED_E2E")
 }
 
-/// Rows that need the Internet or the bait proxy: hardened Linux reserves Internet execution for
-/// the service's own authenticated egress probes, so these are not applicable there.
-fn needs_internet(test: &str) -> bool {
-    if hardened_e2e() {
-        eprintln!("N/A in hardened mode (Internet reserved to service probes): {test}");
-        return true;
+/// Rows that need the Internet or the bait proxy. Hardened Linux reserves Internet execution for
+/// the service's own authenticated egress probes, so there every such row must instead be
+/// refused with `isolation_unavailable` and launch nothing (FR-027, SPEC-018 §4.3). Returns true
+/// when the row was handled that way and must not continue.
+fn internet_refused(b: &dyn SandboxBackend, test: &str, mode: &str, bait: bool) -> bool {
+    if !hardened_e2e() {
+        return false;
     }
-    false
+    match try_run_spec(b, mode, &[], limits(), NetworkMode::Internet, bait) {
+        Err(e) => {
+            assert_eq!(
+                e.code,
+                fail2commit_core::ResultCode::IsolationUnavailable,
+                "{test}: {e:?}"
+            );
+            eprintln!("HARDENED-REFUSED {test}: {}", e.message);
+            true
+        }
+        Ok(out) => panic!(
+            "{test}: hardened Linux ran an Internet job: {:?}",
+            out.status
+        ),
+    }
 }
 
 /// Run this binary as the payload with `F2C_ROWS=<mode>` inside the sandbox.
@@ -107,6 +122,18 @@ fn run_spec(
     network: NetworkMode,
     bait: bool,
 ) -> JobOutcome {
+    try_run_spec(b, mode, env, limits, network, bait).unwrap()
+}
+
+/// As `run_spec`, but hands the backend's refusal back instead of panicking.
+fn try_run_spec(
+    b: &dyn SandboxBackend,
+    mode: &str,
+    env: &[(&str, &str)],
+    limits: JobLimits,
+    network: NetworkMode,
+    bait: bool,
+) -> fail2commit_core::Result<JobOutcome> {
     // Cargo >= 1.100 keeps test binaries under `target/debug/build/<pkg>/<hash>/out`, so the
     // relay is no longer a parent-directory sibling of `current_exe`; point at the cargo binary.
     static RELAY: std::sync::Once = std::sync::Once::new();
@@ -126,7 +153,7 @@ fn run_spec(
     spec.limits = limits;
     spec.network = network;
     spec.bait = bait;
-    fail2commit_core::sandbox::run_job(b, &spec).unwrap()
+    fail2commit_core::sandbox::run_job(b, &spec)
 }
 
 /// `RESULT <check> <verdict>` lines from a row payload.
@@ -829,7 +856,7 @@ fn internet_mode_reaches_a_public_host() {
     let Some(b) = one("internet_mode_reaches_a_public_host") else {
         return;
     };
-    if needs_internet("internet_mode_reaches_a_public_host") {
+    if internet_refused(&b, "internet_mode_reaches_a_public_host", "proxy", false) {
         return;
     }
     let out = run_spec(
@@ -902,7 +929,12 @@ fn private_and_loopback_destinations_are_refused() {
     let Some(b) = one("private_and_loopback_destinations_are_refused") else {
         return;
     };
-    if needs_internet("private_and_loopback_destinations_are_refused") {
+    if internet_refused(
+        &b,
+        "private_and_loopback_destinations_are_refused",
+        "proxy",
+        false,
+    ) {
         return;
     }
     // A listener the test runs on the host: unreachable from the sandbox's own loopback.
@@ -958,7 +990,7 @@ fn listening_sockets_are_blocked() {
     let Some(b) = one("listening_sockets_are_blocked") else {
         return;
     };
-    if needs_internet("listening_sockets_are_blocked") {
+    if internet_refused(&b, "listening_sockets_are_blocked", "listen", false) {
         return;
     }
     let out = run_spec(&b, "listen", &[], limits(), NetworkMode::Internet, false);
@@ -976,7 +1008,7 @@ fn udp_multicast_and_broadcast_are_refused() {
     let Some(b) = one("udp_multicast_and_broadcast_are_refused") else {
         return;
     };
-    if needs_internet("udp_multicast_and_broadcast_are_refused") {
+    if internet_refused(&b, "udp_multicast_and_broadcast_are_refused", "udp", false) {
         return;
     }
     let out = run_spec(&b, "udp", &[], limits(), NetworkMode::Internet, false);
@@ -994,8 +1026,16 @@ fn local_sockets_are_unreachable() {
     let Some(b) = one("local_sockets_are_unreachable") else {
         return;
     };
-    if needs_internet("local_sockets_are_unreachable") {
-        return;
+    let hardened = hardened_e2e();
+    if hardened {
+        // Internet is refused; the /run carve-out for probe stages is then checked directly by
+        // running the same socket probes with no network (docker.sock, dbus, /run/user/0/bus).
+        assert!(internet_refused(
+            &b,
+            "local_sockets_are_unreachable",
+            "unix",
+            false
+        ));
     }
     let dir = tempfile::tempdir().unwrap();
     let approval = dir.path().join("approval.sock");
@@ -1010,7 +1050,11 @@ fn local_sockets_are_unreachable() {
         "unix",
         &[("F2C_T_UNIX", &paths)],
         limits(),
-        NetworkMode::Internet,
+        if hardened {
+            NetworkMode::None
+        } else {
+            NetworkMode::Internet
+        },
         false,
     );
     eprintln!("{}", text(&out.stdout));
@@ -1098,7 +1142,12 @@ fn bait_value_in_a_host_name_is_detected() {
     let Some(b) = one("bait_value_in_a_host_name_is_detected") else {
         return;
     };
-    if needs_internet("bait_value_in_a_host_name_is_detected") {
+    if internet_refused(
+        &b,
+        "bait_value_in_a_host_name_is_detected",
+        "baitproxy",
+        true,
+    ) {
         return;
     }
     let out = run_spec(&b, "baitproxy", &[], limits(), NetworkMode::Internet, true);
@@ -1114,7 +1163,7 @@ fn bait_value_in_plain_http_is_detected() {
     let Some(b) = one("bait_value_in_plain_http_is_detected") else {
         return;
     };
-    if needs_internet("bait_value_in_plain_http_is_detected") {
+    if internet_refused(&b, "bait_value_in_plain_http_is_detected", "baitpost", true) {
         return;
     }
     let out = run_spec(&b, "baitpost", &[], limits(), NetworkMode::Internet, true);
@@ -1129,7 +1178,7 @@ fn clean_build_touches_no_bait() {
     let Some(b) = one("clean_build_touches_no_bait") else {
         return;
     };
-    if needs_internet("clean_build_touches_no_bait") {
+    if internet_refused(&b, "clean_build_touches_no_bait", "cleanbuild", true) {
         return;
     }
     let out = run_spec(&b, "cleanbuild", &[], limits(), NetworkMode::Internet, true);

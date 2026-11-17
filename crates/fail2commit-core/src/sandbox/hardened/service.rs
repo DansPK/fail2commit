@@ -730,6 +730,9 @@ pub fn serve_linux() -> crate::Result<()> {
             "installer uid collides with root or f2c-sandbox",
         ));
     }
+    // Jobs MUST stay serialized: this loop handles one connection at a time on purpose. ACL
+    // grant/restore of ancestors and the shared `jobs` directory is read-modify-write on the
+    // filesystem ACLs, so two concurrent jobs would restore each other's "original" entries.
     for conn in listener.incoming() {
         let Ok(mut stream) = conn else { continue };
         if stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()

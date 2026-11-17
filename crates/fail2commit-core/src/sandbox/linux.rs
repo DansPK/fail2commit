@@ -156,6 +156,8 @@ struct Tools {
     /// Applies the seccomp deny-list inside the sandbox (SPEC-013 §6).
     setpriv: PathBuf,
     scope: Option<Scope>,
+    /// Running under the hardened service (system scope, service-owned stages).
+    hardened: bool,
 }
 
 /// Delegated cgroup v2 limits through a transient systemd user scope.
@@ -233,6 +235,7 @@ impl Bubblewrap {
             bash,
             setpriv,
             scope,
+            hardened: self.parent_cgroup_limits,
         };
         let mut unexpected = String::new();
         match self_test(&tools, self.parent_cgroup_limits, &mut unexpected) {
@@ -396,13 +399,13 @@ fn home_dir() -> Option<PathBuf> {
 /// Whether `c` sits inside the denied directory `d`. The service's own probe stages (strictly
 /// below `/run/fail2commit-hardened/probe-stages`) are the one exception to the `/run` rule: they
 /// are created, owned and removed by the hardened service for its mandatory effect probes.
-fn denied_inside(c: &Path, d: &str) -> bool {
+fn denied_inside(c: &Path, d: &str, hardened: bool) -> bool {
     let stages = Path::new(crate::sandbox::hardened::PROBE_STAGES_DIR);
-    c.starts_with(d) && !(c != stages && c.starts_with(stages))
+    c.starts_with(d) && !(hardened && c != stages && c.starts_with(stages))
 }
 
 /// Canonical form of a job path that may be bound into the sandbox.
-fn bindable(p: &Path, home: Option<&Path>) -> crate::Result<PathBuf> {
+fn bindable(p: &Path, home: Option<&Path>, hardened: bool) -> crate::Result<PathBuf> {
     if !p.is_absolute() {
         return Err(crate::Error::invalid(format!(
             "sandbox path {} is not absolute",
@@ -417,7 +420,7 @@ fn bindable(p: &Path, home: Option<&Path>) -> crate::Result<PathBuf> {
         .map(Path::new)
         .chain(home)
         .find(|d| d.starts_with(&c));
-    let inside = DENY_INSIDE.iter().find(|d| denied_inside(&c, d));
+    let inside = DENY_INSIDE.iter().find(|d| denied_inside(&c, d, hardened));
     if let Some(d) = exposes.map(Path::to_path_buf).or(inside.map(PathBuf::from)) {
         return Err(crate::Error::rejected(format!(
             "refusing to expose {} to the sandbox (covers {})",
@@ -574,11 +577,11 @@ fn tree_bytes(root: &Path) -> u64 {
 /// before anything is launched.
 fn policy_args(tools: &Tools, job: &JobSpec, ctl: &JobCtl) -> crate::Result<Vec<OsString>> {
     let home = home_dir();
-    let work = bindable(&job.work_dir, home.as_deref())?;
+    let work = bindable(&job.work_dir, home.as_deref(), tools.hardened)?;
     let ro = job
         .read_only
         .iter()
-        .map(|p| bindable(p, home.as_deref()))
+        .map(|p| bindable(p, home.as_deref(), tools.hardened))
         .collect::<crate::Result<Vec<_>>>()?;
     let cwd = job
         .cwd
@@ -1294,7 +1297,11 @@ mod tests {
     #[test]
     fn only_service_probe_stages_escape_the_run_deny_rule() {
         let stage = "/run/fail2commit-hardened/probe-stages/probe-abc/work";
-        assert!(!denied_inside(Path::new(stage), "/run"));
+        assert!(!denied_inside(Path::new(stage), "/run", true));
+        assert!(
+            denied_inside(Path::new(stage), "/run", false),
+            "the carve-out is hardened-only"
+        );
         for still_denied in [
             "/run/fail2commit-hardened/probe-stages",
             "/run/fail2commit-hardened/probe-stagesX/work",
@@ -1303,7 +1310,7 @@ mod tests {
             "/run/docker.sock",
         ] {
             assert!(
-                denied_inside(Path::new(still_denied), "/run"),
+                denied_inside(Path::new(still_denied), "/run", true),
                 "{still_denied}"
             );
         }
@@ -1313,14 +1320,20 @@ mod tests {
     fn bindable_refuses_home_root_and_sockets() {
         let home = Path::new("/home/someone");
         for bad in ["/", "/home", "/run", "/proc/self", "/dev", "/etc", "/tmp"] {
-            assert!(bindable(Path::new(bad), Some(home)).is_err(), "{bad}");
+            assert!(
+                bindable(Path::new(bad), Some(home), false).is_err(),
+                "{bad}"
+            );
         }
-        assert!(bindable(Path::new("relative"), None).is_err());
+        assert!(bindable(Path::new("relative"), None, false).is_err());
         let d = tempfile::tempdir().unwrap();
-        let ok = bindable(d.path(), Some(home)).unwrap();
-        assert!(bindable(&ok, Some(&ok)).is_err(), "the host home itself");
+        let ok = bindable(d.path(), Some(home), false).unwrap();
         assert!(
-            bindable(&ok, Some(&ok.join("child"))).is_err(),
+            bindable(&ok, Some(&ok), false).is_err(),
+            "the host home itself"
+        );
+        assert!(
+            bindable(&ok, Some(&ok.join("child")), false).is_err(),
             "an ancestor of home"
         );
     }
